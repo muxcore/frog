@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>README.html</title>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+
+</head>
+
+<body>
+
+<h1 id="frog">Frog</h1>
+<p>A terminal-based Oracle database client written in Rust — inspired by
+Toad, tmux, btop, and Hyprland.</p>
+<p>Frog gives you a fast, keyboard-driven TUI for querying Oracle, with
+multi-session tabs, an embedded SQL editor, pretty result tables, and a
+sqlplus-style scripting workflow.</p>
+<h2 id="features">Features</h2>
+<ul>
+<li><strong>Multi-session tabs</strong> — tmux-style windows with
+hover-to-focus and per-tab connections.</li>
+<li><strong>Embedded SQL editor</strong> — real cursor movement, line
+numbers, statement-at-cursor highlighting, vertical scroll.</li>
+<li><strong>Result viewer</strong> — pretty-printed tables (Table /
+Markdown / ASCII), 2D scrolling, clipboard copy, pagination.</li>
+<li><strong>sqlplus-style scripting</strong> — run a <code>.sql</code>
+file with <code>@file.sql</code>; support nested includes with
+<code>@@rel/path.sql</code>.</li>
+<li><strong>Abort on error</strong> — script runs stop at the first
+failing statement with a clear error log.</li>
+<li><strong>Background query execution</strong> — queries run on a
+worker thread; kick a running query with
+<code>Ctrl+C</code>/<code>Esc</code>.</li>
+<li><strong>SQL history</strong> — persisted to
+<code>frog_history.txt</code> next to the binary and browsable
+in-app.</li>
+<li><strong>Oracle session overview</strong> — <code>v$session</code>
+viewer.</li>
+</ul>
+<h2 id="requirements">Requirements</h2>
+<ul>
+<li>Rust toolchain (edition 2021).</li>
+<li>Oracle Instant Client (<code>libclntsh.so</code>) — the binary links
+against ODPI-C. On Arch install via AUR:
+<code>oracle-instantclient-basic</code>, then set
+<code>LD_LIBRARY_PATH</code> if you hit <code>DPI-1047</code>.</li>
+</ul>
+<h2 id="build">Build</h2>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> build <span class="at">--release</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Binary: ./target/release/frog</span></span></code></pre></div>
+<h2 id="run">Run</h2>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># CLI args (psql-style)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./target/release/frog</span> <span class="at">-H</span> localhost <span class="at">-P</span> 1521 <span class="at">-S</span> ORCL <span class="at">-U</span> user <span class="at">-W</span> pass</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Env vars</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">ORACLE_HOST</span><span class="op">=</span>localhost <span class="va">ORACLE_PORT</span><span class="op">=</span>1521 <span class="va">ORACLE_SERVICE</span><span class="op">=</span>ORCL <span class="dt">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>       <span class="va">ORACLE_USER</span><span class="op">=</span>u <span class="va">ORACLE_PASSWORD</span><span class="op">=</span>p</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="ex">./target/release/frog</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Or a connect string</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="ex">./target/release/frog</span> <span class="at">-d</span> <span class="st">&#39;host=localhost;port=1521;service_name=ORCL;user=scott;password=tiger&#39;</span></span></code></pre></div>
+<p>All connection parameters can be supplied via CLI flags, environment
+variables, or the in-app connection dialog (<code>Ctrl+O</code>).
+Optional YAML config lives at
+<code>~/.config/frog/config.yml</code>.</p>
+<h2 id="keyboard-reference">Keyboard Reference</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Key</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ctrl+Enter</code></td>
+<td>Execute statement at cursor</td>
+</tr>
+<tr>
+<td><code>F5</code></td>
+<td>Run all statements as script</td>
+</tr>
+<tr>
+<td><code>@file.sql</code></td>
+<td>Run a <code>.sql</code> file as a script (nested <code>@@</code>
+includes)</td>
+</tr>
+<tr>
+<td><code>Tab</code></td>
+<td>Cycle focus: Editor / Results / Sidebar</td>
+</tr>
+<tr>
+<td><code>Ctrl+M</code></td>
+<td>Maximize/restore focused panel</td>
+</tr>
+<tr>
+<td><code>Ctrl+B</code></td>
+<td>Toggle sidebar</td>
+</tr>
+<tr>
+<td><code>Ctrl+Y</code></td>
+<td>Copy results to clipboard</td>
+</tr>
+<tr>
+<td><code>Ctrl+D</code></td>
+<td>Toggle Markdown table format</td>
+</tr>
+<tr>
+<td><code>Ctrl+O</code></td>
+<td>Connection dialog</td>
+</tr>
+<tr>
+<td><code>Ctrl+C</code> / <code>Esc</code></td>
+<td>Cancel running query</td>
+</tr>
+<tr>
+<td><code>Ctrl+T</code> / <code>Ctrl+W</code></td>
+<td>New / close session tab</td>
+</tr>
+<tr>
+<td><code>Ctrl+Left/Right</code></td>
+<td>Switch session tabs</td>
+</tr>
+<tr>
+<td><code>F1</code> / <code>F2</code> / <code>F3</code></td>
+<td>Help / v$session / History</td>
+</tr>
+<tr>
+<td><code>Ctrl+Q</code></td>
+<td>Quit</td>
+</tr>
+<tr>
+<td>Mouse</td>
+<td>Hover tabs to focus, drag splitter to resize, click to focus panel,
+scroll results</td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuration">Configuration</h2>
+<p>Optional <code>~/.config/frog/config.yml</code>:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">connections</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> prod</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">host</span><span class="kw">:</span><span class="at"> db.example.com</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">port</span><span class="kw">:</span><span class="at"> </span><span class="dv">1521</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">service</span><span class="kw">:</span><span class="at"> ORCL</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">user</span><span class="kw">:</span><span class="at"> app</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">password</span><span class="kw">:</span><span class="at"> secret</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="fu">defaults</span><span class="kw">:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_rows</span><span class="kw">:</span><span class="at"> </span><span class="dv">10000</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">autocommit</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">max_history</span><span class="kw">:</span><span class="at"> </span><span class="dv">1000</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="fu">ui</span><span class="kw">:</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">tab_size</span><span class="kw">:</span><span class="at"> </span><span class="dv">4</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">date_format</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;%Y-%m-%d %H:%M:%S&quot;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">null_display</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;(NULL)&quot;</span></span></code></pre></div>
+<h2 id="project-structure">Project Structure</h2>
+<pre><code>src/
+  main.rs              # Entry point
+  cli/mod.rs           # CLI args + env vars + YAML config
+  db/
+    mod.rs             # Re-exports
+    connection.rs      # OracleConnection wrapper (oracle crate / ODPI-C)
+    session_manager.rs # Sessions, SqlEditor, SessionManager, history, @file expansion
+  tui/
+    mod.rs             # Re-exports App
+    app.rs             # Event loop, key/mouse handling, layout, focus management
+    widgets.rs         # Tabs, status bar, table viewer, help, dialogs, panels</code></pre>
+<h2 id="scripting">Scripting</h2>
+<p>Frog supports sqlplus-style script files directly from the
+editor:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ot">@setup.sql</span></span></code></pre></div>
+<ul>
+<li><code>@file.sql</code> — run the file, resolving paths from the
+current working directory.</li>
+<li><code>@@dir/file.sql</code> — nested include, resolved relative to
+the including file.</li>
+<li>Scripts stop at the first failing statement, printing which
+statement and the failing SQL.</li>
+</ul>
+<h2 id="testing">Testing</h2>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test</span></code></pre></div>
+<h2 id="known-issues">Known Issues</h2>
+<ul>
+<li>No horizontal scrolling for long editor lines.</li>
+<li>Query cancel (<code>cancel_query</code>) is partially stubbed.</li>
+<li>Result pagination is capped at an initial page (use
+<code>Ctrl+F</code> to fetch more).</li>
+<li><code>connections[]</code> config entries are not yet wired into the
+connection-dialog picker.</li>
+</ul>
+
+</body>
+</html>
