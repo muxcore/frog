@@ -18,6 +18,9 @@ Meet 'Frog' - A terminal-based Oracle database client written in Rust — name i
 - **Oracle session overview** — `v$session` viewer.
 - **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
 
+![Demo GIF](multimedia/demo.gif)
+
+
 ## Requirements
 
 - Rust toolchain (edition 2021).
