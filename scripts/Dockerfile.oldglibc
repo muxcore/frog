@@ -1,0 +1,31 @@
+# Build frog against an old glibc so the resulting binary runs on servers
+# whose glibc is older than the build host's.
+#
+# Ubuntu 20.04 ships glibc 2.31 (>= the glibc 2.28 minimum required by Oracle
+# Instant Client 23, and < glibc 2.34 used on the target servers). See
+# README.md -> "Building for older glibc (containers)".
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin a known-good toolchain. Keep it recent; the pidfd_* symbols in recent
+# std are weak, so they stay unversioned when linked against old glibc.
+ENV RUSTUP_HOME=/opt/rust \
+    CARGO_HOME=/root/.cargo \
+    FROG_TOOLCHAIN=1.97.1
+
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${FROG_TOOLCHAIN}" --profile minimal \
+    && rustup default "${FROG_TOOLCHAIN}"
+
+WORKDIR /src

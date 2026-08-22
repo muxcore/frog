@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 pub struct OracleConnection {
     pub conn: Connection,
+    /// Display string used for `NULL` cell values (from UiConfig).
+    pub null_display: String,
 }
 
 #[derive(Debug, Clone)]
@@ -25,166 +27,182 @@ pub struct QueryRow {
     pub total_fetched: usize,
 }
 
+impl QueryRow {
+    fn error(msg: String, elapsed_ms: u64, page_offset: usize, page_size: usize) -> Self {
+        Self {
+            columns: vec![],
+            rows: vec![],
+            truncated: false,
+            row_count: 0,
+            elapsed_ms,
+            is_error: true,
+            error_msg: Some(msg),
+            rows_affected: None,
+            page_offset,
+            page_size,
+            byte_count: 0,
+            total_fetched: 0,
+        }
+    }
+
+    fn from_query(
+        data: QueryData,
+        elapsed_ms: u64,
+        page_offset: usize,
+        page_size: usize,
+    ) -> Self {
+        let (columns, rows, truncated, total_fetched, byte_count) = data;
+        Self {
+            columns,
+            rows,
+            truncated,
+            row_count: total_fetched,
+            elapsed_ms,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset,
+            page_size,
+            byte_count,
+            total_fetched,
+        }
+    }
+
+    fn notice(text: &str, elapsed_ms: u64, page_size: usize) -> Self {
+        Self {
+            columns: vec!["Result".into()],
+            rows: vec![vec![text.to_string()]],
+            truncated: false,
+            row_count: 1,
+            elapsed_ms,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset: 0,
+            page_size,
+            byte_count: 0,
+            total_fetched: 0,
+        }
+    }
+}
+
+/// (columns, rows, truncated, total_fetched, byte_count)
+type QueryData = (Vec<String>, Vec<Vec<String>>, bool, usize, usize);
+
+/// Map an Oracle error to a message, collapsing user cancellations.
+fn clean_error(e: &oracle::Error) -> String {
+    let msg = e.to_string();
+    if msg.contains("ORA-01013") || msg.to_lowercase().contains("cancel") {
+        "Query cancelled".into()
+    } else {
+        msg
+    }
+}
+
+/// Skip leading whitespace and SQL comments (`-- ...` / `/* ... */`) so
+/// statement-type detection sees the first real keyword. Returns the
+/// remaining text, or "" if the input is only comments/whitespace.
+pub fn strip_leading_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("--") {
+            sql = rest.split_once('\n').map(|(_, after)| after).unwrap_or("");
+        } else if let Some(rest) = sql.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(idx) => sql = &rest[idx + 2..],
+                None => return "",
+            }
+        } else {
+            return sql;
+        }
+    }
+}
+
+fn is_query_sql(trimmed: &str) -> bool {
+    let upper = strip_leading_comments(trimmed).to_uppercase();
+    upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("DESCRIBE")
+        || upper.starts_with("EXPLAIN")
+}
+
 impl OracleConnection {
-    pub fn connect(connect_string: &str, user: &str, password: &str) -> Result<Arc<Self>, anyhow::Error> {
-        let conn = Connection::connect(user, password, connect_string)?;
-        Ok(Arc::new(Self { conn }))
+    pub fn connect_with_autocommit(
+        connect_string: &str,
+        user: &str,
+        password: &str,
+        autocommit: bool,
+        null_display: &str,
+    ) -> Result<Arc<Self>, anyhow::Error> {
+        let mut conn = Connection::connect(user, password, connect_string)?;
+        if autocommit {
+            conn.set_autocommit(true);
+        }
+        Ok(Arc::new(Self {
+            conn,
+            null_display: null_display.to_string(),
+        }))
+    }
+
+    /// Explicitly close the underlying Oracle connection (best-effort).
+    pub fn close(this: &Self) -> anyhow::Result<()> {
+        this.conn.close().map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    /// Augment a connect error with a friendly hint when the Oracle client
+    /// library isn't loadable (DPI-1047 — missing `libclntsh.so` / LD_LIBRARY_PATH).
+    pub fn friendly_connect_error(err: &anyhow::Error) -> String {
+        let msg = err.to_string();
+        if msg.contains("DPI-1047") || msg.contains("libclntsh") {
+            format!(
+                "{}\n\nHint: Oracle Instant Client (libclntsh.so) is required. \
+                 Install it and set LD_LIBRARY_PATH accordingly.",
+                msg
+            )
+        } else {
+            msg
+        }
     }
 
     pub fn execute_query(this: &Self, sql: &str, max_rows: usize) -> QueryRow {
         let start = std::time::Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
         let trimmed = sql.trim();
 
         if trimmed.eq_ignore_ascii_case("commit") {
             return match this.conn.commit() {
-                Ok(_) => QueryRow {
-                    columns: vec!["Result".into()],
-                    rows: vec![vec!["COMMIT".into()]],
-                    truncated: false,
-                    row_count: 1,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: false,
-                    error_msg: None,
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                },
-                Err(e) => QueryRow {
-                    columns: vec![],
-                    rows: vec![],
-                    truncated: false,
-                    row_count: 0,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: true,
-                    error_msg: Some(e.to_string()),
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                },
+                Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
+                Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
             };
         }
 
         if trimmed.eq_ignore_ascii_case("rollback") {
             return match this.conn.rollback() {
-                Ok(_) => QueryRow {
-                    columns: vec!["Result".into()],
-                    rows: vec![vec!["ROLLBACK".into()]],
-                    truncated: false,
-                    row_count: 1,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: false,
-                    error_msg: None,
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                },
-                Err(e) => QueryRow {
-                    columns: vec![],
-                    rows: vec![],
-                    truncated: false,
-                    row_count: 0,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: true,
-                    error_msg: Some(e.to_string()),
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                },
+                Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
+                Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
             };
         }
 
-        let is_query = trimmed.to_uppercase().starts_with("SELECT")
-            || trimmed.to_uppercase().starts_with("WITH")
-            || trimmed.to_uppercase().starts_with("DESCRIBE")
-            || trimmed.to_uppercase().starts_with("EXPLAIN");
+        if is_query_sql(trimmed) {
+            return match Self::do_query(this, sql, max_rows, None) {
+                Ok(data) => QueryRow::from_query(data, elapsed(), 0, max_rows),
+                Err(e) => QueryRow::error(clean_error(&e), elapsed(), 0, max_rows),
+            };
+        }
 
-        if is_query {
-            match Self::do_query(this, sql, max_rows, 0) {
-                Ok((cols, rows, truncated, total_fetched, byte_count)) => QueryRow {
-                    columns: cols,
-                    rows,
-                    truncated,
-                    row_count: total_fetched,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    rows_affected: None,
-                    is_error: false,
-                    error_msg: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count,
-                    total_fetched,
-                },
-                Err(e) => {
-                    let msg = e.to_string();
-                    let clean = if msg.contains("ORA-01013") || msg.to_lowercase().contains("cancel") {
-                        "Query cancelled".into()
-                    } else {
-                        msg
-                    };
-                    QueryRow {
-                    columns: vec![],
-                    rows: vec![],
-                    truncated: false,
-                    row_count: 0,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: true,
-                    error_msg: Some(clean),
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                }},
+        match this.conn.execute(sql, &[]) {
+            Ok(stmt) => {
+                let affected = stmt.row_count().unwrap_or(0);
+                let mut row = QueryRow::notice(
+                    &format!("Statement executed. Rows affected: {}", affected),
+                    elapsed(),
+                    max_rows,
+                );
+                row.row_count = affected as usize;
+                row.rows_affected = Some(affected);
+                row
             }
-        } else {
-            match this.conn.execute(sql, &[]) {
-                Ok(stmt) => {
-                    let affected = stmt.row_count().unwrap_or(0);
-                    QueryRow {
-                        columns: vec!["Result".into()],
-                        rows: vec![vec![format!("Statement executed. Rows affected: {}", affected)]],
-                        truncated: false,
-                        row_count: affected as usize,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        is_error: false,
-                        error_msg: None,
-                        rows_affected: Some(affected),
-                        page_offset: 0,
-                        page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                    }
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let clean = if msg.contains("ORA-01013") || msg.to_lowercase().contains("cancel") {
-                        "Query cancelled".into()
-                    } else {
-                        msg
-                    };
-                    QueryRow {
-                    columns: vec![],
-                    rows: vec![],
-                    truncated: false,
-                    row_count: 0,
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    is_error: true,
-                    error_msg: Some(clean),
-                    rows_affected: None,
-                    page_offset: 0,
-                    page_size: max_rows,
-                    byte_count: 0,
-                    total_fetched: 0,
-                }},
-            }
+            Err(e) => QueryRow::error(clean_error(&e), elapsed(), 0, max_rows),
         }
     }
 
@@ -196,13 +214,18 @@ impl OracleConnection {
     ) -> QueryRow {
         let start = std::time::Instant::now();
         let inner_sql = sql.trim().trim_end_matches(';').trim();
-        let end_row = page_offset + page_size;
-        let fetch_limit = end_row + 1;
+        // Fetch one extra row so we can tell whether more data follows.
+        let fetch_limit = page_offset + page_size + 1;
 
-        let paged_sql = if inner_sql.to_uppercase().starts_with("WITH ") {
+        let paged_sql = if strip_leading_comments(inner_sql)
+            .to_uppercase()
+            .starts_with("WITH ")
+        {
             format!(
                 "{} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                inner_sql, page_offset, page_size + 1
+                inner_sql,
+                page_offset,
+                page_size + 1
             )
         } else {
             format!(
@@ -211,111 +234,31 @@ impl OracleConnection {
             )
         };
 
-        match Self::do_query_paged(this, &paged_sql, page_size) {
-            Ok((cols, rows, truncated, total_fetched, byte_count)) => QueryRow {
-                columns: cols,
-                rows,
-                truncated,
-                row_count: total_fetched,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                rows_affected: None,
-                is_error: false,
-                error_msg: None,
+        match Self::do_query(this, &paged_sql, page_size, Some("RN")) {
+            Ok(data) => QueryRow::from_query(
+                data,
+                start.elapsed().as_millis() as u64,
                 page_offset,
                 page_size,
-                byte_count,
-                total_fetched,
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                let clean = if msg.contains("ORA-01013") || msg.to_lowercase().contains("cancel") {
-                    "Query cancelled".into()
-                } else {
-                    msg
-                };
-                QueryRow {
-                columns: vec![],
-                rows: vec![],
-                truncated: false,
-                row_count: 0,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                is_error: true,
-                error_msg: Some(clean),
-                rows_affected: None,
+            ),
+            Err(e) => QueryRow::error(
+                clean_error(&e),
+                start.elapsed().as_millis() as u64,
                 page_offset,
                 page_size,
-                    byte_count: 0,
-                    total_fetched: 0,
-            }
-        },
+            ),
         }
     }
+
+    /// Run a query and stringify up to `max_rows` (+ one look-ahead row used to
+    /// set `truncated`). When `skip_column` is given (ROWNUM pagination helper),
+    /// that column is dropped from the output.
     fn do_query(
         this: &Self,
         sql: &str,
         max_rows: usize,
-        _page_offset: usize,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>, bool, usize, usize), oracle::Error> {
-        let mut stmt = this.conn.statement(sql).build()?;
-        let rows = stmt.query(&[])?;
-
-        let col_info = rows.column_info();
-        let col_names: Vec<String> = col_info.iter().map(|c| c.name().to_string()).collect();
-        if col_names.is_empty() {
-            return Ok((vec!["Result".into()], vec![], false, 0, 0));
-        }
-
-        let mut result_rows: Vec<Vec<String>> = Vec::new();
-        let mut truncated = false;
-        let mut byte_count = 0usize;
-        let mut fetch_error = None;
-
-        for row_result in rows {
-            if result_rows.len() >= max_rows + 1 {
-                truncated = true;
-                break;
-            }
-            match row_result {
-                Ok(row) => {
-                    let mut row_vals = Vec::new();
-                    for i in 0..col_names.len() {
-                        let val: Result<Option<String>, _> = row.get(i);
-                        match val {
-                            Ok(Some(s)) => {
-                                byte_count += s.len();
-                                row_vals.push(s)
-                            },
-                            Ok(None) => row_vals.push("(NULL)".into()),
-                            Err(_) => row_vals.push("(ERR)".into()),
-                        }
-                    }
-                    result_rows.push(row_vals);
-                }
-                Err(e) => {
-                    fetch_error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        if result_rows.is_empty() && fetch_error.is_some() {
-            return Err(fetch_error.unwrap());
-        }
-
-        if result_rows.len() > max_rows {
-            truncated = true;
-            result_rows.truncate(max_rows);
-        }
-
-        let total_fetched = result_rows.len();
-        Ok((col_names, result_rows, truncated, total_fetched, byte_count))
-    }
-
-    fn do_query_paged(
-        this: &Self,
-        sql: &str,
-        max_rows: usize,
-    ) -> Result<(Vec<String>, Vec<Vec<String>>, bool, usize, usize), oracle::Error> {
+        skip_column: Option<&str>,
+    ) -> Result<QueryData, oracle::Error> {
         let mut stmt = this.conn.statement(sql).build()?;
         let rows = stmt.query(&[])?;
 
@@ -325,12 +268,13 @@ impl OracleConnection {
             return Ok((vec!["Result".into()], vec![], false, 0, 0));
         }
 
+        let skip_idx = skip_column.and_then(|n| all_names.iter().position(|c| c == n));
         let col_names: Vec<String> = all_names
             .iter()
-            .filter(|n| *n != "RN")
-            .cloned()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != skip_idx)
+            .map(|(_, n)| n.clone())
             .collect();
-        let rn_idx = all_names.iter().position(|n| n == "RN");
 
         let mut result_rows: Vec<Vec<String>> = Vec::new();
         let mut truncated = false;
@@ -338,7 +282,7 @@ impl OracleConnection {
         let mut fetch_error = None;
 
         for row_result in rows {
-            if result_rows.len() >= max_rows + 1 {
+            if result_rows.len() > max_rows {
                 truncated = true;
                 break;
             }
@@ -346,7 +290,7 @@ impl OracleConnection {
                 Ok(row) => {
                     let mut row_vals = Vec::new();
                     for i in 0..all_names.len() {
-                        if Some(i) == rn_idx {
+                        if Some(i) == skip_idx {
                             continue;
                         }
                         let val: Result<Option<String>, _> = row.get(i);
@@ -354,8 +298,8 @@ impl OracleConnection {
                             Ok(Some(s)) => {
                                 byte_count += s.len();
                                 row_vals.push(s)
-                            },
-                            Ok(None) => row_vals.push("(NULL)".into()),
+                            }
+                            Ok(None) => row_vals.push(this.null_display.clone()),
                             Err(_) => row_vals.push("(ERR)".into()),
                         }
                     }
@@ -368,14 +312,15 @@ impl OracleConnection {
             }
         }
 
-        if result_rows.is_empty() && fetch_error.is_some() {
-            return Err(fetch_error.unwrap());
+        if result_rows.is_empty() {
+            if let Some(e) = fetch_error {
+                return Err(e);
+            }
         }
 
-        // If we read max_rows + 1 rows, there are more - truncate and mark as truncated
+        // Drop the look-ahead row, adjusting byte_count to match.
         if result_rows.len() > max_rows {
             truncated = true;
-            // Remove the extra row and adjust byte_count
             if let Some(extra_row) = result_rows.pop() {
                 for val in extra_row {
                     byte_count = byte_count.saturating_sub(val.len());
@@ -388,7 +333,9 @@ impl OracleConnection {
     }
 
     pub fn cancel_query(this: &Self) -> anyhow::Result<()> {
-        this.conn.break_execution().map_err(|e| anyhow::anyhow!("{}", e))
+        this.conn
+            .break_execution()
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     pub fn query_v_session(this: &Self) -> Result<Vec<DbSessionInfo>, anyhow::Error> {
@@ -437,4 +384,25 @@ pub struct DbSessionInfo {
     pub sql_id: String,
     pub prev_sql_id: String,
     pub logon_time: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_leading_comments_for_query_detection() {
+        assert!(is_query_sql("-- note\nselect 1 from dual"));
+        assert!(is_query_sql("/* hi */ with x as (select 1 from dual) select * from x"));
+        assert!(is_query_sql(
+            "-- a\n-- b\n/* c; */\nselect * from all_tables;"
+        ));
+        assert!(!is_query_sql("-- note\nupdate t set x = 1"));
+        assert!(strip_leading_comments("-- only comment").is_empty());
+        assert!(strip_leading_comments("/* unterminated").is_empty());
+        assert_eq!(
+            strip_leading_comments("-- ; --\nselect 1"),
+            "select 1"
+        );
+    }
 }

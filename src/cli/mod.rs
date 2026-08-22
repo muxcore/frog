@@ -1,9 +1,21 @@
+pub mod dotenv;
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Clone, Debug)]
-#[command(name = "frog", about = "Terminal Oracle client")]
+#[command(
+    name = "frog",
+    about = "Terminal Oracle client",
+    after_help = "\nExamples:\n\n\
+Connect with a full connection string (host/port/service/user/password):\n\
+    frog -d \"HOST=db1.local;PORT=1521;SERVICE_NAME=ORCL;USER=scott;PASSWORD=tiger\"\n\n\
+Connect with individual parameters (env variables can be used instead):\n\
+    frog -H db1.local -P 1521 -S ORCL -U scott\n\n\
+Same connection using only environment variables:\n\
+    ORACLE_HOST=db1.local ORACLE_SERVICE=ORCL ORACLE_USER=scott ORACLE_PASSWORD=tiger frog\n"
+)]
 pub struct CliArgs {
     #[arg(short = 'H', long, env = "ORACLE_HOST", default_value = "localhost")]
     pub host: String,
@@ -16,9 +28,6 @@ pub struct CliArgs {
 
     #[arg(short = 'U', long = "user", env = "ORACLE_USER")]
     pub user: Option<String>,
-
-    #[arg(short = 'W', long = "password", env = "ORACLE_PASSWORD")]
-    pub password: Option<String>,
 
     #[arg(short = 'd', long = "connect-string", env = "ORACLE_CONNECT")]
     pub connect_string: Option<String>,
@@ -86,6 +95,13 @@ pub struct ConnectionParams {
 
 impl Config {
     pub fn parse() -> Self {
+        // Second-priority configuration source: a `.env` file in the working
+        // directory. Keys already set in the real environment are not
+        // overridden, so precedence is CLI > env var > .env > default.
+        if let Some(info) = dotenv::apply_dotenv() {
+            eprintln!("frog: {}", info.summary());
+        }
+
         let args = CliArgs::parse();
 
         let (mut connection, mut extra_saved) = if let Some(ref cs) = args.connect_string {
@@ -97,7 +113,11 @@ impl Config {
                     port: args.port,
                     service: args.service,
                     user: args.user.clone().unwrap_or_default(),
-                    password: args.password,
+                    // Password comes from ORACLE_PASSWORD env (never a CLI flag),
+                    // or is prompted interactively at startup in main().
+                    password: std::env::var("ORACLE_PASSWORD")
+                        .ok()
+                        .filter(|p| !p.is_empty()),
                 },
                 vec![],
             )
@@ -116,13 +136,17 @@ impl Config {
                         port: connection.port,
                         service: connection.service.clone(),
                         user: connection.user.clone(),
-                        password: connection.password.clone(),
+                        // Do not retain the plaintext password in the saved list.
+                        password: None,
                     }];
                 } else if !extra_saved.is_empty() {
                     extra_saved[0].user = connection.user.clone();
                     extra_saved[0].name = format!(
                         "{}@{}:{}/{}",
-                        connection.user, extra_saved[0].host, extra_saved[0].port, extra_saved[0].service
+                        connection.user,
+                        extra_saved[0].host,
+                        extra_saved[0].port,
+                        extra_saved[0].service
                     );
                 }
             }
@@ -159,10 +183,7 @@ impl Config {
         }
     }
 
-    pub fn connect_string(&self, password: Option<&str>) -> String {
-        let _pw = password
-            .or(self.connection.password.as_deref())
-            .unwrap_or("");
+    pub fn connect_string(&self) -> String {
         format!(
             "//{}:{}/{}",
             self.connection.host, self.connection.port, self.connection.service
@@ -190,21 +211,16 @@ fn parse_connect_string(cs: &str) -> (ConnectionParams, Vec<ConnectionEntry>) {
     let mut password: Option<String> = None;
 
     for part in normalized.split(';') {
-        let part = part.trim();
-        if part.starts_with("HOST=") || part.starts_with("host=") {
-            host = part.split('=').nth(1).unwrap_or("localhost").to_string();
-        } else if part.starts_with("PORT=") || part.starts_with("port=") {
-            port = part
-                .split('=')
-                .nth(1)
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(1521);
-        } else if part.starts_with("SERVICE_NAME=") || part.starts_with("service_name=") {
-            service = part.split('=').nth(1).unwrap_or("ORCL").to_string();
-        } else if part.starts_with("USER=") || part.starts_with("user=") {
-            user = part.split('=').nth(1).unwrap_or("").to_string();
-        } else if part.starts_with("PASSWORD=") || part.starts_with("password=") {
-            password = Some(part.split('=').nth(1).unwrap_or("").to_string());
+        // split_once keeps '=' inside values (e.g. base64 passwords).
+        if let Some((key, value)) = part.trim().split_once('=') {
+            match key.to_ascii_uppercase().as_str() {
+                "HOST" => host = value.trim().to_string(),
+                "PORT" => port = value.trim().parse().unwrap_or(1521),
+                "SERVICE_NAME" => service = value.trim().to_string(),
+                "USER" => user = value.trim().to_string(),
+                "PASSWORD" => password = Some(value.to_string()),
+                _ => {}
+            }
         }
     }
 
@@ -223,7 +239,7 @@ fn parse_connect_string(cs: &str) -> (ConnectionParams, Vec<ConnectionEntry>) {
             user,
             service,
             port,
-            password,
+            password: None,
         }]
     } else {
         vec![]
@@ -244,13 +260,41 @@ fn load_config_file(path: Option<&Path>) -> Option<ConfigFile> {
         paths
     };
 
-    for p in try_paths {
-        if p.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&p) {
-                if let Ok(cfg) = serde_yaml::from_str::<ConfigFile>(&contents) {
-                    return Some(cfg);
+    // Surface config load/parse problems on stderr instead of silently using
+    // defaults, so misconfiguration isn't invisible to the user.
+    let mut found_missing = Vec::new();
+    for p in &try_paths {
+        if !p.exists() {
+            found_missing.push(p.clone());
+            continue;
+        }
+        match std::fs::read_to_string(p) {
+            Ok(contents) => match serde_yaml::from_str::<ConfigFile>(&contents) {
+                Ok(cfg) => return Some(cfg),
+                Err(e) => {
+                    eprintln!(
+                        "frog: warning: could not parse config '{}': {}",
+                        p.display(),
+                        e
+                    );
+                    return None;
                 }
+            },
+            Err(e) => {
+                eprintln!(
+                    "frog: warning: could not read config '{}': {}",
+                    p.display(),
+                    e
+                );
+                return None;
             }
+        }
+    }
+
+    // An explicit -f path that doesn't exist is a hard error worth flagging.
+    if let Some(p) = path {
+        if found_missing.iter().any(|x| x == p) {
+            eprintln!("frog: warning: config file not found: '{}'", p.display());
         }
     }
     None
@@ -262,18 +306,37 @@ mod tests {
 
     #[test]
     fn test_cli_parse_connect_string_without_user() {
-        let args = CliArgs::parse_from(["frog", "-d", "host=localhost;port=1521;service_name=ORCL;user=scott"]);
-        assert_eq!(args.connect_string.as_deref(), Some("host=localhost;port=1521;service_name=ORCL;user=scott"));
+        let args = CliArgs::parse_from([
+            "frog",
+            "-d",
+            "host=localhost;port=1521;service_name=ORCL;user=scott",
+        ]);
+        assert_eq!(
+            args.connect_string.as_deref(),
+            Some("host=localhost;port=1521;service_name=ORCL;user=scott")
+        );
         assert_eq!(args.user, None);
     }
 
     #[test]
     fn test_parse_connect_string() {
-        let (params, _saved) = parse_connect_string("host=myhost;port=1522;service_name=mysvc;user=myuser;password=mypass");
+        let (params, _saved) = parse_connect_string(
+            "host=myhost;port=1522;service_name=mysvc;user=myuser;password=mypass",
+        );
         assert_eq!(params.host, "myhost");
         assert_eq!(params.port, 1522);
         assert_eq!(params.service, "mysvc");
         assert_eq!(params.user, "myuser");
         assert_eq!(params.password.as_deref(), Some("mypass"));
+    }
+
+    #[test]
+    fn test_parse_connect_string_value_with_equals_and_mixed_case() {
+        let (params, _saved) =
+            parse_connect_string("Host=db1;Password=ab==cd;SERVICE_NAME=orcl;User=u");
+        assert_eq!(params.host, "db1");
+        assert_eq!(params.password.as_deref(), Some("ab==cd"));
+        assert_eq!(params.service, "orcl");
+        assert_eq!(params.user, "u");
     }
 }

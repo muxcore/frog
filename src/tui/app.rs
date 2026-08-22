@@ -2,6 +2,7 @@ use crate::cli::Config;
 use crate::db::session_manager::{SessionManager, SessionMode};
 use crate::tui::widgets::*;
 
+use crate::db::session_manager::ConnectionDialog;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind},
     execute,
@@ -9,18 +10,30 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
+use unicode_width::UnicodeWidthChar;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Convert a screen-column offset into a byte offset on `line`, walking chars
+/// by display width so multibyte / wide characters position correctly.
+fn byte_offset_for_column(line: &str, target_col: usize) -> usize {
+    let mut cells = 0usize;
+    let mut byte_off = 0usize;
+    for ch in line.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if cells + w > target_col {
+            break;
+        }
+        cells += w;
+        byte_off += ch.len_utf8();
+    }
+    byte_off
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResultFormat {
+    #[default]
     Table,
     Markdown,
     Ascii,
-}
-
-impl Default for ResultFormat {
-    fn default() -> Self {
-        ResultFormat::Table
-    }
 }
 
 pub struct App {
@@ -38,6 +51,15 @@ pub struct App {
     editor_area: Rect,
     results_area: Rect,
     sidebar_area: Rect,
+    command_mode: bool,
+    command_input: String,
+    command_error: Option<String>,
+    /// When set, the command bar is in confirm mode for this @file command.
+    command_confirm: Option<String>,
+    /// Whether frog captures mouse events. Toggled with Ctrl+M (tmux-style):
+    /// while OFF, the terminal handles selection/copy natively and pastes land
+    /// via bracketed paste.
+    mouse_capture: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +93,11 @@ impl App {
             editor_area: Rect::default(),
             results_area: Rect::default(),
             sidebar_area: Rect::default(),
+            command_mode: false,
+            command_input: String::new(),
+            command_error: None,
+            command_confirm: None,
+            mouse_capture: true,
         })
     }
 
@@ -90,17 +117,23 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let cs = self.config.connect_string(None);
+        let cs = self.config.connect_string();
         let user = self.config.connection.user.clone();
         let pwd = self.config.connection.password.clone().unwrap_or_default();
-        if !user.is_empty() {
-            // Populate conn_dialog with CLI params so new sessions inherit them
+        // Always seed the connection dialog (Ctrl+O) from the startup connection
+        // params (CLI flags / ORACLE_* env vars / config.yml), so it reflects them
+        // even when no user is set — e.g. setting only ORACLE_HOST/ORACLE_SERVICE
+        // and typing user+password in the dialog. Only auto-connect when we have
+        // a user to connect as.
+        {
             let session = self.session_manager.active_session_mut();
             session.conn_dialog.host = self.config.connection.host.clone();
             session.conn_dialog.port = self.config.connection.port.to_string();
             session.conn_dialog.service = self.config.connection.service.clone();
             session.conn_dialog.user = user.clone();
             session.conn_dialog.password = pwd.clone();
+        }
+        if !user.is_empty() {
             self.session_manager.connect_active(&cs, &user, &pwd);
         }
 
@@ -120,11 +153,15 @@ impl App {
         res
     }
 
-    fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
+    fn run_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> anyhow::Result<()> {
         while !self.should_quit {
             self.session_manager.poll_result();
             self.session_manager.poll_conn_result();
             self.session_manager.check_connections();
+            self.session_manager.tick_statuses();
 
             terminal.draw(|f| self.ui(f))?;
 
@@ -132,16 +169,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key),
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
-                    Event::Paste(text) => {
-                        let session = self.session_manager.active_session_mut();
-                        for c in text.chars() {
-                            if c == '\n' {
-                                session.editor.newline();
-                            } else if c != '\r' {
-                                session.editor.insert_char(c);
-                            }
-                        }
-                    }
+                    Event::Paste(text) => self.paste_text(&text),
                     _ => {}
                 }
             }
@@ -149,31 +177,95 @@ impl App {
         Ok(())
     }
 
+    /// Insert pasted text into the active target (command bar, connection
+    /// dialog field or SQL editor).
+    fn paste_text(&mut self, text: &str) {
+        if self.command_mode {
+            self.command_input
+                .extend(text.chars().filter(|c| !c.is_control()));
+            return;
+        }
+        let session = self.session_manager.active_session_mut();
+        if session.mode == SessionMode::ConnectionPickerDialog {
+            for c in text.chars() {
+                session.conn_dialog.insert_char(c);
+            }
+        } else {
+            for c in text.chars() {
+                if c == '\n' {
+                    session.editor.newline();
+                } else if c != '\r' {
+                    session.editor.insert_char(c);
+                }
+            }
+        }
+    }
+
+    /// Toggle mouse capture (tmux-style). While OFF the terminal handles text
+    /// selection/copy natively; bracketed paste still reaches frog.
+    fn toggle_mouse_capture(&mut self) {
+        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        self.mouse_capture = !self.mouse_capture;
+        let mut stdout = io::stdout();
+        let _ = if self.mouse_capture {
+            execute!(stdout, EnableMouseCapture)
+        } else {
+            execute!(stdout, DisableMouseCapture)
+        };
+        let msg = if self.mouse_capture {
+            "Mouse capture ON"
+        } else {
+            "Mouse capture OFF — select to copy with the terminal; middle-click/Ctrl+Shift+V pastes"
+        };
+        self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    /// Read the Linux primary selection (middle-click clipboard), falling back
+    /// to the regular clipboard.
+    #[cfg(target_os = "linux")]
+    fn read_primary_selection() -> Option<String> {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        let mut cb = arboard::Clipboard::new().ok()?;
+        if let Ok(text) = cb.get().clipboard(LinuxClipboardKind::Primary).text() {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        cb.get().text().ok().filter(|t| !t.is_empty())
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                let in_editor = self.editor_area.contains(Position::new(mouse.column, mouse.row));
-                let in_results = self.results_area.contains(Position::new(mouse.column, mouse.row));
-                let in_sidebar = self.sidebar_area.contains(Position::new(mouse.column, mouse.row));
+                let in_editor = self
+                    .editor_area
+                    .contains(Position::new(mouse.column, mouse.row));
+                let in_results = self
+                    .results_area
+                    .contains(Position::new(mouse.column, mouse.row));
+                let in_sidebar = self
+                    .sidebar_area
+                    .contains(Position::new(mouse.column, mouse.row));
 
                 let splitter_x = self.sidebar_area.x;
                 if !self.hide_sidebar && (mouse.column).abs_diff(splitter_x) <= 1 && mouse.row > 2 {
                     self.is_resizing = true;
                 } else if in_editor {
-                    self.active_window = ActiveWindow::Editor;
-                    let session = self.session_manager.active_session_mut();
-                    session.mode = SessionMode::Query;
-                    let raw_row = (mouse.row.saturating_sub(self.editor_area.y + 1)) as usize
-                        + session.editor.scroll_offset;
-                    let line_num_width = 4usize;
-                    let col = (mouse.column.saturating_sub(self.editor_area.x + 1 + line_num_width as u16)) as usize;
-                    let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
-                    session.editor.cursor_row = target_row;
-                    session.editor.cursor_col = col.min(session.editor.lines[target_row].len());
+                    self.click_editor(mouse.column, mouse.row);
                 } else if in_results {
                     self.active_window = ActiveWindow::Results;
                 } else if in_sidebar {
                     self.active_window = ActiveWindow::Sidebar;
+                }
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Middle) => {
+                // tmux-style middle-click paste: place the cursor where the
+                // user clicked in the editor, then insert the primary selection.
+                if self.editor_area.contains(Position::new(mouse.column, mouse.row)) {
+                    self.click_editor(mouse.column, mouse.row);
+                    if let Some(text) = Self::read_primary_selection() {
+                        self.paste_text(&text);
+                    }
                 }
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
@@ -189,24 +281,57 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.results_area.contains(Position::new(mouse.column, mouse.row)) {
+                if self
+                    .results_area
+                    .contains(Position::new(mouse.column, mouse.row))
+                {
                     let session = self.session_manager.active_session_mut();
                     session.scroll_offset = session.scroll_offset.saturating_add(3);
                 }
             }
-            MouseEventKind::ScrollUp => {
-                if self.results_area.contains(Position::new(mouse.column, mouse.row)) {
-                    let session = self.session_manager.active_session_mut();
-                    session.scroll_offset = session.scroll_offset.saturating_sub(3);
-                }
+            MouseEventKind::ScrollUp
+                if self
+                    .results_area
+                    .contains(Position::new(mouse.column, mouse.row)) =>
+            {
+                let session = self.session_manager.active_session_mut();
+                session.scroll_offset = session.scroll_offset.saturating_sub(3);
             }
             _ => {}
         }
     }
 
+    /// Focus the editor and move the text cursor to the clicked position.
+    fn click_editor(&mut self, column: u16, row: u16) {
+        self.active_window = ActiveWindow::Editor;
+        let session = self.session_manager.active_session_mut();
+        session.mode = SessionMode::Query;
+        let raw_row = (row.saturating_sub(self.editor_area.y + 1)) as usize
+            + session.editor.scroll_offset;
+        let line_num_width = 4usize;
+        let target_col =
+            (column.saturating_sub(self.editor_area.x + 1 + line_num_width as u16)) as usize;
+        let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
+        session.editor.cursor_row = target_row;
+        session.editor.cursor_col =
+            byte_offset_for_column(&session.editor.lines[target_row], target_col);
+        session.editor.snap_cursor_to_char_boundary();
+    }
+
     fn handle_key(&mut self, key: event::KeyEvent) {
+        // The kitty keyboard protocol (enabled at startup) also delivers
+        // release events; process press/repeat only.
+        if key.kind == event::KeyEventKind::Release {
+            return;
+        }
+
         if self.show_startup_help {
             self.show_startup_help = false;
+            return;
+        }
+
+        if self.command_mode {
+            self.handle_command_key(key);
             return;
         }
 
@@ -226,6 +351,17 @@ impl App {
                 self.should_quit = true;
                 return;
             }
+            // Enter tmux-style command bar (Ctrl+:). Full-width '；' and
+            // Ctrl+; are also accepted for convenience on non-US layouts.
+            (KeyModifiers::CONTROL, KeyCode::Char(':'))
+            | (KeyModifiers::CONTROL, KeyCode::Char(';'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('：')) => {
+                self.command_mode = true;
+                self.command_input.clear();
+                self.command_error = None;
+                self.command_confirm = None;
+                return;
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
                 self.session_manager.add_session();
                 return;
@@ -243,44 +379,15 @@ impl App {
                 self.session_manager.switch_prev();
                 return;
             }
-            (KeyModifiers::ALT, KeyCode::Char('1')) => {
-                self.session_manager.switch_to(0);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('2')) => {
-                self.session_manager.switch_to(1);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('3')) => {
-                self.session_manager.switch_to(2);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('4')) => {
-                self.session_manager.switch_to(3);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('5')) => {
-                self.session_manager.switch_to(4);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('6')) => {
-                self.session_manager.switch_to(5);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('7')) => {
-                self.session_manager.switch_to(6);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('8')) => {
-                self.session_manager.switch_to(7);
-                return;
-            }
-            (KeyModifiers::ALT, KeyCode::Char('9')) => {
-                self.session_manager.switch_to(8);
+            (KeyModifiers::ALT, KeyCode::Char(c @ '1'..='9')) => {
+                self.session_manager.switch_to(c as usize - '1' as usize);
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
-                self.session_manager.active_session_mut().mode = SessionMode::ConnectionPickerDialog;
+                let session = self.session_manager.active_session_mut();
+                let field = session.conn_dialog.active_field;
+                session.conn_dialog.select_field(field);
+                session.mode = SessionMode::ConnectionPickerDialog;
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
@@ -296,6 +403,13 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('b')) => {
                 self.hide_sidebar = !self.hide_sidebar;
+                return;
+            }
+            // tmux-style: toggle mouse capture so the terminal's native
+            // selection/copy can be used (Ctrl+M needs a CSI-u terminal, same
+            // as Ctrl+Enter).
+            (KeyModifiers::CONTROL, KeyCode::Char('m')) => {
+                self.toggle_mouse_capture();
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('z')) | (KeyModifiers::NONE, KeyCode::F(11)) => {
@@ -329,49 +443,12 @@ impl App {
                             }
                         }
                         ResultFormat::Ascii => {
-                            // Calculate column widths
-                            let mut col_widths: Vec<usize> = last_res.columns.iter().map(|c| c.len()).collect();
-                            for row in &last_res.rows {
-                                for (i, cell) in row.iter().enumerate() {
-                                    if i < col_widths.len() {
-                                        col_widths[i] = col_widths[i].max(cell.len());
-                                    }
-                                }
-                            }
-                            // Header
-                            text.push_str("+");
-                            for w in &col_widths {
-                                text.push_str(&"-".repeat(w + 2));
-                                text.push_str("+");
-                            }
-                            text.push('\n');
-                            text.push_str("| ");
-                            for (i, col) in last_res.columns.iter().enumerate() {
-                                text.push_str(&format!("{:width$} | ", col, width = col_widths[i]));
-                            }
-                            text.push('\n');
-                            text.push_str("+");
-                            for w in &col_widths {
-                                text.push_str(&"-".repeat(w + 2));
-                                text.push_str("+");
-                            }
-                            text.push('\n');
-                            // Rows
-                            for row in &last_res.rows {
-                                text.push_str("| ");
-                                for (i, cell) in row.iter().enumerate() {
-                                    if i < col_widths.len() {
-                                        text.push_str(&format!("{:width$} | ", cell, width = col_widths[i]));
-                                    }
-                                }
-                                text.push('\n');
-                            }
-                            text.push_str("+");
-                            for w in &col_widths {
-                                text.push_str(&"-".repeat(w + 2));
-                                text.push_str("+");
-                            }
-                            text.push('\n');
+                            text.push_str(&format_ascii_table(
+                                last_res,
+                                0,
+                                0,
+                                last_res.rows.len(),
+                            ));
                         }
                         ResultFormat::Table => {
                             // TSV fallback
@@ -462,83 +539,170 @@ impl App {
         let session = self.session_manager.active_session_mut();
 
         match session.mode {
-            SessionMode::Query => {
-                match self.active_window {
-                    ActiveWindow::Editor => match (key.modifiers, key.code) {
-                        (KeyModifiers::CONTROL, KeyCode::Char('a')) => session.editor.cursor_col = 0,
-                        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
-                            session.editor.cursor_col =
-                                session.editor.lines[session.editor.cursor_row].len();
-                        }
-                        (KeyModifiers::CONTROL, KeyCode::Char('k')) => session.editor.kill_line(),
-                        (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                            session.editor.lines[session.editor.cursor_row].clear();
-                            session.editor.cursor_col = 0;
-                        }
-                        (KeyModifiers::CONTROL, KeyCode::Char('d')) => session.editor.delete(),
-                        (m, KeyCode::Char(c)) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                            if !c.is_control() {
-                                session.editor.insert_char(c);
-                            }
-                        }
-                        (m, KeyCode::Backspace) if m.is_empty() || m == KeyModifiers::SHIFT => session.editor.backspace(),
-                        (m, KeyCode::Delete) if m.is_empty() || m == KeyModifiers::SHIFT => session.editor.delete(),
-                        (m, KeyCode::Enter) if m.is_empty() || m == KeyModifiers::SHIFT => session.editor.newline(),
-                        (_, KeyCode::Left) => session.editor.move_left(),
-                        (_, KeyCode::Right) => session.editor.move_right(),
-                        (_, KeyCode::Up) => session.editor.move_up(),
-                        (_, KeyCode::Down) => session.editor.move_down(),
-                        (_, KeyCode::Home) => session.editor.cursor_col = 0,
-                        (_, KeyCode::End) => {
-                            session.editor.cursor_col =
-                                session.editor.lines[session.editor.cursor_row].len();
-                        }
-                        (_, KeyCode::PageUp) => {
-                            for _ in 0..10 {
-                                session.editor.move_up();
-                            }
-                        }
-                        (_, KeyCode::PageDown) => {
-                            for _ in 0..10 {
-                                session.editor.move_down();
-                            }
-                        }
-                        _ => {}
-                    },
-                    ActiveWindow::Results => match key.code {
-                        KeyCode::Down => {
-                            session.scroll_offset = session.scroll_offset.saturating_add(1)
-                        }
-                        KeyCode::Up => {
-                            session.scroll_offset = session.scroll_offset.saturating_sub(1)
-                        }
-                        KeyCode::Right => {
-                            session.col_scroll_offset = session.col_scroll_offset.saturating_add(1)
-                        }
-                        KeyCode::Left => {
-                            session.col_scroll_offset = session.col_scroll_offset.saturating_sub(1)
-                        }
-                        KeyCode::PageDown => {
-                            session.scroll_offset = session.scroll_offset.saturating_add(20)
-                        }
-                        KeyCode::PageUp => {
-                            session.scroll_offset = session.scroll_offset.saturating_sub(20)
-                        }
-                        KeyCode::Esc => self.active_window = ActiveWindow::Editor,
-                        _ => {}
-                    },
-                    ActiveWindow::Sidebar => {
-                        if key.code == KeyCode::Esc {
-                            self.active_window = ActiveWindow::Editor;
+            SessionMode::Query => match self.active_window {
+                ActiveWindow::Editor => match (key.modifiers, key.code) {
+                    (KeyModifiers::CONTROL, KeyCode::Char('a')) => session.editor.cursor_col = 0,
+                    (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                        session.editor.cursor_col =
+                            session.editor.lines[session.editor.cursor_row].len();
+                    }
+                    (KeyModifiers::CONTROL, KeyCode::Char('k')) => session.editor.kill_line(),
+                    (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                        session.editor.lines[session.editor.cursor_row].clear();
+                        session.editor.cursor_col = 0;
+                    }
+                    (KeyModifiers::CONTROL, KeyCode::Char('d')) => session.editor.delete(),
+                    (m, KeyCode::Char(c)) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        if !c.is_control() {
+                            session.editor.insert_char(c);
                         }
                     }
+                    (m, KeyCode::Backspace) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        session.editor.backspace()
+                    }
+                    (m, KeyCode::Delete) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        session.editor.delete()
+                    }
+                    (m, KeyCode::Enter) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        session.editor.newline()
+                    }
+                    (_, KeyCode::Left) => session.editor.move_left(),
+                    (_, KeyCode::Right) => session.editor.move_right(),
+                    (_, KeyCode::Up) => session.editor.move_up(),
+                    (_, KeyCode::Down) => session.editor.move_down(),
+                    (_, KeyCode::Home) => session.editor.cursor_col = 0,
+                    (_, KeyCode::End) => {
+                        session.editor.cursor_col =
+                            session.editor.lines[session.editor.cursor_row].len();
+                    }
+                    (_, KeyCode::PageUp) => {
+                        for _ in 0..10 {
+                            session.editor.move_up();
+                        }
+                    }
+                    (_, KeyCode::PageDown) => {
+                        for _ in 0..10 {
+                            session.editor.move_down();
+                        }
+                    }
+                    _ => {}
+                },
+                ActiveWindow::Results => match key.code {
+                    KeyCode::Down => {
+                        session.scroll_offset = session.scroll_offset.saturating_add(1)
+                    }
+                    KeyCode::Up => session.scroll_offset = session.scroll_offset.saturating_sub(1),
+                    KeyCode::Right => {
+                        session.col_scroll_offset = session.col_scroll_offset.saturating_add(1)
+                    }
+                    KeyCode::Left => {
+                        session.col_scroll_offset = session.col_scroll_offset.saturating_sub(1)
+                    }
+                    KeyCode::PageDown => {
+                        session.scroll_offset = session.scroll_offset.saturating_add(20)
+                    }
+                    KeyCode::PageUp => {
+                        session.scroll_offset = session.scroll_offset.saturating_sub(20)
+                    }
+                    KeyCode::Esc => self.active_window = ActiveWindow::Editor,
+                    _ => {}
+                },
+                ActiveWindow::Sidebar => {
+                    if key.code == KeyCode::Esc {
+                        self.active_window = ActiveWindow::Editor;
+                    }
                 }
-            }
-            SessionMode::Results | SessionMode::SessionView | SessionMode::Help | SessionMode::History | SessionMode::ConnectionPickerDialog => {
+            },
+            SessionMode::Results
+            | SessionMode::SessionView
+            | SessionMode::Help
+            | SessionMode::History
+            | SessionMode::ConnectionPickerDialog => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     session.mode = SessionMode::Query;
                     self.active_window = ActiveWindow::Editor;
                 }
+            }
+        }
+    }
+
+    /// Handle input while the tmux-style command bar is open (Ctrl+:).
+    fn handle_command_key(&mut self, key: event::KeyEvent) {
+        // Confirmation prompt: y/Enter run, n/Esc cancel.
+        if self.command_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let cmd = self.command_confirm.take().unwrap();
+                    self.command_mode = false;
+                    self.command_input.clear();
+                    self.command_error = None;
+                    self.run_command(&cmd, true);
+                }
+                _ => {
+                    self.command_confirm = None;
+                    self.command_mode = false;
+                    self.command_input.clear();
+                    self.command_error = None;
+                }
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.command_mode = false;
+                self.command_input.clear();
+                self.command_error = None;
+            }
+            KeyCode::Enter => {
+                let cmd = self.command_input.trim().to_string();
+                self.command_mode = false;
+                self.command_input.clear();
+                self.command_error = None;
+                if !cmd.is_empty() {
+                    self.run_command(&cmd, false);
+                }
+            }
+            KeyCode::Backspace => {
+                self.command_input.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.command_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Execute a command typed into the command bar. `confirmed` is true when
+    /// the user already accepted the "Run? [y/N]" prompt for this command.
+    fn run_command(&mut self, cmd: &str, confirmed: bool) {
+        let lower = cmd.trim().to_lowercase();
+
+        // @file / @ file.sql — run a SQL script file (handled by execute_query).
+        if lower.starts_with('@') {
+            let path = cmd.trim_start_matches('@').trim();
+            // Confirm running files with a non-.sql extension.
+            if !path.ends_with(".sql") && !confirmed {
+                self.command_mode = true;
+                self.command_confirm = Some(cmd.to_string());
+                self.command_input.clear();
+                self.command_error = None;
+                return;
+            }
+            let session = self.session_manager.active_session_mut();
+            session.set_status(format!("Running script '{}'...", path));
+            self.session_manager.execute_query(cmd);
+            return;
+        }
+
+        match lower.as_str() {
+            "clear" | "cls" => {
+                let session = self.session_manager.active_session_mut();
+                session.results.clear();
+                session.set_status("Results cleared");
+            }
+            _ => {
+                self.command_error = Some(format!("Unknown command: '{}'", cmd));
             }
         }
     }
@@ -575,15 +739,26 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 session.mode = SessionMode::Query;
-                return;
             }
             KeyCode::Tab | KeyCode::Down => {
-                dlg.active_field = (dlg.active_field + 1) % 5;
-                return;
+                let next = (dlg.active_field + 1) % ConnectionDialog::FIELD_COUNT;
+                dlg.select_field(next);
             }
             KeyCode::BackTab | KeyCode::Up => {
-                dlg.active_field = if dlg.active_field == 0 { 4 } else { dlg.active_field - 1 };
-                return;
+                let prev = if dlg.active_field == 0 {
+                    ConnectionDialog::FIELD_COUNT - 1
+                } else {
+                    dlg.active_field - 1
+                };
+                dlg.select_field(prev);
+            }
+            KeyCode::Left => dlg.cursor_left(),
+            KeyCode::Right => dlg.cursor_right(),
+            KeyCode::Home | KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+                dlg.cursor_home()
+            }
+            KeyCode::End | KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+                dlg.cursor_end()
             }
             KeyCode::Enter => {
                 let host = dlg.host.clone();
@@ -594,30 +769,11 @@ impl App {
                 let cs = format!("//{}:{}/{}", host, port, service);
                 session.mode = SessionMode::Query;
                 self.session_manager.connect_active(&cs, &user, &password);
-                return;
             }
-            KeyCode::Char(c) => {
-                let field = match dlg.active_field {
-                    0 => &mut dlg.host,
-                    1 => &mut dlg.port,
-                    2 => &mut dlg.service,
-                    3 => &mut dlg.user,
-                    4 => &mut dlg.password,
-                    _ => return,
-                };
-                field.push(c);
-            }
-            KeyCode::Backspace => {
-                let field = match dlg.active_field {
-                    0 => &mut dlg.host,
-                    1 => &mut dlg.port,
-                    2 => &mut dlg.service,
-                    3 => &mut dlg.user,
-                    4 => &mut dlg.password,
-                    _ => return,
-                };
-                field.pop();
-            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => dlg.clear_field(),
+            KeyCode::Backspace => dlg.backspace(),
+            KeyCode::Delete => dlg.delete(),
+            KeyCode::Char(c) => dlg.insert_char(c),
             _ => {}
         }
     }
@@ -639,7 +795,12 @@ impl App {
             ])
             .split(size);
 
-        render_tabs(&self.session_manager.sessions, self.session_manager.active_idx, f, chunks[0]);
+        render_tabs(
+            &self.session_manager.sessions,
+            self.session_manager.active_idx,
+            f,
+            chunks[0],
+        );
 
         let mode = self.session_manager.active_session().mode.clone();
 
@@ -686,7 +847,10 @@ impl App {
 
                         let main_chunks = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints([Constraint::Length(self.editor_height), Constraint::Min(4)])
+                            .constraints([
+                                Constraint::Length(self.editor_height),
+                                Constraint::Min(4),
+                            ])
                             .split(left);
 
                         self.editor_area = main_chunks[0];
@@ -697,26 +861,61 @@ impl App {
 
                 if self.editor_area.height > 2 {
                     let vis_height = self.editor_area.height.saturating_sub(2) as usize;
-                    self.session_manager.active_session_mut().editor.ensure_cursor_visible(vis_height);
+                    self.session_manager
+                        .active_session_mut()
+                        .editor
+                        .ensure_cursor_visible(vis_height);
                 }
 
                 let session = self.session_manager.active_session();
 
                 match self.maximized_box {
                     Some(MaximizedBox::Editor) => {
-                        render_editor(session, self.active_window == ActiveWindow::Editor, f, self.editor_area);
+                        render_editor(
+                            session,
+                            self.active_window == ActiveWindow::Editor,
+                            f,
+                            self.editor_area,
+                        );
                     }
                     Some(MaximizedBox::Results) => {
                         let current_res = session.results.last();
-                        render_table(session, &current_res, session.scroll_offset, session.col_scroll_offset, f, self.results_area, self.result_format, self.active_window == ActiveWindow::Results);
+                        render_table(
+                            session,
+                            &current_res,
+                            TableViewState {
+                                scroll_offset: session.scroll_offset,
+                                col_scroll_offset: session.col_scroll_offset,
+                                result_format: self.result_format,
+                                focused: self.active_window == ActiveWindow::Results,
+                            },
+                            f,
+                            self.results_area,
+                        );
                     }
                     Some(MaximizedBox::Sidebar) => {
                         render_right_panel(session, f, self.sidebar_area);
                     }
                     None => {
-                        render_editor(session, self.active_window == ActiveWindow::Editor, f, self.editor_area);
+                        render_editor(
+                            session,
+                            self.active_window == ActiveWindow::Editor,
+                            f,
+                            self.editor_area,
+                        );
                         let current_res = session.results.last();
-                        render_table(session, &current_res, session.scroll_offset, session.col_scroll_offset, f, self.results_area, self.result_format, self.active_window == ActiveWindow::Results);
+                        render_table(
+                            session,
+                            &current_res,
+                            TableViewState {
+                                scroll_offset: session.scroll_offset,
+                                col_scroll_offset: session.col_scroll_offset,
+                                result_format: self.result_format,
+                                focused: self.active_window == ActiveWindow::Results,
+                            },
+                            f,
+                            self.results_area,
+                        );
                         if !self.hide_sidebar {
                             render_right_panel(session, f, self.sidebar_area);
                         }
@@ -725,7 +924,8 @@ impl App {
 
                 // Place the real (blinking) terminal cursor inside the editor
                 if self.active_window == ActiveWindow::Editor
-                    && (self.maximized_box.is_none() || self.maximized_box == Some(MaximizedBox::Editor))
+                    && (self.maximized_box.is_none()
+                        || self.maximized_box == Some(MaximizedBox::Editor))
                 {
                     let area = self.editor_area;
                     let vis_height = area.height.saturating_sub(2) as usize;
@@ -734,7 +934,10 @@ impl App {
                     if row >= scroll && row < scroll + vis_height {
                         let line_num_width = 4u16;
                         let max_text_width = area.width.saturating_sub(2 + line_num_width) as usize;
-                        let cx = area.x + 1 + line_num_width + session.editor.cursor_col.min(max_text_width) as u16;
+                        let cx = area.x
+                            + 1
+                            + line_num_width
+                            + session.editor.cursor_col.min(max_text_width) as u16;
                         let cy = area.y + 1 + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
                     }
@@ -743,6 +946,21 @@ impl App {
         }
 
         let session = self.session_manager.active_session();
-        render_status_bar(session, self.active_window, f, chunks[2]);
+        if self.command_mode {
+            render_command_bar(
+                &self.command_input,
+                self.command_error.as_deref(),
+                self.command_confirm.as_deref(),
+                f,
+                chunks[2],
+            );
+            // Put the terminal cursor after the ": " prompt inside the bar.
+            let bar = chunks[2];
+            let cx = (bar.x + 2 + self.command_input.chars().count() as u16)
+                .min(bar.right().saturating_sub(1));
+            f.set_cursor_position(Position::new(cx, bar.y));
+        } else {
+            render_status_bar(session, self.active_window, self.mouse_capture, f, chunks[2]);
+        }
     }
 }

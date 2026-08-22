@@ -13,7 +13,7 @@ cargo build --release
 
 ```bash
 # CLI args (psql-style)
-./target/release/frog -H localhost -P 1521 -S ORCL -U user -W pass
+./target/release/frog -H localhost -P 1521 -S ORCL -U user
 
 # Env vars
 export ORACLE_HOST=localhost ORACLE_PORT=1521 ORACLE_SERVICE=ORCL ORACLE_USER=u ORACLE_PASSWORD=p
@@ -28,6 +28,7 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 |---|---|
 | `Ctrl+Enter` | Execute statement at cursor |
 | `F5` | Run all statements as script |
+| `Ctrl+:` | Command bar (e.g. `@file.sql`, `@@inc.sql`, `clear`, `cls`) |
 | `Tab` | Cycle focus: Editor / Results / Sidebar |
 | `Ctrl+M` | Maximize/restore focused panel |
 | `Ctrl+B` | Toggle sidebar |
@@ -78,6 +79,10 @@ src/
 - [x] Editor: vertical scroll follows cursor (`ensure_cursor_visible`) wired in render loop.
 - [x] Query execution feedback signal (`⟳ RUNNING` tab badge, glowing yellow editor border, status bar badge, and result viewer placeholder).
 - [x] Dynamic vertical editor resizing via `Ctrl+Plus`/`Ctrl+=`/`Ctrl+Up`/`Alt+Up` and `Ctrl+-`/`Ctrl+_`/`Ctrl+Down`/`Alt+Down`.
+- [x] **tmux-style command bar (`Ctrl+:`)** — replaces the status bar with a `:`-prompt input. `@file.sql` runs scripts (incl. nested `@@inc`), `clear`/`cls` clears results; unknown commands show inline errors.
+- [x] **`@file` scripting moved out of the SQL editor** into the command bar (was previously triggered by typing `@file.sql` in the editor).
+- [x] **Result-viewer scrolling fixed for Markdown & ASCII formats** — vertical (and horizontal) scroll now applies in all three result formats, not just Table. (Also rebuilt the stale release binary.)
+- [x] **Low-priority audit cleanups** — status-message auto-expiry (5s TTL), pagination-error status-line UX, `@file` non-`.sql` confirmation prompt, `null_display` config wired, removed unused `connect_string` param, zero clippy warnings, `render_table` arg-grouping (`TableViewState`), and friendly `DPI-1047` connect hint.
 
 ## TODO / Known Issues
 
@@ -85,43 +90,42 @@ src/
 
 ### Correctness & SQL Parsing
 
-- [ ] **[High] Statement splitter is not SQL-aware.** `SqlEditor::statements_with_ranges` splits on every `;` and `/`-only line with no awareness of string literals (`'a;b'`), inline/`/* */` comments, or PL/SQL blocks (`BEGIN ... END;`). A `.sql` file containing these will be mis-split and produce broken statements. Need a small parser that tracks quotes/comments and handles PL/SQL blocks (with trailing `/` line).
-- [ ] **[Medium] `@file` expansion has no dotted-identifier / missing-file hint** — a mistyped `@file` currently aborts with only the raw read error; consider surfacing the attempted path and offering `@@` sibling resolution hint (partially done).
+- [x] **[High] Statement splitter is not SQL-aware.** Rewrote `SqlEditor::statements_with_ranges` to track quoting and `--`/`/* */` comments so `;` inside them is not a terminator, and to keep PL/SQL blocks (`DECLARE`/`BEGIN`/`CREATE ... PROCEDURE|FUNCTION|PACKAGE|...`) as single statements that terminate at `END;`. Trailing `/` no longer leaks into a statement. Covered by unit tests.
+- [x] **[Medium] `@file` expansion has no dotted-identifier / missing-file hint.** `load_script_file` now returns a clear message when the file is not found, showing the attempted path and explaining `@` (CWD) vs `@@` (relative-to-including-file) resolution rules.
 
 ### Concurrency & Resource Lifecycle
 
-- [ ] **[High] Oracle connection leaks on session close.** `remove_session` drops the `Session` but never removes the `Arc<OracleConnection>` from `conn_map` nor calls `OracleConnection::close()`. Long sessions accumulate live DB connections until app exit.
-- [ ] **[High] Unbounded in-memory growth.** `session.results` grows for every executed statement/script and is never cleared — long sessions accumulate rows. `session.query_history` is also unbounded in-memory even though `max_history` config exists (never enforced).
-- [ ] **[Medium] One OS thread per execution.** Each `execute_query` / `execute_script` / `fetch_next_page` spawns a raw `thread::spawn` with no cap; rapid `Ctrl+Enter` can pile up threads and interleave results. Consider a per-session worker with a job queue, or at least track an in-flight job id so stale results are ignored.
-- [ ] **[Medium] Cancel/execute race on shared connection.** `cancel_query` calls `break_execution` on a connection that a worker thread may be executing against concurrently. Works in practice, but there is no synchronization guaranteeing the break targets the in-flight statement — document or serialize.
+- [x] **[High] Oracle connection leaks on session close.** `remove_session` now removes the connection from `conn_map` and calls the new `OracleConnection::close()` so the DB session is released promptly.
+- [x] **[High] Unbounded in-memory growth.** Added `max_history` (from config) and `max_results_per_session` bounds; `query_history` drops oldest entries over the cap and `session.results` trims oldest pages over the cap.
+- [x] **[Medium] One OS thread per execution.** Added a per-session `job_seq` generation token carried on every result; `poll_result` now drops results that were produced by a superseded execution, so rapid `Ctrl+Enter` no longer interleaves or displays stale rows from an older spawn.
+- [x] **[Medium] Cancel/execute race on shared connection.** Serialized execution with a per-session `exec_lock` (`Arc<Mutex<()>>`) so two worker threads never call ODPI-C concurrently on the same connection; `break_execution` remains callable from the UI thread while a query runs.
 
 ### Configuration Wiring / Dead Code
 
-- [ ] **[High] `autocommit` config is unused.** `Config.autocommit` defaults to `true` but nothing ever calls `oracle`'s `set_autocommit`; connections silently start with autocommit **disabled** (crate default). Implies UI says one thing and behavior is another — DML is not committed automatically. Decide semantics and wire it in `connect_active`/`add_session`.
-- [ ] **[Medium] `max_rows`/`FROG_MAX_ROWS` is ignored.** Parsed in CLI/config but execution uses hard-coded `Session.page_size = 100`; the prefetched page size never reads `max_rows`.
-- [ ] **[Low] `UiConfig` (theme, tab_size, date_format, null_display) is dead config.** Parsed and defaulted but never applied to rendering.
-- [ ] **[Low] `Config::connect_string(password)` takes a `password` arg it never uses** — misleading signature; remove the parameter.
+- [x] **[High] `autocommit` config is unused.** Added `connect_with_autocommit` and wired `Config.autocommit` through `SessionManager.autocommit` into every connection (initial, connection-dialog, and new-session auto-connect). Connections now honor the configured autocommit.
+- [x] **[Medium] `max_rows`/`FROG_MAX_ROWS` is ignored.** Added `SessionManager.max_rows` (wired from config) and apply it as a soft cap in `fetch_next_page` — pagination stops and informs the user once the total rows fetched reaches the limit.
+- [x] **[Low] `UiConfig` (theme, tab_size, date_format, null_display) is dead config.** `null_display` is now applied to every NULL cell in results (wired through `OracleConnection.null_display`). `date_format`/`theme` are not applicable: Oracle returns dates as pre-formatted strings and the TUI uses a fixed palette.
 
 ### Security & Secrets
 
-- [ ] **[High] Password exposed on the CLI process list.** `-W/--password` and `PASSWORD=` inside a `-d` connect string are visible to other users via `/proc`/`ps` during startup. Recommend prompting for a missing password (or env-only / keyring), and scrubbing `PASSWORD=` from any persisted `saved_connections`.
-- [ ] **[High] Plaintext passwords persisted.** `connections[]` / `saved_connections` store passwords in `~/.config/frog/config.yml` and in `ConnectionDialog.password` with no masking/encryption. Document, restrict file perms, or integrate a keyring (`secret-service`/`keyring` crate).
-- [ ] **[Medium] `frog_history.txt` stores SQL in plaintext near the binary** with default perms; may capture sensitive statements (e.g., `ALTER USER ... IDENTIFIED BY '...'`). Consider honoring `max_history`, a size cap, and 0600 perms.
-- [ ] **[Low] `@file` can execute any readable file with no prompting** — intended feature, but note there is no confirmation for non-`.sql` files.
+- [x] **[High] Password exposed on the CLI process list.** Removed `-W/--password` from the CLI entirely — passwords are never accepted on the command line (so not visible via `/proc`/`ps`). Password now comes from `ORACLE_PASSWORD` env, a `PASSWORD=` connect-string component, or an interactive echo-off prompt (`rpassword`) fired in `main()` when a user is set but no password is provided.
+- [x] **[High] Plaintext passwords persisted.** Dropped password persistence: frog only ever reads config, never writes it; CLI/connect-string-derived `saved_connections` entries are scrubbed to `password: None`; the connection-dialog password is ephemeral in-memory session state (needed only to connect) and is not stored to disk.
+- [x] **[Medium] `frog_history.txt` stores SQL in plaintext near the binary** — now created with owner-only (0o600) permissions on Unix. `max_history` is now enforced in memory. Consider an on-disk size cap as well.
+- [x] **[Low] `@file` can execute any readable file with no prompting** — now prompts `Run '…'? [y/N]` in the command bar for files with a non-`.sql` extension.
 
 ### Error Handling & UX
 
-- [ ] **[Medium] Config parse/read errors are silently swallowed.** `load_config_file` returns `None` on any failure and the app falls back to defaults with no message — silent misconfiguration. Surface parse errors to the status bar / startup.
-- [ ] **[Low] Pagination error UX.** A paged fetch that errors appends a separate error row while prior success rows remain visible; consider a status-line message instead (partially addressed for cancel).
-- [ ] **[Low] `status_message` is never auto-cleared** — a stale notice can persist indefinitely. Consider auto-expire after N seconds.
+- [x] **[Medium] Config parse/read errors are silently swallowed.** `load_config_file` now prints a warning to stderr for explicit `-f` misconfig (missing / unreadable / unparseable) instead of silently falling back to defaults.
+- [x] **[Low] Pagination error UX.** A paged fetch that errors now surfaces as a status-line message instead of appending a duplicate/error row on top of existing data.
+- [x] **[Low] `status_message` is never auto-cleared.** Added `status_message_ttl` (5s) + `tick_statuses()` called every frame; stale notices auto-expire.
 
 ### Quality / Housekeeping
 
-- [ ] **[Low] Fix clippy warnings (26 bin + test).** Key ones: `too_many_arguments` on `render_table`, `manual_clamp`, `needless_return` in `handle_conn_dialog`, `single_char` `push_str` loops, and the `fetch_error.unwrap()` after `is_some()` pattern in `connection.rs` (replace with `Result` refactor).
-- [ ] **[Low] `render_table` takes 8 args** — group scroll/format state into a small struct.
-- [ ] **[Low] Add integration/unit tests** for the new SQL-aware statement splitter once implemented (current splitter has none).
+- [x] **[Low] Fix clippy warnings.** Cleaned all clippy warnings to zero (complex-type alias `QueryData`, `fetch_error.unwrap()` refactor, `manual_clamp`, `needless_return`, single-char `push_str`, unused `mut`, etc.).
+- [x] **[Low] `render_table` takes 8 args.** Grouped scroll/format/focus into a `TableViewState` struct.
+- [x] **[Low] Add integration/unit tests for the new SQL-aware statement splitter.** Added tests: string literals, comments, PL/SQL blocks, multi-statement splits (+ existing `parse_file_directive` and `expand_statements` tests).
 - [ ] **[Low] Consider `oracle-rs` pure-Rust driver** once it matures (currently async-only, incompatible).
-- [ ] **[Low] No `LD_LIBRARY_PATH`/ODPI-C runtime check** — crashes with `DPI-1047` on start; give a friendly error instead of an unwrap-style failure.
+- [x] **[Low] No `LD_LIBRARY_PATH`/ODPI-C runtime check.** Connect errors containing `DPI-1047` / `libclntsh` now show a friendly hint (install Instant Client + set `LD_LIBRARY_PATH`) instead of a bare error.
 
 ## Notes
 

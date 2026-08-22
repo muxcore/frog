@@ -1,19 +1,22 @@
 # Frog
 
-A terminal-based Oracle database client written in Rust — inspired by Toad, tmux, btop, and Hyprland.
+You ocassianly need to ssh to remote machine and debug some stuck session. You absolutley hate sqlplus
+visual (functionality is fine), I've got you:
 
-Frog gives you a fast, keyboard-driven TUI for querying Oracle, with multi-session tabs, an embedded SQL editor, pretty result tables, and a sqlplus-style scripting workflow.
+Meet 'Frog' - A terminal-based Oracle database client written in Rust — name inspired by Toad. Tmux, btop for UI.
+
+**Before you start reading further: If you are against AI assisted developement, look away. Otherwise continue.**
 
 ## Features
 
 - **Multi-session tabs** — tmux-style windows with hover-to-focus and per-tab connections.
 - **Embedded SQL editor** — real cursor movement, line numbers, statement-at-cursor highlighting, vertical scroll.
 - **Result viewer** — pretty-printed tables (Table / Markdown / ASCII), 2D scrolling, clipboard copy, pagination.
-- **sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
-- **Abort on error** — script runs stop at the first failing statement with a clear error log.
+- **(experimental)sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
 - **SQL history** — persisted to `frog_history.txt` next to the binary and browsable in-app.
 - **Oracle session overview** — `v$session` viewer.
+- **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
 
 ## Requirements
 
@@ -27,11 +30,66 @@ cargo build --release
 # Binary: ./target/release/frog
 ```
 
+## Building for older glibc (containers)
+
+### Why this is sometimes needed
+
+A Rust binary is linked against the glibc of the machine that **built** it. If you
+build on a distro with a newer glibc (e.g. glibc 2.43) and copy the binary to a
+server with an older glibc (e.g. glibc 2.34), the loader aborts at startup with
+something like:
+
+```
+version `GLIBC_2.39' not found (required by ./frog)
+```
+
+In frog's case the two extra symbol versions come from:
+
+- `__isoc23_strtol` (needs glibc 2.38) — pulled in by compiling ODPI-C's `dpi.c`
+  (`odpic-sys` uses `cc`) against current headers.
+- `pidfd_getpid` / `pidfd_spawnp` (need glibc 2.39) — referenced by recent Rust `std`.
+
+Since glibc symbol versions can't be retrofitted, the binary must be rebuilt on a
+glibc that is **older than or equal to** the target server's. The scripts below do
+exactly that inside a container based on Ubuntu 20.04 (glibc 2.31), which produces
+a binary whose highest required symbol is `GLIBC_2.30` or lower — runnable on
+glibc 2.34 servers.
+
+> **Why not a fully static build?** ODPI-C `dlopen`s Oracle's `libclntsh.so` at
+> runtime, and Oracle Instant Client only ships glibc-linked shared libraries. A
+> fully static (musl) process cannot `dlopen` a glibc-linked `.so`, so a static
+> frog would start but fail to connect (`DPI-1047`). A container build using an
+> old glibc keeps normal dynamic linking, so `libclntsh.so` loads fine on the
+> target server.
+>
+> Latest Oracle Instant Client (23) needs glibc ≥ 2.28, which the glibc-2.34
+> server already satisfies, so using it doesn't raise the requirement.
+
+### Usage
+
+Requires [Docker](https://docs.docker.com/get-docker/).
+
+```bash
+# Build dist/frog (glibc <= 2.34 compatible)
+./scripts/build-old-glibc.sh
+
+# Remove everything the build created (image, volumes, dist/)
+./scripts/clean-old-glibc.sh
+```
+
+`build-old-glibc.sh` builds the binary, verifies with `objdump` that the highest
+required GLIBC symbol is ≤ `2.34` (fail-fast otherwise), and writes the result to
+`dist/frog`. The produced binary is still dynamically linked, so the server still
+needs Oracle Instant Client (`libclntsh.so`, via `LD_LIBRARY_PATH`) and `libgcc_s`.
+
+The scripts are opinionated (base image, target glibc, Rust toolchain) but easy to
+tune — see the variables at the top of each script and `scripts/Dockerfile.oldglibc`.
+
 ## Run
 
 ```bash
 # CLI args (psql-style)
-./target/release/frog -H localhost -P 1521 -S ORCL -U user -W pass
+./target/release/frog -H localhost -P 1521 -S ORCL -U user
 
 # Env vars
 export ORACLE_HOST=localhost ORACLE_PORT=1521 ORACLE_SERVICE=ORCL \
@@ -39,20 +97,54 @@ export ORACLE_HOST=localhost ORACLE_PORT=1521 ORACLE_SERVICE=ORCL \
 ./target/release/frog
 
 # Or a connect string
-./target/release/frog -d 'host=localhost;port=1521;service_name=ORCL;user=scott;password=tiger'
+./target/release/frog -d 'host=localhost;port=1521;service_name=ORCL;user=scott'
 ```
 
 All connection parameters can be supplied via CLI flags, environment variables, or the in-app connection dialog (`Ctrl+O`). Optional YAML config lives at `~/.config/frog/config.yml`.
+
+### `.env` file
+
+If a `.env` file exists in the directory frog is started from, its variables are used as a second-priority source — after real environment variables. Precedence per setting:
+
+```
+CLI flag  >  environment variable (ORACLE_* / FROG_*)  >  .env  >  built-in default
+```
+
+Example `.env`:
+
+```bash
+ORACLE_HOST=db1.local
+ORACLE_PORT=1521
+ORACLE_SERVICE=ORCL
+ORACLE_USER=scott
+ORACLE_PASSWORD=tiger
+# or a full connect string instead of the individual fields:
+# ORACLE_CONNECT=HOST=db1.local;PORT=1521;SERVICE_NAME=ORCL;USER=scott;PASSWORD=tiger
+```
+
+Supported keys: `ORACLE_CONNECT`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored.
+
+At startup frog prints one line summarizing what the `.env` contributed, for example:
+
+```
+frog: './.env': using ORACLE_USER, ORACLE_PASSWORD; ignored ORACLE_HOST (set in environment)
+```
+
+Opening the dialog with `Ctrl+O` **pre-fills its fields from the startup connection parameters** (CLI flags / `ORACLE_*` env vars / `.env` / `-d` connect string / `config.yml`). So if you launch with `ORACLE_HOST`/`ORACLE_SERVICE` set and type the user + password into the dialog, the host/port/service are already there — just fill in credentials and connect. You only need `ORACLE_USER` present if you want frog to auto-connect on startup.
+
+Inside the dialog: `Tab`/`Up`/`Down` switch fields (the current field is highlighted and shows a visible insertion cursor), `Left`/`Right`/`Home`/`End` move within the text, `Backspace`/`Delete` edit at the cursor, and `Ctrl+U` clears a field (handy for wiping a password that was pre-filled from `.env`). The port field accepts digits only.
+
+> **Passwords**: never pass a password on the command line (`-W` was removed so it can't leak via `ps`). FROG reads it from `ORACLE_PASSWORD` (env or `.env`), a `PASSWORD=` connect-string component, or prompts interactively (echo-off) at startup. Frog never persists passwords to disk.
 
 ## Keyboard Reference
 
 | Key | Action |
 |---|---|
-| `Ctrl+Enter` | Execute statement at cursor |
+| `Ctrl+Enter` / `Alt+Enter` | Execute statement at cursor |
 | `F5` | Run all statements as script |
-| `@file.sql` | Run a `.sql` file as a script (nested `@@` includes) |
+| `Ctrl+:` | Open command bar (`@file.sql` runs a script, `clear`/`cls` clears results) |
 | `Tab` | Cycle focus: Editor / Results / Sidebar |
-| `Ctrl+M` | Maximize/restore focused panel |
+| `Ctrl+Z` / `F11` | Maximize/restore focused panel |
 | `Ctrl+B` | Toggle sidebar |
 | `Ctrl+Y` | Copy results to clipboard |
 | `Ctrl+D` | Toggle Markdown table format |
@@ -62,9 +154,29 @@ All connection parameters can be supplied via CLI flags, environment variables, 
 | `Ctrl+Left/Right` | Switch session tabs |
 | `F1` / `F2` / `F3` | Help / v$session / History |
 | `Ctrl+Q` | Quit |
+| `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |
 
+### Copy & paste (tmux style)
+
+- **Middle-click** pastes the primary selection at the clicked position in the editor (falls back to the regular clipboard). Bracketed paste (`Ctrl+Shift+V`) works everywhere — editor, connection dialog and command bar.
+- Pressing **`Ctrl+M` turns mouse capture off**: select text with your terminal's native selection to copy it, paste freely, then press `Ctrl+M` again to re-enable frog's mouse handling (scrolling, click-to-focus, splitter drag). The status bar shows `Mouse:OFF` while capture is disabled.
+- On most terminals you can also hold **`Shift` while dragging** to use the native selection without toggling capture.
+- `Ctrl+Y` remains available to copy the current result set to the system clipboard.
+
+> Like `Ctrl+Enter`, the `Ctrl+M` binding requires a terminal that emits modified-key (`CSI u`) sequences (e.g. Alacritty); otherwise it may arrive as plain Enter.
+
+> **Note on `Ctrl+Enter`:** it isn't an ASCII control character, so it only reaches
+> frog as a distinct key when the terminal emulator emits a modified-key (`CSI u`)
+> escape sequence for it — which modern Linux terminals like Alacritty do.
+> On limited/proxied clients (Git Bash on Windows, or sessions routed through a
+> CyberArk PSM / jump-host proxy) `Ctrl+Enter` often arrives as a plain Enter and
+> just inserts a newline instead of submitting. If that happens, use **`Alt+Enter`**
+> (or `F8`/`F9`), which uses a plain `ESC Enter` sequence that survives any transport.
+
 ## Configuration
+
+You are better of using .env, or env variables, but:
 
 Optional `~/.config/frog/config.yml`:
 
@@ -86,25 +198,11 @@ ui:
   null_display: "(NULL)"
 ```
 
-## Project Structure
 
-```
-src/
-  main.rs              # Entry point
-  cli/mod.rs           # CLI args + env vars + YAML config
-  db/
-    mod.rs             # Re-exports
-    connection.rs      # OracleConnection wrapper (oracle crate / ODPI-C)
-    session_manager.rs # Sessions, SqlEditor, SessionManager, history, @file expansion
-  tui/
-    mod.rs             # Re-exports App
-    app.rs             # Event loop, key/mouse handling, layout, focus management
-    widgets.rs         # Tabs, status bar, table viewer, help, dialogs, panels
-```
+
 
 ## Scripting
-
-Frog supports sqlplus-style script files directly from the editor:
+Experimental. Report bugs.  Sqlplus-style script files directly from the editor:
 
 ```sql
 @setup.sql

@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Old-glibc container build output
+/dist
+
 # Frog runtime files
 /frog_history.txt
 *.sql.bak

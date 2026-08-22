@@ -1,10 +1,8 @@
-use ratatui::{
-    prelude::*,
-    widgets::*,
-};
-use crate::db::session_manager::{Session, SessionManager, SessionMode};
 use crate::db::connection::QueryRow;
-use crate::tui::app::ActiveWindow;
+use crate::db::session_manager::{ConnectionDialog, Session, SessionManager, SessionMode};
+use crate::tui::app::{ActiveWindow, ResultFormat};
+use ratatui::{prelude::*, widgets::*};
+use unicode_width::UnicodeWidthStr;
 
 pub fn render_tabs(sessions: &[Session], active_idx: usize, f: &mut Frame, area: Rect) {
     let titles: Vec<Line> = sessions
@@ -12,7 +10,9 @@ pub fn render_tabs(sessions: &[Session], active_idx: usize, f: &mut Frame, area:
         .enumerate()
         .map(|(i, s)| {
             let style = if i == active_idx {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -34,14 +34,62 @@ pub fn render_tabs(sessions: &[Session], active_idx: usize, f: &mut Frame, area:
         .collect();
 
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
         .highlight_style(Style::default().fg(Color::Cyan))
         .select(active_idx);
 
     f.render_widget(tabs, area);
 }
 
-pub fn render_status_bar(session: &Session, active_window: ActiveWindow, f: &mut Frame, area: Rect) {
+/// Render the tmux-style command bar (Ctrl+:).
+pub fn render_command_bar(
+    input: &str,
+    error: Option<&str>,
+    confirm: Option<&str>,
+    f: &mut Frame,
+    area: Rect,
+) {
+    let prompt = Span::styled(
+        ": ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut spans = vec![prompt, Span::raw(input.to_string())];
+    if let Some(cmd) = confirm {
+        spans.push(Span::styled(
+            format!("  Run '{}'? [y/N] ", cmd),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(err) = error {
+        spans.push(Span::styled(
+            format!("  ⚠ {}", err),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let bar =
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Cyan).fg(Color::Black));
+    f.render_widget(bar, area);
+}
+
+pub fn render_status_bar(
+    session: &Session,
+    active_window: ActiveWindow,
+    mouse_capture: bool,
+    f: &mut Frame,
+    area: Rect,
+) {
     let mode_str = match session.mode {
         SessionMode::Query => "[QUERY]",
         SessionMode::Results => "[RESULTS]",
@@ -66,11 +114,20 @@ pub fn render_status_bar(session: &Session, active_window: ActiveWindow, f: &mut
     };
 
     let conn_style = if session.connecting {
-        Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
     } else if session.is_connected {
-        Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Green)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Red)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     };
 
     let error_part = if let Some(ref err) = session.connect_error {
@@ -86,7 +143,13 @@ pub fn render_status_bar(session: &Session, active_window: ActiveWindow, f: &mut
     };
 
     let exec_part = if session.pending_query {
-        Span::styled(" ⟳ EXECUTING QUERY... ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " ⟳ EXECUTING QUERY... ",
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("")
     };
@@ -99,14 +162,30 @@ pub fn render_status_bar(session: &Session, active_window: ActiveWindow, f: &mut
         focus_str
     );
 
+    let mouse_part = if mouse_capture {
+        Span::raw("")
+    } else {
+        Span::styled(
+            " | Mouse:OFF (terminal select/copy)",
+            Style::default().fg(Color::Magenta),
+        )
+    };
+
     let status_text = Line::from(vec![
-        Span::styled(mode_str, Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            mode_str,
+            Style::default()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(conn_status, conn_style),
         exec_part,
         Span::styled(error_part, Style::default().fg(Color::Red)),
         Span::styled(status_msg_part, Style::default().fg(Color::Cyan)),
         Span::raw(cursor_info),
-        Span::raw(" | Tab: Focus | Ctrl+/-: Resize Editor | F3: History | Ctrl+Y: Copy"),
+        mouse_part,
+        Span::raw(" | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy"),
     ]);
 
     let bar = Paragraph::new(status_text)
@@ -126,7 +205,7 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else {
-        " SQL Editor (Ctrl+Enter: run stmt | F5: run script | @file.sql: run file | Ctrl+/-: resize) "
+        " SQL Editor (Ctrl+Enter: run stmt | F5: run script | Ctrl+:: run @file | Ctrl+/-: resize) "
     };
 
     let block = Block::default()
@@ -157,7 +236,9 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
 
             let line_num_str = format!("{:3} ", idx + 1);
             let num_style = if is_current_line {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -203,15 +284,25 @@ pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(i, stmt)| {
             let style = if i == session.history_cursor {
-                Style::default().bg(Color::Rgb(60, 60, 100)).fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 100))
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            let prefix = if i == session.history_cursor { "▶ " } else { "  " };
+            let prefix = if i == session.history_cursor {
+                "▶ "
+            } else {
+                "  "
+            };
             let single_line_stmt = stmt.replace('\n', " ");
             ListItem::new(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(Color::Cyan)),
-                Span::styled(format!("[#{:02}] ", i + 1), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("[#{:02}] ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(single_line_stmt, style),
             ]))
         })
@@ -221,18 +312,28 @@ pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
     f.render_widget(list, area);
 }
 
-use crate::tui::app::ResultFormat;
+/// Render-time state for the result viewer (scroll + display format + focus).
+#[derive(Debug, Clone, Copy)]
+pub struct TableViewState {
+    pub scroll_offset: usize,
+    pub col_scroll_offset: usize,
+    pub result_format: ResultFormat,
+    pub focused: bool,
+}
 
 pub fn render_table(
     session: &Session,
     query_row: &Option<&QueryRow>,
-    scroll_offset: usize,
-    col_scroll_offset: usize,
+    view: TableViewState,
     f: &mut Frame,
     area: Rect,
-    result_format: ResultFormat,
-    focused: bool,
 ) {
+    let TableViewState {
+        scroll_offset,
+        col_scroll_offset,
+        result_format,
+        focused,
+    } = view;
     let border_color = if session.pending_query {
         Color::Yellow
     } else if focused {
@@ -254,7 +355,11 @@ pub fn render_table(
 
     if session.pending_query {
         let p = Paragraph::new(" ⟳ Executing SQL query... Waiting for database response.")
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
             .block(block);
         f.render_widget(p, area);
         return;
@@ -277,6 +382,15 @@ pub fn render_table(
                 let end_col = (start_col + 10).min(total_cols);
                 let visible_cols = &qr.columns[start_col..end_col];
 
+                // Apply vertical scroll (rows) just like Table mode.
+                let avail_height = area.height.saturating_sub(3) as usize;
+                let rows: Vec<&Vec<String>> = qr
+                    .rows
+                    .iter()
+                    .skip(scroll_offset)
+                    .take(avail_height)
+                    .collect();
+
                 let mut md_text = String::new();
                 md_text.push_str("| ");
                 md_text.push_str(&visible_cols.join(" | "));
@@ -285,25 +399,48 @@ pub fn render_table(
                     md_text.push_str("---|");
                 }
                 md_text.push('\n');
-                for row in &qr.rows {
-                    let visible_row: Vec<&str> = row[start_col..end_col].iter().map(|s| s.as_str()).collect();
+                let visible_rows = rows.len();
+                for row in &rows {
+                    let visible_row: Vec<&str> =
+                        row[start_col..end_col].iter().map(|s| s.as_str()).collect();
                     md_text.push_str("| ");
                     md_text.push_str(&visible_row.join(" | "));
                     md_text.push_str(" |\n");
                 }
                 let p = Paragraph::new(md_text)
                     .style(Style::default().fg(Color::White))
-                    .block(Block::default().title(" Result Viewer (Markdown Format) ").borders(Borders::ALL).border_style(Style::default().fg(Color::Magenta)));
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                " Result Viewer (Markdown Format | rows {}-{} of {}) ",
+                                scroll_offset + 1,
+                                (scroll_offset + visible_rows).min(qr.rows.len()),
+                                qr.rows.len()
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Magenta)),
+                    );
                 f.render_widget(p, area);
                 return;
             }
             ResultFormat::Ascii => {
                 let total_cols = qr.columns.len();
                 let start_col = col_scroll_offset.min(total_cols.saturating_sub(1));
-                let ascii_text = format_ascii_table(qr, start_col);
+                let avail_height = area.height.saturating_sub(3) as usize;
+                let ascii_text = format_ascii_table(qr, start_col, scroll_offset, avail_height);
                 let p = Paragraph::new(ascii_text)
                     .style(Style::default().fg(Color::White))
-                    .block(Block::default().title(" Result Viewer (ASCII Table) ").borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+                    .block(
+                        Block::default()
+                            .title(format!(
+                                " Result Viewer (ASCII Table | rows {}-{} of {}) ",
+                                scroll_offset + 1,
+                                (scroll_offset + avail_height).min(qr.rows.len()),
+                                qr.rows.len()
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    );
                 f.render_widget(p, area);
                 return;
             }
@@ -314,7 +451,10 @@ pub fn render_table(
 
         if qr.columns.is_empty() || qr.rows.is_empty() {
             let msg = if let Some(rows_affected) = qr.rows_affected {
-                format!("Statement executed. {} rows affected. Elapsed: {}ms", rows_affected, qr.elapsed_ms)
+                format!(
+                    "Statement executed. {} rows affected. Elapsed: {}ms",
+                    rows_affected, qr.elapsed_ms
+                )
             } else {
                 "No data returned. Elapsed: ".to_string() + &qr.elapsed_ms.to_string() + "ms"
             };
@@ -327,25 +467,41 @@ pub fn render_table(
 
         let total_cols = qr.columns.len();
         let start_col = col_scroll_offset.min(total_cols.saturating_sub(1));
-        let visible_cols: Vec<String> = qr.columns.iter().skip(start_col).take(10).cloned().collect();
+        let visible_cols: Vec<String> = qr
+            .columns
+            .iter()
+            .skip(start_col)
+            .take(10)
+            .cloned()
+            .collect();
 
         let header = Row::new(visible_cols.clone())
-            .style(Style::default().bg(Color::Rgb(40, 40, 80)).fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .bg(Color::Rgb(40, 40, 80))
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
             .height(1);
 
         let total_rows = qr.rows.len();
         let avail_height = area.height.saturating_sub(4) as usize;
 
-        let mut visible_rows: Vec<Row> = qr.rows
+        let mut visible_rows: Vec<Row> = qr
+            .rows
             .iter()
             .skip(scroll_offset)
             .take(avail_height)
             .enumerate()
             .map(|(idx, row)| {
-                let bg = if idx % 2 == 0 { Color::Rgb(18, 18, 22) } else { Color::Rgb(24, 24, 30) };
-                let sliced_row: Vec<String> = row.iter().skip(start_col).take(10).cloned().collect();
-                Row::new(sliced_row)
-                    .style(Style::default().bg(bg).fg(Color::White))
+                let bg = if idx % 2 == 0 {
+                    Color::Rgb(18, 18, 22)
+                } else {
+                    Color::Rgb(24, 24, 30)
+                };
+                let sliced_row: Vec<String> =
+                    row.iter().skip(start_col).take(10).cloned().collect();
+                Row::new(sliced_row).style(Style::default().bg(bg).fg(Color::White))
             })
             .collect();
 
@@ -353,16 +509,19 @@ pub fn render_table(
         if qr.truncated && visible_rows.len() < avail_height {
             let hint = format!(
                 " ↓ {} rows loaded — press Ctrl+F to fetch next {} rows ",
-                total_rows,
-                qr.page_size
+                total_rows, qr.page_size
             );
             let mut footer_cells = vec![hint];
             for _ in 1..visible_cols.len() {
                 footer_cells.push(String::new());
             }
             visible_rows.push(
-                Row::new(footer_cells)
-                    .style(Style::default().bg(Color::Rgb(30, 30, 60)).fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC))
+                Row::new(footer_cells).style(
+                    Style::default()
+                        .bg(Color::Rgb(30, 30, 60))
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                ),
             );
         }
 
@@ -389,12 +548,17 @@ pub fn render_table(
 
         let widths: Vec<Constraint> = visible_cols
             .iter()
-            .map(|c| Constraint::Length((c.len() as u16).max(12).min(35)))
+            .map(|c| Constraint::Length((c.len() as u16).clamp(12, 35)))
             .collect();
 
         let table = Table::new(visible_rows, widths)
             .header(header)
-            .block(Block::default().title(title).borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
             .row_highlight_style(Style::default().bg(Color::Rgb(60, 60, 80)));
 
         f.render_widget(table, area);
@@ -402,10 +566,18 @@ pub fn render_table(
         let p = Paragraph::new("No query executed yet. Type SQL and press F5.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
-f.render_widget(p, area);
+        f.render_widget(p, area);
+    }
 }
 
-fn format_ascii_table(qr: &crate::db::connection::QueryRow, start_col: usize) -> String {
+/// Format a result page as an ASCII table using display width (so wide /
+/// multibyte characters align correctly).
+pub fn format_ascii_table(
+    qr: &QueryRow,
+    start_col: usize,
+    scroll_offset: usize,
+    avail_height: usize,
+) -> String {
     if qr.columns.is_empty() || qr.rows.is_empty() {
         return "No data to display".to_string();
     }
@@ -417,18 +589,35 @@ fn format_ascii_table(qr: &crate::db::connection::QueryRow, start_col: usize) ->
 
     let mut col_widths = Vec::new();
     for i in visible_range.clone() {
-        let mut w = qr.columns[i].len();
-        for row in &qr.rows {
+        let mut w = UnicodeWidthStr::width(qr.columns[i].as_str());
+        for row in qr.rows.iter().skip(scroll_offset).take(avail_height) {
             if i < row.len() {
-                w = w.max(row[i].len());
+                w = w.max(UnicodeWidthStr::width(row[i].as_str()));
             }
         }
         col_widths.push(w);
     }
 
-    let columns: Vec<&str> = qr.columns[visible_range.clone()].iter().map(|s| s.as_str()).collect();
-    let rows: Vec<Vec<&str>> = qr.rows.iter()
-        .map(|r| r[visible_range.clone()].iter().map(|s| s.as_str()).collect())
+    // Pad `s` on the right to the display width `w`.
+    fn padded(s: &str, w: usize) -> String {
+        format!("{}{}", s, " ".repeat(w - UnicodeWidthStr::width(s) + 1))
+    }
+
+    let columns: Vec<&str> = qr.columns[visible_range.clone()]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let rows: Vec<Vec<&str>> = qr
+        .rows
+        .iter()
+        .skip(scroll_offset)
+        .take(avail_height)
+        .map(|r| {
+            r[visible_range.clone()]
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        })
         .collect();
 
     let mut output = String::new();
@@ -443,8 +632,7 @@ fn format_ascii_table(qr: &crate::db::connection::QueryRow, start_col: usize) ->
     output.push('|');
     for (i, col) in columns.iter().enumerate() {
         output.push(' ');
-        output.push_str(col);
-        output.push_str(&" ".repeat(col_widths[i] - col.len() + 1));
+        output.push_str(&padded(col, col_widths[i]));
         output.push('|');
     }
     output.push('\n');
@@ -460,8 +648,7 @@ fn format_ascii_table(qr: &crate::db::connection::QueryRow, start_col: usize) ->
         output.push('|');
         for (i, cell) in row.iter().enumerate() {
             output.push(' ');
-            output.push_str(cell);
-            output.push_str(&" ".repeat(col_widths[i] - cell.len() + 1));
+            output.push_str(&padded(cell, col_widths[i]));
             output.push('|');
         }
         output.push('\n');
@@ -485,37 +672,57 @@ fn format_bytes(bytes: usize) -> String {
         format!("{} B", bytes)
     }
 }
-}
 
 pub fn render_session_overview(sm: &SessionManager, f: &mut Frame, area: Rect) {
     let db_sessions = sm.get_session_info();
-    let header = Row::new(vec!["SID", "Serial#", "User", "Status", "Machine", "Program", "SQL_ID", "Logon Time"])
-        .style(Style::default().bg(Color::Rgb(40, 40, 60)).fg(Color::White).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "SID",
+        "Serial#",
+        "User",
+        "Status",
+        "Machine",
+        "Program",
+        "SQL_ID",
+        "Logon Time",
+    ])
+    .style(
+        Style::default()
+            .bg(Color::Rgb(40, 40, 60))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let avail = area.height.saturating_sub(4) as usize;
-    let rows: Vec<Row> = db_sessions.iter().take(avail).map(|ds| {
-        Row::new(vec![
-            ds.sid.to_string(),
-            ds.serial.to_string(),
-            ds.username.clone(),
-            ds.status.clone(),
-            ds.machine.clone(),
-            ds.program.clone(),
-            ds.sql_id.clone(),
-            ds.logon_time.clone(),
-        ])
-    }).collect();
+    let rows: Vec<Row> = db_sessions
+        .iter()
+        .take(avail)
+        .map(|ds| {
+            Row::new(vec![
+                ds.sid.to_string(),
+                ds.serial.to_string(),
+                ds.username.clone(),
+                ds.status.clone(),
+                ds.machine.clone(),
+                ds.program.clone(),
+                ds.sql_id.clone(),
+                ds.logon_time.clone(),
+            ])
+        })
+        .collect();
 
-    let table = Table::new(rows, [
-        Constraint::Length(6),
-        Constraint::Length(8),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(12),
-        Constraint::Length(18),
-        Constraint::Length(14),
-        Constraint::Length(20),
-    ])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Length(14),
+            Constraint::Length(20),
+        ],
+    )
     .header(header)
     .block(Block::default().title(" v$session ").borders(Borders::ALL));
 
@@ -524,9 +731,17 @@ pub fn render_session_overview(sm: &SessionManager, f: &mut Frame, area: Rect) {
 
 pub fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
-        Line::from(Span::styled(" Frog Oracle Client — Welcome & Usability Overview ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            " Frog Oracle Client — Welcome & Usability Overview ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from(Span::styled(" ─ Window & Panels ─ ", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            " ─ Window & Panels ─ ",
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from("  Ctrl+T              Open new session tab"),
         Line::from("  Ctrl+W              Close current tab"),
         Line::from("  Ctrl+Right / Alt+Right  Next session tab"),
@@ -539,87 +754,153 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Mouse Hover         Auto-focus panels (Hyprland style)"),
         Line::from("  Mouse Drag Border   Resize panels horizontally"),
         Line::from("  Mouse Scroll        Scroll result table vertically"),
+        Line::from("  Middle-click        Paste selection at cursor (tmux style)"),
+        Line::from("  Ctrl+M              Toggle mouse capture — while OFF the terminal"),
+        Line::from("                      handles select/copy natively (or hold Shift+drag)"),
         Line::from(""),
-        Line::from(Span::styled(" ─ SQL Execution ─ ", Style::default().fg(Color::Cyan))),
-        Line::from("  Ctrl+Enter / F9     Execute statement under cursor"),
+        Line::from(Span::styled(
+            " ─ SQL Execution ─ ",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Ctrl+Enter / Alt+Enter / F9  Execute statement under cursor"),
         Line::from("  F5 / Ctrl+R         Execute all statements as script"),
-        Line::from("  @file.sql / @@inc   Run a .sql file as a script (nested includes)"),
+        Line::from("  Ctrl+:              Command bar (e.g. @file.sql, @@inc, clear)"),
         Line::from("  Ctrl+C / Esc          Cancel running query"),
         Line::from(""),
-        Line::from(Span::styled(" ─ Results ─ ", Style::default().fg(Color::Cyan))),
-        Line::from("  Ctrl+F              Fetch next page of results (200 rows)"),
+        Line::from(Span::styled(
+            " ─ Results ─ ",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Ctrl+F              Fetch next page of results (100 rows)"),
         Line::from("  Ctrl+Y              Copy results to clipboard"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
         Line::from("  Arrow keys / PgUp/PgDn  Scroll results"),
         Line::from(""),
-        Line::from(Span::styled(" ─ SQL Editor ─ ", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            " ─ SQL Editor ─ ",
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from("  Arrow keys          Move cursor"),
         Line::from("  Home / End          Start / end of line"),
         Line::from("  Ctrl+A / Ctrl+E     Start / end of line"),
         Line::from("  Ctrl+K              Kill (delete) to end of line"),
         Line::from("  Ctrl+U              Delete to start of line"),
         Line::from("  Delete / Backspace  Delete character"),
-        Line::from("  Ctrl+H              Open SQL history"),
+        Line::from("  F3                  Open SQL history"),
         Line::from(""),
-        Line::from(Span::styled(" ─ Connection & Views ─ ", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            " ─ Connection & Views ─ ",
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from("  Ctrl+O              Open connection dialog"),
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Oracle v$session overview"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
     ];
-    let p = Paragraph::new(help_text)
-        .block(Block::default().title(" Welcome / Help (Press any key to start) ").borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+    let p = Paragraph::new(help_text).block(
+        Block::default()
+            .title(" Welcome / Help (Press any key to start) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
     f.render_widget(p, area);
 }
 
 pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
     let dlg = &session.conn_dialog;
-    let fields = [
-        ("Host:    ", dlg.host.clone()),
-        ("Port:    ", dlg.port.clone()),
-        ("Service: ", dlg.service.clone()),
-        ("User:    ", dlg.user.clone()),
-        ("Password:", if dlg.password.is_empty() { String::new() } else { String::from("********") }),
+    let labels = [
+        "Host:    ",
+        "Port:    ",
+        "Service: ",
+        "User:    ",
+        "Password:",
+    ];
+    let raw_values = [
+        dlg.host.clone(),
+        dlg.port.clone(),
+        dlg.service.clone(),
+        dlg.user.clone(),
+        // Mask every character individually so edits stay visible.
+        "*".repeat(dlg.password.chars().count()),
     ];
 
     let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(" Oracle Connection ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            " Oracle Connection ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
     ];
 
-    for (i, (label, value)) in fields.iter().enumerate() {
+    for (i, (label, value)) in labels.iter().zip(raw_values.iter()).enumerate() {
         let is_active = i == dlg.active_field;
-        let style = if is_active {
-            Style::default().bg(Color::Rgb(60, 60, 90)).fg(Color::Yellow)
+
+        // Draw the insertion cursor inside the text for the active field.
+        let shown: Span = if is_active {
+            let pos = dlg.cursor.min(value.len());
+            let mut p = pos;
+            while p > 0 && !value.is_char_boundary(p) {
+                p -= 1;
+            }
+            Span::styled(
+                format!("{}▏{}", &value[..p], &value[p..]),
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 90))
+                    .fg(Color::Yellow),
+            )
         } else {
-            Style::default().fg(Color::White)
+            Span::raw(value.clone())
         };
-        let cursor = if is_active { " ▏" } else { "" };
+
         lines.push(Line::from(vec![
             Span::styled(*label, Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{}{}", value, cursor), style),
+            shown,
         ]));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(" Tab/Arrow: navigate fields | Enter: connect | Esc: cancel ", Style::default().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled(
+        format!(
+            " Tab/Up/Down: field ({}/{}) | Left/Right: cursor | Ctrl+U: clear | Enter: connect | Esc: cancel ",
+            dlg.active_field + 1,
+            ConnectionDialog::FIELD_COUNT
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
 
     if session.connecting {
-        lines.push(Line::from(Span::styled(" Connecting... ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            " Connecting... ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     if let Some(ref err) = session.connect_error {
-        lines.push(Line::from(Span::styled(format!(" Error: {} ", err), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            format!(" Error: {} ", err),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
     }
 
-    let p = Paragraph::new(lines)
-        .block(Block::default().title(" Connect ").borders(Borders::ALL).border_style(Style::default().fg(Color::Green)));
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Connect ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
     f.render_widget(p, area);
 }
 
 pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
     let text = vec![
-        Line::from(Span::styled(" Connections ", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            " Connections ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(if session.is_connected {
             Span::styled(" ✔ Connected ", Style::default().fg(Color::Green))
@@ -629,22 +910,13 @@ pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
             Span::styled(" ✖ Disconnected ", Style::default().fg(Color::Red))
         }),
         Line::from(""),
-        Line::from(Span::styled(" (Press Ctrl+B to hide sidebar)", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            " (Press Ctrl+B to hide sidebar)",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
-    let p = Paragraph::new(text)
-        .block(Block::default().title(" Info Panel ").borders(Borders::ALL));
-    f.render_widget(p, area);
-}
-
-pub fn render_session_sidebar(_session: &Session, f: &mut Frame, area: Rect) {
-    let text = vec![
-        Line::from(Span::styled(" Quick Info ", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(""),
-        Line::from("Press Esc to return"),
-    ];
-
-    let p = Paragraph::new(text)
-        .block(Block::default().title(" Sidebar ").borders(Borders::ALL));
+    let p =
+        Paragraph::new(text).block(Block::default().title(" Info Panel ").borders(Borders::ALL));
     f.render_widget(p, area);
 }

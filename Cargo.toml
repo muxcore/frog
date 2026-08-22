@@ -16,6 +16,7 @@ chrono = "0.4"
 unicode-width = "0.2"
 anyhow = "1.0"
 arboard = "3"
+rpassword = "7"
 
 [profile.release]
 opt-level = 2
