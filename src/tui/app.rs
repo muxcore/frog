@@ -117,24 +117,25 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let cs = self.config.connect_string();
-        let user = self.config.connection.user.clone();
-        let pwd = self.config.connection.password.clone().unwrap_or_default();
+        let params = self.config.connection.clone();
+        let user = params.user.clone();
         // Always seed the connection dialog (Ctrl+O) from the startup connection
-        // params (CLI flags / ORACLE_* env vars / config.yml), so it reflects them
-        // even when no user is set — e.g. setting only ORACLE_HOST/ORACLE_SERVICE
-        // and typing user+password in the dialog. Only auto-connect when we have
+        // params (CLI flags / ORACLE_*/PG* env vars / config.yml), so it reflects them
+        // even when no user is set — e.g. setting only host/service and typing
+        // user+password in the dialog. Only auto-connect when we have
         // a user to connect as.
         {
             let session = self.session_manager.active_session_mut();
-            session.conn_dialog.host = self.config.connection.host.clone();
-            session.conn_dialog.port = self.config.connection.port.to_string();
-            session.conn_dialog.service = self.config.connection.service.clone();
+            session.conn_dialog.db_type = params.db_type;
+            session.conn_dialog.host = params.host.clone();
+            session.conn_dialog.port = params.port.to_string();
+            session.conn_dialog.service = params.service.clone();
+            session.conn_dialog.database = params.database.clone();
             session.conn_dialog.user = user.clone();
-            session.conn_dialog.password = pwd.clone();
+            session.conn_dialog.password = params.password.clone().unwrap_or_default();
         }
         if !user.is_empty() {
-            self.session_manager.connect_active(&cs, &user, &pwd);
+            self.session_manager.connect_active(&params);
         }
 
         let res = self.run_loop(&mut terminal);
@@ -345,6 +346,10 @@ impl App {
             self.handle_history(key);
             return;
         }
+        if mode == SessionMode::SessionView {
+            self.handle_session_view(key);
+            return;
+        }
 
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
@@ -526,7 +531,7 @@ impl App {
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(2)) => {
-                self.session_manager.active_session_mut().mode = SessionMode::SessionView;
+                self.session_manager.enter_session_view();
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(3)) => {
@@ -732,6 +737,57 @@ impl App {
         }
     }
 
+    /// TOAD-style session browser: pick a session row, preview its current
+    /// SQL and run EXPLAIN on it.
+    fn handle_session_view(&mut self, key: event::KeyEvent) {
+        // Never trap the user: Ctrl+Q always quits.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
+            self.should_quit = true;
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                let session = self.session_manager.active_session_mut();
+                session.mode = SessionMode::Query;
+                self.active_window = ActiveWindow::Editor;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.session_manager.move_session_cursor(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                self.session_manager.move_session_cursor(1);
+            }
+            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.session_manager.explain_selected();
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.session_manager.load_selected_sql();
+            }
+            KeyCode::PageUp => {
+                let session = self.session_manager.active_session_mut();
+                session.plan_scroll = session.plan_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let session = self.session_manager.active_session_mut();
+                session.plan_scroll = session.plan_scroll.saturating_add(10);
+            }
+            KeyCode::Home => {
+                let session = self.session_manager.active_session_mut();
+                session.plan_scroll = 0;
+                session.plan_hscroll = 0;
+            }
+            KeyCode::Left => {
+                let session = self.session_manager.active_session_mut();
+                session.plan_hscroll = session.plan_hscroll.saturating_sub(8);
+            }
+            KeyCode::Right => {
+                let session = self.session_manager.active_session_mut();
+                session.plan_hscroll = session.plan_hscroll.saturating_add(8);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_conn_dialog(&mut self, key: event::KeyEvent) {
         let session = self.session_manager.active_session_mut();
         let dlg = &mut session.conn_dialog;
@@ -761,19 +817,25 @@ impl App {
                 dlg.cursor_end()
             }
             KeyCode::Enter => {
-                let host = dlg.host.clone();
-                let port = dlg.port.clone();
-                let service = dlg.service.clone();
-                let user = dlg.user.clone();
-                let password = dlg.password.clone();
-                let cs = format!("//{}:{}/{}", host, port, service);
+                let params = dlg.to_params();
                 session.mode = SessionMode::Query;
-                self.session_manager.connect_active(&cs, &user, &password);
+                self.session_manager.connect_active(&params);
             }
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => dlg.clear_field(),
             KeyCode::Backspace => dlg.backspace(),
             KeyCode::Delete => dlg.delete(),
-            KeyCode::Char(c) => dlg.insert_char(c),
+            KeyCode::Char(' ') if dlg.is_type_field() => dlg.toggle_db_type(),
+            KeyCode::Char(c) => {
+                if dlg.is_type_field() {
+                    match c.to_ascii_lowercase() {
+                        'o' => dlg.set_db_type(crate::db::DbType::Oracle),
+                        'p' => dlg.set_db_type(crate::db::DbType::Postgres),
+                        _ => {}
+                    }
+                } else {
+                    dlg.insert_char(c)
+                }
+            }
             _ => {}
         }
     }
@@ -806,7 +868,7 @@ impl App {
 
         match mode {
             SessionMode::SessionView => {
-                render_session_overview(&self.session_manager, f, chunks[1]);
+                render_session_overview(&mut self.session_manager, f, chunks[1]);
             }
             SessionMode::Help => {
                 render_help(f, chunks[1]);

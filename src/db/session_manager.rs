@@ -1,4 +1,6 @@
-use crate::db::connection::{DbSessionInfo, OracleConnection, QueryRow};
+use crate::cli::ConnectionParams;
+use crate::db::connection::{DbConnection, DbSessionInfo, DbType, OracleConnection, QueryRow};
+use crate::db::postgres::PgConnection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -590,7 +592,7 @@ impl SqlEditor {
 pub struct Session {
     pub id: usize,
     pub name: String,
-    pub conn: Option<Arc<OracleConnection>>,
+    pub conn: Option<Arc<dyn DbConnection>>,
     pub is_connected: bool,
     pub connecting: bool,
     pub connect_error: Option<String>,
@@ -621,13 +623,30 @@ pub struct Session {
     /// worker threads never call ODPI-C concurrently on the same connection
     /// (breaking is the only operation allowed from the UI thread).
     pub exec_lock: Arc<Mutex<()>>,
+    /// F2 browser: index of the highlighted session row.
+    pub session_view_cursor: usize,
+    /// Full SQL text of the highlighted F2 row (loaded on demand).
+    pub plan_sql_text: Option<String>,
+    /// Which session `plan_sql_text`/`plan_result` belong to (`"<sid> <user>"`).
+    pub plan_for: Option<String>,
+    /// Last explain plan output for the highlighted F2 row.
+    pub plan_result: Option<QueryRow>,
+    /// Vertical scroll offset of the F2 plan pane.
+    pub plan_scroll: usize,
+    /// Horizontal (char) scroll offset of the F2 plan pane.
+    pub plan_hscroll: usize,
+    /// Last F2 list failure (e.g. missing V$SESSION privileges), shown in
+    /// the browser instead of an unexplained empty table.
+    pub session_view_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConnectionDialog {
+    pub db_type: DbType,
     pub host: String,
     pub port: String,
     pub service: String,
+    pub database: String,
     pub user: String,
     pub password: String,
     pub active_field: usize,
@@ -638,9 +657,11 @@ pub struct ConnectionDialog {
 impl Default for ConnectionDialog {
     fn default() -> Self {
         Self {
+            db_type: DbType::Oracle,
             host: String::from("localhost"),
             port: String::from("1521"),
             service: String::from("ORCL"),
+            database: String::from("postgres"),
             user: String::new(),
             password: String::new(),
             active_field: 0,
@@ -650,31 +671,82 @@ impl Default for ConnectionDialog {
 }
 
 impl ConnectionDialog {
-    /// The number of fields in the dialog.
-    pub const FIELD_COUNT: usize = 5;
+    /// Field order: 0 = Type, 1 = Host, 2 = Port, 3 = Service/Database,
+    /// 4 = User, 5 = Password.
+    pub const FIELD_COUNT: usize = 6;
+
+    /// Whether the type selector row is active (not a text field).
+    pub fn is_type_field(&self) -> bool {
+        self.active_field == 0
+    }
+
+    /// Label for field 3, depending on the backend.
+    pub fn db_name_label(&self) -> &'static str {
+        match self.db_type {
+            DbType::Oracle => "Service: ",
+            DbType::Postgres => "Database:",
+        }
+    }
+
+    /// Flip Oracle <-> Postgres. When the port still holds the old backend's
+    /// default it is switched to the new backend's default as well.
+    pub fn toggle_db_type(&mut self) {
+        let new_type = match self.db_type {
+            DbType::Oracle => DbType::Postgres,
+            DbType::Postgres => DbType::Oracle,
+        };
+        self.set_db_type(new_type);
+    }
+
+    pub fn set_db_type(&mut self, db_type: DbType) {
+        let old_default = self.db_type.default_port().to_string();
+        self.db_type = db_type;
+        if self.port == old_default {
+            self.port = db_type.default_port().to_string();
+        }
+        if db_type == DbType::Postgres && self.database.is_empty() && !self.service.is_empty() {
+            self.database = self.service.clone();
+        }
+        if db_type == DbType::Oracle && self.service.is_empty() && !self.database.is_empty() {
+            self.service = self.database.clone();
+        }
+        self.cursor = 0;
+    }
 
     fn field(&self) -> &String {
         match self.active_field {
-            0 => &self.host,
-            1 => &self.port,
-            2 => &self.service,
-            3 => &self.user,
-            _ => &self.password,
+            1 => &self.host,
+            2 => &self.port,
+            3 => match self.db_type {
+                DbType::Oracle => &self.service,
+                DbType::Postgres => &self.database,
+            },
+            4 => &self.user,
+            5 => &self.password,
+            _ => &self.host,
         }
     }
 
     fn field_mut(&mut self) -> &mut String {
         match self.active_field {
-            0 => &mut self.host,
-            1 => &mut self.port,
-            2 => &mut self.service,
-            3 => &mut self.user,
-            _ => &mut self.password,
+            1 => &mut self.host,
+            2 => &mut self.port,
+            3 => match self.db_type {
+                DbType::Oracle => &mut self.service,
+                DbType::Postgres => &mut self.database,
+            },
+            4 => &mut self.user,
+            5 => &mut self.password,
+            _ => &mut self.host,
         }
     }
 
     /// Snap the cursor to a valid position inside the active field.
     pub fn clamp_cursor(&mut self) {
+        if self.is_type_field() {
+            self.cursor = 0;
+            return;
+        }
         let len = self.field().len();
         let mut pos = self.cursor.min(len);
         while pos < len && !self.field().is_char_boundary(pos) {
@@ -686,12 +758,20 @@ impl ConnectionDialog {
     /// Select a field by index (mod FIELD_COUNT) and park the cursor at its end.
     pub fn select_field(&mut self, idx: usize) {
         self.active_field = idx % Self::FIELD_COUNT;
-        self.cursor = self.field().len();
+        if self.is_type_field() {
+            self.cursor = 0;
+        } else {
+            self.cursor = self.field().len();
+        }
     }
 
-    /// Insert a character at the cursor (digits only for the port field).
+    /// Insert a character at the cursor (digits only for the port field,
+    /// no-op on the type selector row).
     pub fn insert_char(&mut self, c: char) {
-        if c.is_control() || (self.active_field == 1 && !c.is_ascii_digit()) {
+        if self.is_type_field() {
+            return;
+        }
+        if c.is_control() || (self.active_field == 2 && !c.is_ascii_digit()) {
             return;
         }
         self.clamp_cursor();
@@ -702,6 +782,9 @@ impl ConnectionDialog {
 
     /// Delete the character before the cursor.
     pub fn backspace(&mut self) {
+        if self.is_type_field() {
+            return;
+        }
         self.clamp_cursor();
         let cur = self.cursor;
         if cur > 0 {
@@ -717,6 +800,9 @@ impl ConnectionDialog {
 
     /// Delete the character at the cursor.
     pub fn delete(&mut self) {
+        if self.is_type_field() {
+            return;
+        }
         self.clamp_cursor();
         let next = self.field()[self.cursor..]
             .chars()
@@ -732,11 +818,18 @@ impl ConnectionDialog {
 
     /// Remove everything from the active field.
     pub fn clear_field(&mut self) {
+        if self.is_type_field() {
+            return;
+        }
         self.field_mut().clear();
         self.cursor = 0;
     }
 
     pub fn cursor_left(&mut self) {
+        if self.is_type_field() {
+            self.toggle_db_type();
+            return;
+        }
         self.clamp_cursor();
         if self.cursor > 0 {
             let prev = self.field()[..self.cursor]
@@ -749,6 +842,10 @@ impl ConnectionDialog {
     }
 
     pub fn cursor_right(&mut self) {
+        if self.is_type_field() {
+            self.toggle_db_type();
+            return;
+        }
         let s = self.field();
         let next = s[self.cursor..].chars().next().map(|c| c.len_utf8());
         if let Some(n) = next {
@@ -761,7 +858,54 @@ impl ConnectionDialog {
     }
 
     pub fn cursor_end(&mut self) {
+        if self.is_type_field() {
+            self.cursor = 0;
+            return;
+        }
         self.cursor = self.field().len();
+    }
+
+    /// Build connection parameters from the dialog contents.
+    pub fn to_params(&self) -> ConnectionParams {
+        let port = self.port.parse::<u16>().unwrap_or_else(|_| self.db_type.default_port());
+        let (service, database) = match self.db_type {
+            DbType::Oracle => {
+                let service = if self.service.is_empty() {
+                    self.database.clone()
+                } else {
+                    self.service.clone()
+                };
+                let service = if service.is_empty() { "ORCL".into() } else { service };
+                let database = service.clone();
+                (service, database)
+            }
+            DbType::Postgres => {
+                let database = if self.database.is_empty() {
+                    if self.service.is_empty() {
+                        if self.user.is_empty() {
+                            "postgres".into()
+                        } else {
+                            self.user.clone()
+                        }
+                    } else {
+                        self.service.clone()
+                    }
+                } else {
+                    self.database.clone()
+                };
+                let service = database.clone();
+                (service, database)
+            }
+        };
+        ConnectionParams {
+            db_type: self.db_type,
+            host: self.host.clone(),
+            port,
+            service,
+            database,
+            user: self.user.clone(),
+            password: Some(self.password.clone()).filter(|p| !p.is_empty()),
+        }
     }
 }
 
@@ -817,6 +961,13 @@ impl Session {
             status_message_ttl: std::time::Duration::from_secs(5),
             job_seq: 0,
             exec_lock: Arc::new(Mutex::new(())),
+            session_view_cursor: 0,
+            plan_sql_text: None,
+            plan_for: None,
+            plan_result: None,
+            plan_scroll: 0,
+            plan_hscroll: 0,
+            session_view_error: None,
         }
     }
 }
@@ -829,7 +980,7 @@ pub struct SessionManager {
     result_tx: Sender<(usize, u64, QueryRow)>,
     conn_result_rx: Receiver<(usize, bool, String, String)>,
     conn_result_tx: Sender<(usize, bool, String, String)>,
-    conn_map: Arc<Mutex<HashMap<usize, Arc<OracleConnection>>>>,
+    conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
     /// Maximum number of query-history entries kept per session.
     pub max_history: usize,
     /// Maximum number of result pages kept per session before trimming.
@@ -918,6 +1069,56 @@ impl SessionManager {
         let _ = result_tx.send((id, seq, err_row));
     }
 
+    /// Open a backend connection in a background thread and report back
+    /// through the conn_result channel.
+    fn spawn_connect(
+        conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
+        conn_result_tx: Sender<(usize, bool, String, String)>,
+        id: usize,
+        params: ConnectionParams,
+        autocommit: bool,
+        null_display: String,
+    ) {
+        thread::spawn(move || {
+            let name_str = params.display_name();
+            let result: Result<Arc<dyn DbConnection>, anyhow::Error> = match params.db_type {
+                DbType::Oracle => OracleConnection::connect_with_autocommit(
+                    &params.oracle_connect_string(),
+                    &params.user,
+                    params.password.as_deref().unwrap_or(""),
+                    autocommit,
+                    &null_display,
+                )
+                .map(|c| c as Arc<dyn DbConnection>),
+                DbType::Postgres => PgConnection::connect(
+                    &params.host,
+                    params.port,
+                    &params.database,
+                    &params.user,
+                    params.password.as_deref().unwrap_or(""),
+                    &null_display,
+                )
+                .map(|c| c as Arc<dyn DbConnection>),
+            };
+            match result {
+                Ok(conn) => {
+                    if let Ok(mut map) = conn_map.lock() {
+                        map.insert(id, conn);
+                    }
+                    let _ = conn_result_tx.send((id, true, String::new(), name_str));
+                }
+                Err(e) => {
+                    let msg = if params.db_type == DbType::Oracle {
+                        OracleConnection::friendly_connect_error(&e)
+                    } else {
+                        e.to_string()
+                    };
+                    let _ = conn_result_tx.send((id, false, msg, name_str));
+                }
+            }
+        });
+    }
+
     pub fn add_session(&mut self) -> usize {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut session = Session::new(id);
@@ -926,51 +1127,25 @@ impl SessionManager {
         // If active session is connected, auto-connect the new session with same params
         let active = &self.sessions[self.active_idx];
         let should_connect = active.is_connected && !active.connecting;
-        let cs = format!(
-            "//{}:{}/{}",
-            active.conn_dialog.host, active.conn_dialog.port, active.conn_dialog.service
-        );
-        let user = active.conn_dialog.user.clone();
-        let password = active.conn_dialog.password.clone();
+        let params = active.conn_dialog.to_params();
 
         self.sessions.push(session);
         self.active_idx = self.sessions.len() - 1;
         let new_idx = self.active_idx;
 
-        if should_connect && !user.is_empty() && !password.is_empty() {
+        if should_connect && !params.user.is_empty() {
             let id = self.sessions[new_idx].id;
-            let cs_str = cs.clone();
-            let user_str = user.clone();
-            let password_str = password.clone();
-            let name_str = format!("{}@{}", user_str, cs_str.trim_start_matches("//"));
-            let autocommit = self.autocommit;
-            let null_display = self.null_display.clone();
-            let conn_map = self.conn_map.clone();
-            let conn_result_tx = self.conn_result_tx.clone();
+            Self::spawn_connect(
+                self.conn_map.clone(),
+                self.conn_result_tx.clone(),
+                id,
+                params,
+                self.autocommit,
+                self.null_display.clone(),
+            );
 
             self.sessions[new_idx].connecting = true;
             self.sessions[new_idx].connect_error = None;
-
-            thread::spawn(move || {
-                match OracleConnection::connect_with_autocommit(
-                    &cs_str,
-                    &user_str,
-                    &password_str,
-                    autocommit,
-                    &null_display,
-                ) {
-                    Ok(conn) => {
-                        if let Ok(mut map) = conn_map.lock() {
-                            map.insert(id, conn);
-                        }
-                        let _ = conn_result_tx.send((id, true, String::new(), name_str));
-                    }
-                    Err(e) => {
-                        let msg = OracleConnection::friendly_connect_error(&e);
-                        let _ = conn_result_tx.send((id, false, msg, name_str));
-                    }
-                }
-            });
         }
 
         new_idx
@@ -990,11 +1165,11 @@ impl SessionManager {
             self.active_idx -= 1;
         }
 
-        // Release the Oracle connection for the removed session so the underlying
+        // Release the DB connection for the removed session so the underlying
         // DB session is closed promptly instead of lingering until app exit.
         if let Ok(mut map) = self.conn_map.lock() {
             if let Some(conn) = map.remove(&removed_id) {
-                let _ = OracleConnection::close(conn.as_ref());
+                let _ = conn.close();
             }
         }
     }
@@ -1021,40 +1196,30 @@ impl SessionManager {
         }
     }
 
-    pub fn connect_active(&mut self, cs: &str, user: &str, password: &str) {
+    pub fn connect_active(&mut self, params: &ConnectionParams) {
         let id = self.sessions[self.active_idx].id;
-        let cs_str = cs.to_string();
-        let user_str = user.to_string();
-        let password = password.to_string();
-        let name_str = format!("{}@{}", user_str, cs_str.trim_start_matches("//"));
-        let autocommit = self.autocommit;
-        let null_display = self.null_display.clone();
-        let conn_map = self.conn_map.clone();
-        let conn_result_tx = self.conn_result_tx.clone();
+        Self::spawn_connect(
+            self.conn_map.clone(),
+            self.conn_result_tx.clone(),
+            id,
+            params.clone(),
+            self.autocommit,
+            self.null_display.clone(),
+        );
 
         self.sessions[self.active_idx].connecting = true;
         self.sessions[self.active_idx].connect_error = None;
+    }
 
-        thread::spawn(move || {
-            match OracleConnection::connect_with_autocommit(
-                &cs_str,
-                &user_str,
-                &password,
-                autocommit,
-                &null_display,
-            ) {
-                Ok(conn) => {
-                    if let Ok(mut map) = conn_map.lock() {
-                        map.insert(id, conn);
-                    }
-                    let _ = conn_result_tx.send((id, true, String::new(), name_str));
-                }
-                Err(e) => {
-                    let msg = OracleConnection::friendly_connect_error(&e);
-                    let _ = conn_result_tx.send((id, false, msg, name_str));
-                }
+    /// Backend of the active session's connection if connected, else the
+    /// backend selected in its connection dialog.
+    pub fn active_db_type(&self) -> DbType {
+        if let Ok(map) = self.conn_map.lock() {
+            if let Some(conn) = map.get(&self.sessions[self.active_idx].id) {
+                return conn.db_type();
             }
-        });
+        }
+        self.sessions[self.active_idx].conn_dialog.db_type
     }
 
     pub fn execute_query(&mut self, sql: &str) {
@@ -1115,9 +1280,10 @@ impl SessionManager {
                 if !trimmed.is_empty() {
                     append_history(&trimmed);
                     sess.query_history.push(trimmed.clone());
-                    let up = crate::db::connection::strip_leading_comments(&trimmed)
-                        .to_uppercase();
-                    if up.starts_with("SELECT") || up.starts_with("WITH") {
+                    if crate::db::connection::is_query_sql_for(
+                        sess.conn_dialog.db_type,
+                        &trimmed,
+                    ) {
                         sess.last_sql = Some(trimmed);
                     }
                 }
@@ -1133,7 +1299,7 @@ impl SessionManager {
 
         thread::spawn(move || {
             // Serialize on this session's connection so only one statement runs
-            // at a time on it (avoids concurrent ODPI-C calls from duplicate spawns).
+            // at a time on it (avoids concurrent driver calls from duplicate spawns).
             let _guard = exec_lock.lock().ok();
             let conn_opt = conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
             if let Some(conn) = conn_opt {
@@ -1142,7 +1308,7 @@ impl SessionManager {
                     if had_error {
                         break;
                     }
-                    let result = OracleConnection::execute_query(&conn, sql, page_size);
+                    let result = conn.execute_query(sql, page_size);
                     let was_cancelled = result.is_error
                         && result
                             .error_msg
@@ -1250,18 +1416,18 @@ impl SessionManager {
             let _guard = exec_lock.lock().ok();
             let conn_opt = conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
             if let Some(conn) = conn_opt {
-                let result =
-                    OracleConnection::execute_query_paged(&conn, &sql, current_offset, allowed);
+                let result = conn.execute_query_paged(&sql, current_offset, allowed);
                 let _ = result_tx.send((id, seq, result));
             }
         });
     }
 
-    /// Whether an Oracle error message indicates a user-requested cancellation.
+    /// Whether a backend error message indicates a user-requested cancellation.
     pub fn is_cancelled_msg(msg: &str) -> bool {
         msg == "Query cancelled"
             || msg.contains("ORA-01013")
             || msg.contains("ORA-01014")
+            || msg.contains("57014")
             || msg.to_lowercase().contains("cancel")
             || msg.to_lowercase().contains("interrupted")
     }
@@ -1291,7 +1457,7 @@ impl SessionManager {
 
         match conn {
             Some(conn) => {
-                let result = OracleConnection::cancel_query(conn.as_ref());
+                let result = conn.cancel_query();
                 match result {
                     Ok(()) => {
                         self.sessions[self.active_idx].status_message =
@@ -1388,16 +1554,148 @@ impl SessionManager {
         }
     }
 
-    pub fn get_session_info(&self) -> Vec<DbSessionInfo> {
+    /// Query the backend for its session list. Failures (notably missing
+    /// `V$SESSION` privileges on Oracle) are returned as a displayable
+    /// message instead of being swallowed.
+    pub fn get_session_info(&self) -> Result<Vec<DbSessionInfo>, String> {
         let id = self.sessions[self.active_idx].id;
-        if let Ok(map) = self.conn_map.lock() {
-            if let Some(conn) = map.get(&id) {
-                if let Ok(info) = OracleConnection::query_v_session(conn.as_ref()) {
-                    return info;
+        let conn = self
+            .conn_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned());
+        match conn {
+            Some(c) => c.query_sessions().map_err(|e| {
+                if c.db_type() == DbType::Oracle {
+                    OracleConnection::friendly_session_error(&e.to_string())
+                } else {
+                    e.to_string()
                 }
+            }),
+            None => Err("Not connected. Use Ctrl+O to connect.".into()),
+        }
+    }
+
+    /// Refresh the F2 list, recording any failure on the active session so
+    /// the browser can show it (e.g. missing dictionary privileges).
+    pub(crate) fn fresh_session_list(&mut self) -> Vec<DbSessionInfo> {
+        let idx = self.active_idx;
+        match self.get_session_info() {
+            Ok(list) => {
+                self.sessions[idx].session_view_error = None;
+                list
+            }
+            Err(msg) => {
+                self.sessions[idx].session_view_error = Some(msg);
+                vec![]
             }
         }
-        vec![]
+    }
+
+    /// Open the F2 session browser: reset selection/plan state and preload
+    /// the current SQL of the first row (best effort).
+    pub fn enter_session_view(&mut self) {
+        let idx = self.active_idx;
+        {
+            let s = &mut self.sessions[idx];
+            s.mode = SessionMode::SessionView;
+            s.session_view_cursor = 0;
+            s.plan_sql_text = None;
+            s.plan_for = None;
+            s.plan_result = None;
+            s.plan_scroll = 0;
+            s.plan_hscroll = 0;
+            s.session_view_error = None;
+        }
+        self.load_selected_sql();
+    }
+
+    /// Move the F2 highlight and preload that row's SQL (best effort).
+    pub fn move_session_cursor(&mut self, delta: isize) {
+        let len = self.fresh_session_list().len();
+        if len == 0 {
+            return;
+        }
+        let idx = self.active_idx;
+        let cur = self.sessions[idx].session_view_cursor as isize;
+        let next = cur.saturating_add(delta).clamp(0, len as isize - 1) as usize;
+        if next != self.sessions[idx].session_view_cursor {
+            self.sessions[idx].session_view_cursor = next;
+            self.load_selected_sql();
+        }
+    }
+
+    /// Load the full SQL text of the highlighted F2 row into `plan_sql_text`.
+    /// Clears any previous plan; failures surface as a status message.
+    pub fn load_selected_sql(&mut self) {
+        let idx = self.active_idx;
+        let cursor = self.sessions[idx].session_view_cursor;
+        let info = match self.fresh_session_list().into_iter().nth(cursor) {
+            Some(info) => info,
+            None => {
+                let s = &mut self.sessions[idx];
+                s.plan_sql_text = None;
+                s.plan_result = None;
+                s.plan_for = None;
+                return;
+            }
+        };
+        let label = format!("{} {}", info.sid, info.username);
+        let id = self.sessions[idx].id;
+        let conn = self
+            .conn_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned());
+        let sess = &mut self.sessions[idx];
+        sess.plan_for = Some(label);
+        sess.plan_scroll = 0;
+        sess.plan_hscroll = 0;
+        sess.plan_result = None;
+        match conn {
+            Some(c) => match c.session_sql(&info) {
+                Ok(text) => sess.plan_sql_text = Some(text),
+                Err(e) => {
+                    sess.plan_sql_text = None;
+                    sess.set_status(format!("No SQL text: {}", e));
+                }
+            },
+            None => {
+                sess.plan_sql_text = None;
+                sess.set_status("Not connected");
+            }
+        }
+    }
+
+    /// Run EXPLAIN for the highlighted F2 row's SQL and store the plan.
+    pub fn explain_selected(&mut self) {
+        let idx = self.active_idx;
+        if self.sessions[idx].plan_sql_text.is_none() {
+            self.load_selected_sql();
+        }
+        let (sql, max_rows) = {
+            let sess = &self.sessions[idx];
+            match sess.plan_sql_text.clone() {
+                Some(t) if !t.trim().is_empty() => (t, sess.page_size),
+                _ => return,
+            }
+        };
+        let id = self.sessions[idx].id;
+        let conn = self
+            .conn_map
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned());
+        match conn {
+            Some(c) => {
+                let result = c.explain_plan(&sql, max_rows);
+                let sess = &mut self.sessions[idx];
+                sess.plan_result = Some(result);
+                sess.plan_scroll = 0;
+                sess.plan_hscroll = 0;
+            }
+            None => self.sessions[idx].set_status("Not connected"),
+        }
     }
 
     pub fn check_connections(&mut self) {
@@ -1409,7 +1707,7 @@ impl SessionManager {
         }
     }
 
-    pub fn active_connection(&self) -> Option<Arc<OracleConnection>> {
+    pub fn active_connection(&self) -> Option<Arc<dyn DbConnection>> {
         let id = self.sessions[self.active_idx].id;
         let map = self.conn_map.lock().ok()?;
         map.get(&id).cloned()
@@ -1431,6 +1729,32 @@ mod tests {
         assert_eq!(parse_file_directive("select 1 from dual"), None);
         assert_eq!(parse_file_directive("@"), None);
         assert_eq!(parse_file_directive("   "), None);
+    }
+
+    #[test]
+    fn conn_dialog_toggle_switches_port_default() {
+        let mut dlg = ConnectionDialog::default();
+        assert_eq!(dlg.db_type, DbType::Oracle);
+        assert_eq!(dlg.port, "1521");
+        dlg.toggle_db_type();
+        assert_eq!(dlg.db_type, DbType::Postgres);
+        assert_eq!(dlg.port, "5432");
+        // Custom ports are left alone.
+        dlg.port = "15432".into();
+        dlg.toggle_db_type();
+        assert_eq!(dlg.db_type, DbType::Oracle);
+        assert_eq!(dlg.port, "15432");
+    }
+
+    #[test]
+    fn conn_dialog_to_params_cross_fills_names() {
+        let mut dlg = ConnectionDialog::default();
+        dlg.set_db_type(DbType::Postgres);
+        dlg.service = "myapp".into();
+        dlg.database.clear();
+        let params = dlg.to_params();
+        assert_eq!(params.database, "myapp");
+        assert_eq!(params.port, 5432);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 You ocassianly need to ssh to remote machine and debug some stuck session. You absolutley hate sqlplus
 visual (functionality is fine), I've got you:
 
-Meet 'Frog' - A terminal-based Oracle database client written in Rust — name inspired by Toad. Tmux, btop for UI.
+Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust — name inspired by Toad. Tmux, btop for UI.
 
 **Before you start reading further: If you are against AI assisted developement, look away. Otherwise continue.**
 
@@ -15,7 +15,8 @@ Meet 'Frog' - A terminal-based Oracle database client written in Rust — name i
 - **(experimental)sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
 - **SQL history** — persisted to `frog_history.txt` next to the binary and browsable in-app.
-- **Oracle session overview** — `v$session` viewer.
+- **Oracle + Postgres** — pick the backend with `--db-type` or the `Type:` row in the connection dialog (`Ctrl+O`). Postgres needs no client libraries.
+- **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style).
 - **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
 
 ![Demo GIF](multimedia/demo.gif)
@@ -24,7 +25,8 @@ Meet 'Frog' - A terminal-based Oracle database client written in Rust — name i
 ## Requirements
 
 - Rust toolchain (edition 2021).
-- Oracle Instant Client (`libclntsh.so`) — the binary links against ODPI-C. On Arch install via AUR: `oracle-instantclient-basic`, then set `LD_LIBRARY_PATH` if you hit `DPI-1047`.
+- For Oracle: Oracle Instant Client (`libclntsh.so`) — the binary links against ODPI-C. On Arch install via AUR: `oracle-instantclient-basic`, then set `LD_LIBRARY_PATH` if you hit `DPI-1047`.
+- For Postgres: nothing extra (pure-Rust driver, plaintext `NoTls` in v1).
 
 ## Build
 
@@ -91,16 +93,28 @@ tune — see the variables at the top of each script and `scripts/Dockerfile.old
 ## Run
 
 ```bash
-# CLI args (psql-style)
-./target/release/frog -H localhost -P 1521 -S ORCL -U user
+# Oracle: CLI args
+./target/release/frog -H localhost -P 1521 -S ORCL -U scott
 
-# Env vars
+# Oracle: env vars
 export ORACLE_HOST=localhost ORACLE_PORT=1521 ORACLE_SERVICE=ORCL \
-       ORACLE_USER=u ORACLE_PASSWORD=p
+       ORACLE_USER=scott ORACLE_PASSWORD=tiger
 ./target/release/frog
 
-# Or a connect string
+# Oracle: connect string
 ./target/release/frog -d 'host=localhost;port=1521;service_name=ORCL;user=scott'
+
+# Postgres: URL connect string
+./target/release/frog -d 'postgres://scott:tiger@db1.local:5432/myapp'
+
+# Postgres: CLI args
+./target/release/frog --db-type postgres -H db1.local -D myapp -U scott
+
+# Postgres: standard PG* env vars (frog picks postgres automatically
+# when only PG* variables are set)
+export FROG_DB_TYPE=postgres PGHOST=db1.local PGDATABASE=myapp \
+       PGUSER=scott PGPASSWORD=tiger
+./target/release/frog
 ```
 
 All connection parameters can be supplied via CLI flags, environment variables, or the in-app connection dialog (`Ctrl+O`). Optional YAML config lives at `~/.config/frog/config.yml`.
@@ -110,10 +124,10 @@ All connection parameters can be supplied via CLI flags, environment variables, 
 If a `.env` file exists in the directory frog is started from, its variables are used as a second-priority source — after real environment variables. Precedence per setting:
 
 ```
-CLI flag  >  environment variable (ORACLE_* / FROG_*)  >  .env  >  built-in default
+CLI flag  >  environment variable (ORACLE_* / PG* / FROG_*)  >  .env  >  built-in default
 ```
 
-Example `.env`:
+Example `.env` (Oracle):
 
 ```bash
 ORACLE_HOST=db1.local
@@ -125,7 +139,20 @@ ORACLE_PASSWORD=tiger
 # ORACLE_CONNECT=HOST=db1.local;PORT=1521;SERVICE_NAME=ORCL;USER=scott;PASSWORD=tiger
 ```
 
-Supported keys: `ORACLE_CONNECT`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored.
+Example `.env` (Postgres):
+
+```bash
+FROG_DB_TYPE=postgres
+PGHOST=db1.local
+PGPORT=5432
+PGDATABASE=myapp
+PGUSER=scott
+PGPASSWORD=tiger
+# or a URL instead of the individual fields:
+# ORACLE_CONNECT=postgres://scott:tiger@db1.local:5432/myapp
+```
+
+Supported keys: `ORACLE_CONNECT`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
 
 At startup frog prints one line summarizing what the `.env` contributed, for example:
 
@@ -133,11 +160,11 @@ At startup frog prints one line summarizing what the `.env` contributed, for exa
 frog: './.env': using ORACLE_USER, ORACLE_PASSWORD; ignored ORACLE_HOST (set in environment)
 ```
 
-Opening the dialog with `Ctrl+O` **pre-fills its fields from the startup connection parameters** (CLI flags / `ORACLE_*` env vars / `.env` / `-d` connect string / `config.yml`). So if you launch with `ORACLE_HOST`/`ORACLE_SERVICE` set and type the user + password into the dialog, the host/port/service are already there — just fill in credentials and connect. You only need `ORACLE_USER` present if you want frog to auto-connect on startup.
+Opening the dialog with `Ctrl+O` **pre-fills its fields from the startup connection parameters** (CLI flags / `ORACLE_*`/`PG*` env vars / `.env` / `-d` connect string / `config.yml`). So if you launch with `ORACLE_HOST`/`ORACLE_SERVICE` set and type the user + password into the dialog, the host/port/service are already there — just fill in credentials and connect. You only need the user present if you want frog to auto-connect on startup.
 
-Inside the dialog: `Tab`/`Up`/`Down` switch fields (the current field is highlighted and shows a visible insertion cursor), `Left`/`Right`/`Home`/`End` move within the text, `Backspace`/`Delete` edit at the cursor, and `Ctrl+U` clears a field (handy for wiping a password that was pre-filled from `.env`). The port field accepts digits only.
+Inside the dialog: the first row selects the backend (`Type: oracle/postgres` — `Space`/`Left`/`Right` toggles, `o`/`p` picks directly; switching updates the default port `1521`/`5432`). `Tab`/`Up`/`Down` switch fields (the current field is highlighted and shows a visible insertion cursor), `Left`/`Right`/`Home`/`End` move within the text, `Backspace`/`Delete` edit at the cursor, and `Ctrl+U` clears a field (handy for wiping a password that was pre-filled from `.env`). The port field accepts digits only. The third row is labeled `Service:` for Oracle and `Database:` for Postgres (`-S` and `-D`/`DATABASE=` are aliases for each other).
 
-> **Passwords**: never pass a password on the command line (`-W` was removed so it can't leak via `ps`). FROG reads it from `ORACLE_PASSWORD` (env or `.env`), a `PASSWORD=` connect-string component, or prompts interactively (echo-off) at startup. Frog never persists passwords to disk.
+> **Passwords**: never pass a password on the command line (`-W` was removed so it can't leak via `ps`). FROG reads it from `ORACLE_PASSWORD` / `PGPASSWORD` (env or `.env`), a `PASSWORD=` connect-string component (or the `postgres://user:pass@…` URL), or prompts interactively (echo-off) at startup. Frog never persists passwords to disk.
 
 ## Keyboard Reference
 
@@ -151,11 +178,12 @@ Inside the dialog: `Tab`/`Up`/`Down` switch fields (the current field is highlig
 | `Ctrl+B` | Toggle sidebar |
 | `Ctrl+Y` | Copy results to clipboard |
 | `Ctrl+D` | Toggle Markdown table format |
-| `Ctrl+O` | Connection dialog |
+| `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
 | `Ctrl+C` / `Esc` | Cancel running query |
+| `Ctrl+F` | Fetch next page of results |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / v$session / History |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter` = explain plan) / History |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |
@@ -191,6 +219,12 @@ connections:
     service: ORCL
     user: app
     password: secret
+  - name: pg-dev
+    db_type: postgres
+    host: db1.local
+    port: 5432
+    database: myapp   # 'service:' works as an alias when 'database:' is omitted
+    user: scott
 defaults:
   max_rows: 10000
   autocommit: true
@@ -200,6 +234,19 @@ ui:
   date_format: "%Y-%m-%d %H:%M:%S"
   null_display: "(NULL)"
 ```
+
+## Backend notes
+
+- **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET` — `Ctrl+F` fetches more on both.
+- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads, `PgUp`/`PgDn` scroll the plan.
+- **F2 privileges (Oracle)**: the browser needs dictionary access. If F2 shows an error about it, ask your DBA for e.g.:
+  ```sql
+  GRANT SELECT_CATALOG_ROLE TO scott;
+  -- or minimally:
+  GRANT SELECT ON V_$SESSION TO scott;
+  GRANT SELECT ON V_$SQL TO scott;
+  ```
+- **Postgres statements**: besides `SELECT`/`WITH`, `VALUES`/`TABLE`/`SHOW` and `… RETURNING` run as queries and return rows.
 
 
 

@@ -1,5 +1,73 @@
 use oracle::Connection;
+use std::str::FromStr;
 use std::sync::Arc;
+
+/// Which database backend a session talks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbType {
+    #[default]
+    Oracle,
+    Postgres,
+}
+
+impl std::fmt::Display for DbType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbType::Oracle => write!(f, "oracle"),
+            DbType::Postgres => write!(f, "postgres"),
+        }
+    }
+}
+
+impl FromStr for DbType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "oracle" => Ok(DbType::Oracle),
+            "postgres" | "postgresql" | "pg" => Ok(DbType::Postgres),
+            other => Err(format!(
+                "unknown db type '{}' (expected 'oracle' or 'postgres')",
+                other
+            )),
+        }
+    }
+}
+
+impl DbType {
+    /// Default TCP port for the backend.
+    pub fn default_port(self) -> u16 {
+        match self {
+            DbType::Oracle => 1521,
+            DbType::Postgres => 5432,
+        }
+    }
+
+    /// Short label used in session names / status UI.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            DbType::Oracle => "ora",
+            DbType::Postgres => "pg",
+        }
+    }
+}
+
+/// Backend-agnostic database connection. Implemented by Oracle and Postgres
+/// connections so sessions can hold either behind an `Arc<dyn DbConnection>`.
+pub trait DbConnection: Send + Sync {
+    fn execute_query(&self, sql: &str, max_rows: usize) -> QueryRow;
+    fn execute_query_paged(&self, sql: &str, page_offset: usize, page_size: usize) -> QueryRow;
+    fn cancel_query(&self) -> anyhow::Result<()>;
+    fn close(&self) -> anyhow::Result<()>;
+    fn query_sessions(&self) -> anyhow::Result<Vec<DbSessionInfo>>;
+    fn db_type(&self) -> DbType;
+    /// Full text of the SQL currently executed by the given session entry
+    /// (TOAD-style session browser detail). Errors when the session is idle
+    /// or its SQL text is not visible to us.
+    fn session_sql(&self, info: &DbSessionInfo) -> anyhow::Result<String>;
+    /// Explain plan for an arbitrary SQL statement, as a displayable result.
+    fn explain_plan(&self, sql: &str, max_rows: usize) -> QueryRow;
+}
 
 pub struct OracleConnection {
     pub conn: Connection,
@@ -28,7 +96,7 @@ pub struct QueryRow {
 }
 
 impl QueryRow {
-    fn error(msg: String, elapsed_ms: u64, page_offset: usize, page_size: usize) -> Self {
+    pub(crate) fn error(msg: String, elapsed_ms: u64, page_offset: usize, page_size: usize) -> Self {
         Self {
             columns: vec![],
             rows: vec![],
@@ -45,7 +113,7 @@ impl QueryRow {
         }
     }
 
-    fn from_query(
+    pub(crate) fn from_query(
         data: QueryData,
         elapsed_ms: u64,
         page_offset: usize,
@@ -68,7 +136,7 @@ impl QueryRow {
         }
     }
 
-    fn notice(text: &str, elapsed_ms: u64, page_size: usize) -> Self {
+    pub(crate) fn notice(text: &str, elapsed_ms: u64, page_size: usize) -> Self {
         Self {
             columns: vec!["Result".into()],
             rows: vec![vec![text.to_string()]],
@@ -87,7 +155,7 @@ impl QueryRow {
 }
 
 /// (columns, rows, truncated, total_fetched, byte_count)
-type QueryData = (Vec<String>, Vec<Vec<String>>, bool, usize, usize);
+pub(crate) type QueryData = (Vec<String>, Vec<Vec<String>>, bool, usize, usize);
 
 /// Map an Oracle error to a message, collapsing user cancellations.
 fn clean_error(e: &oracle::Error) -> String {
@@ -119,11 +187,30 @@ pub fn strip_leading_comments(mut sql: &str) -> &str {
 }
 
 fn is_query_sql(trimmed: &str) -> bool {
+    is_query_sql_for(DbType::Oracle, trimmed)
+}
+
+pub fn is_query_sql_for(db_type: DbType, trimmed: &str) -> bool {
     let upper = strip_leading_comments(trimmed).to_uppercase();
-    upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("DESCRIBE")
-        || upper.starts_with("EXPLAIN")
+    match db_type {
+        DbType::Oracle => {
+            upper.starts_with("SELECT")
+                || upper.starts_with("WITH")
+                || upper.starts_with("DESCRIBE")
+                || upper.starts_with("EXPLAIN")
+        }
+        DbType::Postgres => {
+            upper.starts_with("SELECT")
+                || upper.starts_with("WITH")
+                || upper.starts_with("VALUES")
+                || upper.starts_with("TABLE")
+                || upper.starts_with("SHOW")
+                || upper.starts_with("DESCRIBE")
+                || upper.starts_with("EXPLAIN")
+                // INSERT/UPDATE/DELETE ... RETURNING yields rows in Postgres.
+                || upper.contains("RETURNING")
+        }
+    }
 }
 
 impl OracleConnection {
@@ -145,8 +232,8 @@ impl OracleConnection {
     }
 
     /// Explicitly close the underlying Oracle connection (best-effort).
-    pub fn close(this: &Self) -> anyhow::Result<()> {
-        this.conn.close().map_err(|e| anyhow::anyhow!("{}", e))
+    pub fn close(&self) -> anyhow::Result<()> {
+        self.conn.close().map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// Augment a connect error with a friendly hint when the Oracle client
@@ -164,33 +251,49 @@ impl OracleConnection {
         }
     }
 
-    pub fn execute_query(this: &Self, sql: &str, max_rows: usize) -> QueryRow {
+    /// Map an F2 browser query failure to a message. Missing dictionary
+    /// privileges (the usual cause of an empty F2) get a GRANT hint.
+    pub fn friendly_session_error(msg: &str) -> String {
+        if msg.contains("ORA-00942") || msg.contains("ORA-01031") {
+            format!(
+                "{}\n\nHint: F2 needs SELECT on V_$SESSION (and V_$SQL for SQL text). \
+                 Ask your DBA for e.g.:\n  GRANT SELECT_CATALOG_ROLE TO <your_user>;\n\
+                 -- or minimally:\n  GRANT SELECT ON V_$SESSION TO <your_user>;\n  \
+                 GRANT SELECT ON V_$SQL TO <your_user>;",
+                msg
+            )
+        } else {
+            msg.to_string()
+        }
+    }
+
+    pub fn execute_query(&self, sql: &str, max_rows: usize) -> QueryRow {
         let start = std::time::Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;
         let trimmed = sql.trim();
 
         if trimmed.eq_ignore_ascii_case("commit") {
-            return match this.conn.commit() {
+            return match self.conn.commit() {
                 Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
                 Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
             };
         }
 
         if trimmed.eq_ignore_ascii_case("rollback") {
-            return match this.conn.rollback() {
+            return match self.conn.rollback() {
                 Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
                 Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
             };
         }
 
         if is_query_sql(trimmed) {
-            return match Self::do_query(this, sql, max_rows, None) {
+            return match Self::do_query(self, sql, max_rows, None) {
                 Ok(data) => QueryRow::from_query(data, elapsed(), 0, max_rows),
                 Err(e) => QueryRow::error(clean_error(&e), elapsed(), 0, max_rows),
             };
         }
 
-        match this.conn.execute(sql, &[]) {
+        match self.conn.execute(sql, &[]) {
             Ok(stmt) => {
                 let affected = stmt.row_count().unwrap_or(0);
                 let mut row = QueryRow::notice(
@@ -207,7 +310,7 @@ impl OracleConnection {
     }
 
     pub fn execute_query_paged(
-        this: &Self,
+        &self,
         sql: &str,
         page_offset: usize,
         page_size: usize,
@@ -234,7 +337,7 @@ impl OracleConnection {
             )
         };
 
-        match Self::do_query(this, &paged_sql, page_size, Some("RN")) {
+        match Self::do_query(self, &paged_sql, page_size, Some("RN")) {
             Ok(data) => QueryRow::from_query(
                 data,
                 start.elapsed().as_millis() as u64,
@@ -332,13 +435,13 @@ impl OracleConnection {
         Ok((col_names, result_rows, truncated, total_fetched, byte_count))
     }
 
-    pub fn cancel_query(this: &Self) -> anyhow::Result<()> {
-        this.conn
+    pub fn cancel_query(&self) -> anyhow::Result<()> {
+        self.conn
             .break_execution()
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
-    pub fn query_v_session(this: &Self) -> Result<Vec<DbSessionInfo>, anyhow::Error> {
+    pub fn query_v_session(&self) -> Result<Vec<DbSessionInfo>, anyhow::Error> {
         let sql = r#"
             SELECT s.sid, s.serial#, s.username, s.status, s.osuser,
                    s.machine, s.program, s.sql_id, s.prev_sql_id,
@@ -348,7 +451,7 @@ impl OracleConnection {
               AND s.sid != SYS_CONTEXT('USERENV', 'SID')
             ORDER BY s.logon_time DESC
         "#;
-        let mut stmt = this.conn.statement(sql).build()?;
+        let mut stmt = self.conn.statement(sql).build()?;
         let rows = stmt.query(&[])?;
         let mut sessions = Vec::new();
 
@@ -369,6 +472,122 @@ impl OracleConnection {
         }
 
         Ok(sessions)
+    }
+
+    /// Full SQL text for a session entry, resolved through `V$SQL` by SQL_ID.
+    pub fn session_sql_text(&self, info: &DbSessionInfo) -> anyhow::Result<String> {
+        let id = info.sql_id.trim();
+        if id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "session {}/{} has no current SQL (idle)",
+                info.sid,
+                info.serial
+            ));
+        }
+        if !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(anyhow::anyhow!("unexpected SQL_ID value"));
+        }
+        let sql = format!(
+            "SELECT SQL_FULLTEXT, SQL_TEXT FROM V$SQL WHERE SQL_ID = '{}' AND ROWNUM = 1",
+            id
+        );
+        let mut stmt = self
+            .conn
+            .statement(&sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt.query(&[]).map_err(|e| anyhow::anyhow!("{}", e))?;
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            // SQL_FULLTEXT is a CLOB; fall back to the (1000-char) SQL_TEXT.
+            let full: Option<String> = row.get("SQL_FULLTEXT").unwrap_or(None);
+            if let Some(t) = full.filter(|t| !t.trim().is_empty()) {
+                return Ok(t);
+            }
+            let short: Option<String> = row.get("SQL_TEXT").unwrap_or(None);
+            if let Some(t) = short.filter(|t| !t.trim().is_empty()) {
+                return Ok(t);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "SQL text for SQL_ID '{}' not found in V$SQL (aged out or no access)",
+            id
+        ))
+    }
+
+    /// Explain plan via `EXPLAIN PLAN` + `DBMS_XPLAN.DISPLAY`, using a unique
+    /// statement id so concurrent frog explains don't clobber each other.
+    pub fn explain_plan_for(&self, sql: &str, max_rows: usize) -> QueryRow {
+        let start = std::time::Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
+        let inner = sql.trim().trim_end_matches(';').trim();
+        if inner.is_empty() {
+            return QueryRow::error("Nothing to explain.".into(), elapsed(), 0, max_rows);
+        }
+        let stmt_id = oracle_statement_id();
+        let explain_sql = oracle_explain_sql(inner, &stmt_id);
+        if let Err(e) = self.conn.execute(&explain_sql, &[]) {
+            return QueryRow::error(clean_error(&e), elapsed(), 0, max_rows);
+        }
+        let display_sql = format!(
+            "SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, '{}', 'TYPICAL'))",
+            stmt_id
+        );
+        let result = match Self::do_query(self, &display_sql, max_rows, None) {
+            Ok(data) => QueryRow::from_query(data, elapsed(), 0, max_rows),
+            Err(e) => QueryRow::error(clean_error(&e), elapsed(), 0, max_rows),
+        };
+        // Best-effort cleanup so PLAN_TABLE doesn't fill up.
+        let _ = self.conn.execute(
+            &format!(
+                "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = '{}'",
+                stmt_id
+            ),
+            &[],
+        );
+        result
+    }
+}
+
+/// Unique `EXPLAIN PLAN` statement id (`FROG_<pid>_<counter>`, ≤ 30 chars).
+pub(crate) fn oracle_statement_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("FROG{}_{}", std::process::id() % 100000, n % 1000000)
+}
+
+/// Build the `EXPLAIN PLAN ... FOR <sql>` statement (pure, testable).
+pub(crate) fn oracle_explain_sql(inner_sql: &str, stmt_id: &str) -> String {
+    format!(
+        "EXPLAIN PLAN SET STATEMENT_ID = '{}' FOR {}",
+        stmt_id, inner_sql
+    )
+}
+
+impl DbConnection for OracleConnection {
+    fn execute_query(&self, sql: &str, max_rows: usize) -> QueryRow {
+        OracleConnection::execute_query(self, sql, max_rows)
+    }
+    fn execute_query_paged(&self, sql: &str, page_offset: usize, page_size: usize) -> QueryRow {
+        OracleConnection::execute_query_paged(self, sql, page_offset, page_size)
+    }
+    fn cancel_query(&self) -> anyhow::Result<()> {
+        OracleConnection::cancel_query(self)
+    }
+    fn close(&self) -> anyhow::Result<()> {
+        OracleConnection::close(self)
+    }
+    fn query_sessions(&self) -> anyhow::Result<Vec<DbSessionInfo>> {
+        self.query_v_session()
+    }
+    fn session_sql(&self, info: &DbSessionInfo) -> anyhow::Result<String> {
+        self.session_sql_text(info)
+    }
+    fn explain_plan(&self, sql: &str, max_rows: usize) -> QueryRow {
+        self.explain_plan_for(sql, max_rows)
+    }
+    fn db_type(&self) -> DbType {
+        DbType::Oracle
     }
 }
 
@@ -404,5 +623,33 @@ mod tests {
             strip_leading_comments("-- ; --\nselect 1"),
             "select 1"
         );
+    }
+
+    #[test]
+    fn oracle_explain_builders() {
+        let id = oracle_statement_id();
+        assert!(id.starts_with("FROG"));
+        assert!(id.len() <= 30);
+        assert!(id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+        // Uniqueness within a process.
+        assert_ne!(id, oracle_statement_id());
+        let stmt = oracle_explain_sql("select 1 from dual", "FROG1_2");
+        assert_eq!(
+            stmt,
+            "EXPLAIN PLAN SET STATEMENT_ID = 'FROG1_2' FOR select 1 from dual"
+        );
+    }
+
+    #[test]
+    fn session_error_maps_missing_privileges() {
+        let msg = OracleConnection::friendly_session_error("ORA-00942: table or view does not exist");
+        assert!(msg.contains("ORA-00942"));
+        assert!(msg.contains("GRANT SELECT_CATALOG_ROLE"));
+        assert!(msg.contains("V_$SESSION"));
+        let msg = OracleConnection::friendly_session_error("ORA-01031: insufficient privileges");
+        assert!(msg.contains("GRANT SELECT ON V_$SQL"));
+        // Unrelated errors pass through untouched.
+        let plain = "ORA-12170: TNS:Connect timeout occurred";
+        assert_eq!(OracleConnection::friendly_session_error(plain), plain);
     }
 }

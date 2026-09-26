@@ -1,5 +1,6 @@
 use crate::db::connection::QueryRow;
 use crate::db::session_manager::{ConnectionDialog, Session, SessionManager, SessionMode};
+use crate::db::DbType;
 use crate::tui::app::{ActiveWindow, ResultFormat};
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::UnicodeWidthStr;
@@ -673,18 +674,42 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-pub fn render_session_overview(sm: &SessionManager, f: &mut Frame, area: Rect) {
-    let db_sessions = sm.get_session_info();
-    let header = Row::new(vec![
-        "SID",
-        "Serial#",
-        "User",
-        "Status",
-        "Machine",
-        "Program",
-        "SQL_ID",
-        "Logon Time",
-    ])
+pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rect) {
+    let db_type = sm.active_db_type();
+    let db_sessions = sm.fresh_session_list();
+    let sess = sm.active_session();
+    let cursor = sess
+        .session_view_cursor
+        .min(db_sessions.len().saturating_sub(1));
+    let (title, headers): (&str, Vec<&str>) = match db_type {
+        DbType::Oracle => (
+            " v$session — ↑/↓ pick · Enter explain · Esc back ",
+            vec![
+                "SID",
+                "Serial#",
+                "User",
+                "Status",
+                "Machine",
+                "Program",
+                "SQL_ID",
+                "Logon Time",
+            ],
+        ),
+        DbType::Postgres => (
+            " pg_stat_activity — ↑/↓ pick · Enter explain · Esc back ",
+            vec![
+                "PID",
+                "—",
+                "User",
+                "State",
+                "Client",
+                "App",
+                "Query",
+                "Backend Start",
+            ],
+        ),
+    };
+    let header = Row::new(headers)
     .style(
         Style::default()
             .bg(Color::Rgb(40, 40, 60))
@@ -692,21 +717,78 @@ pub fn render_session_overview(sm: &SessionManager, f: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let avail = area.height.saturating_sub(4) as usize;
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Min(8)])
+        .split(area);
+
+    // Empty list: show why (privileges / not connected) instead of a bare
+    // table — an unexplained empty F2 looks like "no sessions".
+    if db_sessions.is_empty() {
+        let (title, body, style) = match &sess.session_view_error {
+            Some(err) => (
+                " Sessions — error (press r to retry, Esc to go back) ",
+                err.clone(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            None => (
+                " Sessions ",
+                "No other sessions found.".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
+        let p = Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(style)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            );
+        f.render_widget(p, panes[0]);
+    } else {
+    // Keep the highlighted row visible.
+    let avail = panes[0].height.saturating_sub(4) as usize;
+    let start = if avail == 0 {
+        0
+    } else if cursor >= avail {
+        cursor + 1 - avail
+    } else {
+        0
+    };
     let rows: Vec<Row> = db_sessions
         .iter()
+        .skip(start)
         .take(avail)
-        .map(|ds| {
-            Row::new(vec![
+        .enumerate()
+        .map(|(rel, ds)| {
+            let idx = start + rel;
+            let serial = if db_type == DbType::Postgres {
+                String::from("—")
+            } else {
+                ds.serial.to_string()
+            };
+            let row = Row::new(vec![
                 ds.sid.to_string(),
-                ds.serial.to_string(),
+                serial,
                 ds.username.clone(),
                 ds.status.clone(),
                 ds.machine.clone(),
                 ds.program.clone(),
                 ds.sql_id.clone(),
                 ds.logon_time.clone(),
-            ])
+            ]);
+            if idx == cursor {
+                row.style(
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 100))
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
         })
         .collect();
 
@@ -724,15 +806,106 @@ pub fn render_session_overview(sm: &SessionManager, f: &mut Frame, area: Rect) {
         ],
     )
     .header(header)
-    .block(Block::default().title(" v$session ").borders(Borders::ALL));
+    .block(Block::default().title(title).borders(Borders::ALL));
 
-    f.render_widget(table, area);
+    f.render_widget(table, panes[0]);
+    } // end else (non-empty session list)
+
+    // --- detail panes: current SQL + explain plan ---
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(3)])
+        .split(panes[1]);
+
+    let sql_title = match &sess.plan_for {
+        Some(who) => format!(" Current SQL — session {} (r: reload) ", who),
+        None => " Current SQL ".to_string(),
+    };
+    let sql_text = sess
+        .plan_sql_text
+        .as_deref()
+        .unwrap_or("↑/↓ selects a session · its SQL loads here · Enter runs EXPLAIN");
+    let sql_para = Paragraph::new(sql_text)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .title(sql_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    f.render_widget(sql_para, detail[0]);
+
+    render_plan_pane(sess, f, detail[1]);
+}
+
+/// Slice `s` from char offset `skip` (plan-pane horizontal scroll).
+fn hslice(s: &str, skip: usize) -> String {
+    if skip == 0 {
+        return s.to_string();
+    }
+    s.chars().skip(skip).collect()
+}
+
+/// Bottom F2 pane: the stored explain plan (or a hint when none ran yet).
+fn render_plan_pane(session: &Session, f: &mut Frame, area: Rect) {
+    let block = || {
+        Block::default()
+            .title(" Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+    };
+    let Some(qr) = session.plan_result.as_ref() else {
+        let p = Paragraph::new("Press Enter to EXPLAIN the SQL above.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block());
+        f.render_widget(p, area);
+        return;
+    };
+    if qr.is_error {
+        let p = Paragraph::new(format!(
+            "EXPLAIN failed:\n{}",
+            qr.error_msg.as_deref().unwrap_or("Unknown error")
+        ))
+        .style(Style::default().fg(Color::Red))
+        .block(block());
+        f.render_widget(p, area);
+        return;
+    }
+    if qr.columns.is_empty() {
+        let p = Paragraph::new("Plan returned no columns.")
+            .style(Style::default().fg(Color::Yellow))
+            .block(block());
+        f.render_widget(p, area);
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(qr.rows.len() + 1);
+    lines.push(Line::from(Span::styled(
+        hslice(&qr.columns.join(" | "), session.plan_hscroll),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for row in &qr.rows {
+        lines.push(Line::from(Span::raw(hslice(
+            &row.join(" | "),
+            session.plan_hscroll,
+        ))));
+    }
+    let skip = session
+        .plan_scroll
+        .min(lines.len().saturating_sub(1));
+    let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
+    let p = Paragraph::new(visible)
+        .style(Style::default().fg(Color::White))
+        .block(block());
+    f.render_widget(p, area);
 }
 
 pub fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
         Line::from(Span::styled(
-            " Frog Oracle Client — Welcome & Usability Overview ",
+            " Frog DB Client — Welcome & Usability Overview ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -792,9 +965,9 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             " ─ Connection & Views ─ ",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+O              Open connection dialog"),
+        Line::from("  Ctrl+O              Open connection dialog (Type/Host/Port/Service|DB/User/Password)"),
         Line::from("  F1                  This help screen"),
-        Line::from("  F2                  Oracle v$session overview"),
+        Line::from("  F2                  Session browser — pick a session, Enter shows EXPLAIN plan"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
     ];
@@ -809,25 +982,37 @@ pub fn render_help(f: &mut Frame, area: Rect) {
 
 pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
     let dlg = &session.conn_dialog;
+    let db_name_label = dlg.db_name_label();
+    let db_name_value = match dlg.db_type {
+        DbType::Oracle => dlg.service.clone(),
+        DbType::Postgres => dlg.database.clone(),
+    };
     let labels = [
+        "Type:    ",
         "Host:    ",
         "Port:    ",
-        "Service: ",
+        db_name_label,
         "User:    ",
         "Password:",
     ];
-    let raw_values = [
+    // Mask every password character individually so edits stay visible.
+    let masked_pw = "*".repeat(dlg.password.chars().count());
+    let raw_values: Vec<String> = vec![
+        dlg.db_type.to_string(),
         dlg.host.clone(),
         dlg.port.clone(),
-        dlg.service.clone(),
+        db_name_value,
         dlg.user.clone(),
-        // Mask every character individually so edits stay visible.
-        "*".repeat(dlg.password.chars().count()),
+        masked_pw,
     ];
 
+    let title = match dlg.db_type {
+        DbType::Oracle => " Oracle Connection ",
+        DbType::Postgres => " Postgres Connection ",
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            " Oracle Connection ",
+            title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -839,18 +1024,28 @@ pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
         let is_active = i == dlg.active_field;
 
         // Draw the insertion cursor inside the text for the active field.
+        // The type row is a selector (Space/Left/Right or o/p toggles).
         let shown: Span = if is_active {
-            let pos = dlg.cursor.min(value.len());
-            let mut p = pos;
-            while p > 0 && !value.is_char_boundary(p) {
-                p -= 1;
+            if i == 0 {
+                Span::styled(
+                    format!("[{}]▏ (Space: toggle, o/p: pick)", value),
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 90))
+                        .fg(Color::Yellow),
+                )
+            } else {
+                let pos = dlg.cursor.min(value.len());
+                let mut p = pos;
+                while p > 0 && !value.is_char_boundary(p) {
+                    p -= 1;
+                }
+                Span::styled(
+                    format!("{}▏{}", &value[..p], &value[p..]),
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 90))
+                        .fg(Color::Yellow),
+                )
             }
-            Span::styled(
-                format!("{}▏{}", &value[..p], &value[p..]),
-                Style::default()
-                    .bg(Color::Rgb(60, 60, 90))
-                    .fg(Color::Yellow),
-            )
         } else {
             Span::raw(value.clone())
         };
@@ -896,12 +1091,38 @@ pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
 }
 
 pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
+    let backend = match session.conn_dialog.db_type {
+        DbType::Oracle => format!(
+            "Backend: oracle  {}:{}/{}",
+            session.conn_dialog.host,
+            session.conn_dialog.port,
+            if session.conn_dialog.service.is_empty() {
+                session.conn_dialog.database.clone()
+            } else {
+                session.conn_dialog.service.clone()
+            },
+        ),
+        DbType::Postgres => format!(
+            "Backend: postgres  {}:{}/{}",
+            session.conn_dialog.host,
+            session.conn_dialog.port,
+            if session.conn_dialog.database.is_empty() {
+                session.conn_dialog.service.clone()
+            } else {
+                session.conn_dialog.database.clone()
+            },
+        ),
+    };
     let text = vec![
         Line::from(Span::styled(
             " Connections ",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
+        Line::from(Span::styled(
+            backend,
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from(if session.is_connected {
             Span::styled(" ✔ Connected ", Style::default().fg(Color::Green))
         } else if session.connecting {
