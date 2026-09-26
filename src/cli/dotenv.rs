@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Keys frog reads from the environment; these are also picked up from a
@@ -18,6 +19,7 @@ const ENV_KEYS: &[&str] = &[
     "PGDATABASE",
     "PGUSER",
     "PGPASSWORD",
+    "DATABASE_URL",
 ];
 
 /// What was read from a `.env` file.
@@ -60,21 +62,27 @@ fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Load `<cwd>/.env` (if any) and export its variables as second-priority
-/// fallbacks: a key already set in the real environment is left untouched, so
-/// precedence is CLI flag > env var > `.env` > built-in default.
-pub fn apply_dotenv() -> Option<DotEnvInfo> {
+/// Load `<cwd>/.env` (if any) WITHOUT touching the process environment.
+///
+/// Returns the summary info plus a map of the values to use as fallbacks:
+/// only keys absent from the real environment are included, so precedence
+/// stays CLI flag > env var > `.env` > built-in default *per setting*.
+/// (An earlier design exported `.env` via `set_var`, which made `.env`
+/// values indistinguishable from real env vars and let a `.env`
+/// connect string silently beat real `PG*`/`ORACLE_*` variables.)
+pub fn load_dotenv() -> Option<(DotEnvInfo, HashMap<String, String>)> {
     let path = PathBuf::from(".env");
     load_from(&path)
 }
 
-fn load_from(path: &Path) -> Option<DotEnvInfo> {
+fn load_from(path: &Path) -> Option<(DotEnvInfo, HashMap<String, String>)> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut info = DotEnvInfo {
         path: path.to_path_buf(),
         applied: Vec::new(),
         overridden: Vec::new(),
     };
+    let mut map = HashMap::new();
     for (key, value) in parse_dotenv(&contents) {
         if !ENV_KEYS.contains(&key.as_str()) {
             continue;
@@ -83,12 +91,10 @@ fn load_from(path: &Path) -> Option<DotEnvInfo> {
             info.overridden.push(key);
             continue;
         }
-        // Startup is single-threaded here, so mutating the environment is fine;
-        // it lets clap's `env = "..."` attributes pick the values up uniformly.
-        std::env::set_var(&key, &value);
-        info.applied.push(key);
+        info.applied.push(key.clone());
+        map.insert(key, value);
     }
-    Some(info)
+    Some((info, map))
 }
 
 /// Human-readable one-liner about what the `.env` file contributed.

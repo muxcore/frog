@@ -1,5 +1,5 @@
 use super::connection::{
-    DbConnection, DbSessionInfo, DbType, QueryData, QueryRow, is_query_sql_for,
+    DbConnection, DbSessionInfo, DbType, QueryData, QueryRow,
 };
 use std::sync::{Arc, Mutex};
 
@@ -21,128 +21,113 @@ fn clean_error_msg(msg: &str) -> String {
     }
 }
 
-fn opt_string<T: ToString>(v: Option<T>, null_display: &str) -> String {
-    v.map(|x| x.to_string())
-        .unwrap_or_else(|| null_display.to_string())
+/// Verbose connection failure: what was attempted (never the password),
+/// the underlying cause, and a hint for the usual suspects.
+pub fn friendly_connect_error(
+    host: &str,
+    port: u16,
+    database: &str,
+    user: &str,
+    cause: &str,
+) -> String {
+    let who = if user.is_empty() { "<no user>" } else { user };
+    let mut out = format!(
+        "Could not connect to postgres://{}@{}:{}/{}\n  cause: {}",
+        who, host, port, database, cause
+    );
+    let lower = cause.to_lowercase();
+    let hint = if lower.contains("connection refused") {
+        "Is Postgres running and listening there? Try `pg_isready -h <host> -p <port>` \
+         and check listen_addresses / the port (PGHOST/PGPORT)."
+    } else if lower.contains("password authentication failed")
+        || lower.contains("authentication failed")
+    {
+        "Wrong user or password (PGUSER/PGPASSWORD). The role must exist and be \
+         allowed to log in."
+    } else if lower.contains("does not exist") && lower.contains("database") {
+        "No such database — check the name (PGDATABASE/-D); it is case-sensitive."
+    } else if lower.contains("no pg_hba.conf entry") {
+        "The server refused this host/user/database/auth-method combination. The DBA \
+         must allow it in pg_hba.conf (e.g. `host <db> <user> <addr> scram-sha-256`)."
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "Network timeout — host unreachable or a firewall is blocking the port."
+    } else if lower.contains("could not translate")
+        || lower.contains("name resolution")
+        || lower.contains("nodename nor servname")
+        || lower.contains("failed to lookup")
+    {
+        "Hostname does not resolve — check PGHOST."
+    } else if lower.contains("ssl") {
+        "TLS problem — frog v1 connects without TLS (NoTls); the server must accept \
+         non-SSL connections (sslmode allow/disable equivalent)."
+    } else {
+        ""
+    };
+    if !hint.is_empty() {
+        out.push_str("\n\nHint: ");
+        out.push_str(hint);
+    }
+    out
 }
 
-/// Convert one cell to its display string, dispatching on the Postgres type.
-/// Falls back to a `String` read for unknown types.
-fn cell_to_string(row: &postgres::Row, idx: usize, null_display: &str) -> String {
-    use postgres::types::Type;
-    let ty = row.columns()[idx].type_().clone();
-    if ty == Type::BOOL {
-        let v: Result<Option<bool>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::INT2 {
-        let v: Result<Option<i16>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::INT4 {
-        let v: Result<Option<i32>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::INT8 {
-        let v: Result<Option<i64>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::OID {
-        let v: Result<Option<u32>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::FLOAT4 {
-        let v: Result<Option<f32>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::FLOAT8 {
-        let v: Result<Option<f64>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::BYTEA {
-        let v: Result<Option<Vec<u8>>, _> = row.try_get(idx);
-        return match v {
-            Ok(Some(bytes)) => {
-                let mut s = String::with_capacity(bytes.len() * 2 + 2);
-                s.push_str("\\x");
-                for b in bytes {
-                    s.push_str(&format!("{:02x}", b));
-                }
-                s
-            }
-            Ok(None) => null_display.to_string(),
-            Err(_) => "(ERR)".into(),
-        };
-    }
-    if ty == Type::DATE {
-        let v: Result<Option<chrono::NaiveDate>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::TIME {
-        let v: Result<Option<chrono::NaiveTime>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::TIMESTAMP {
-        let v: Result<Option<chrono::NaiveDateTime>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::TIMESTAMPTZ {
-        let v: Result<Option<chrono::DateTime<chrono::Utc>>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::UUID {
-        let v: Result<Option<uuid::Uuid>, _> = row.try_get(idx);
-        return v.map(|o| opt_string(o, null_display)).unwrap_or("(ERR)".into());
-    }
-    if ty == Type::JSON || ty == Type::JSONB {
-        let v: Result<Option<serde_json::Value>, _> = row.try_get(idx);
-        return v
-            .map(|o| opt_string(o, null_display))
-            .unwrap_or("(ERR)".into());
-    }
-    // Text-like, numeric and everything else: read as String.
-    let v: Result<Option<String>, _> = row.try_get(idx);
-    match v {
-        Ok(Some(s)) => s,
-        Ok(None) => null_display.to_string(),
-        Err(_) => "(ERR)".into(),
-    }
-}
 
-fn rows_to_data(
-    columns: Vec<String>,
-    rows: Vec<postgres::Row>,
-    max_rows: usize,
-    null_display: &str,
-) -> QueryData {
-    let mut result_rows: Vec<Vec<String>> = Vec::new();
-    let mut byte_count = 0usize;
-    for row in rows {
-        if result_rows.len() > max_rows {
-            break;
-        }
-        let mut vals = Vec::with_capacity(columns.len());
-        for i in 0..columns.len() {
-            let s = cell_to_string(&row, i, null_display);
-            byte_count += s.len();
-            vals.push(s);
-        }
-        result_rows.push(vals);
-    }
-    let mut truncated = false;
-    if result_rows.len() > max_rows {
-        truncated = true;
-        if let Some(extra) = result_rows.pop() {
-            for val in extra {
-                byte_count = byte_count.saturating_sub(val.len());
-            }
-        }
-    }
-    let total = result_rows.len();
-    (columns, result_rows, truncated, total, byte_count)
-}
 
 impl PgConnection {
+
+    /// Run one statement through the simple query protocol. Every value arrives
+    /// as server-formatted text, so ALL Postgres types (numeric, money,
+    /// intervals, uuids, json, arrays, …) display correctly with no per-type
+    /// binary decoding. Returns the display data plus the completion count.
+    fn do_simple(&self, sql: &str, max_rows: usize) -> anyhow::Result<(QueryData, u64)> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        let messages = client
+            .simple_query(sql)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut columns: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut byte_count = 0usize;
+        let mut truncated = false;
+        let mut completed = 0u64;
+        for msg in messages {
+            match msg {
+                postgres::SimpleQueryMessage::RowDescription(desc) => {
+                    columns = desc.iter().map(|c| c.name().to_string()).collect();
+                }
+                postgres::SimpleQueryMessage::Row(row) => {
+                    // Keep one look-ahead row to detect truncation.
+                    if rows.len() > max_rows {
+                        truncated = true;
+                        continue;
+                    }
+                    let mut vals = Vec::with_capacity(row.len());
+                    for i in 0..row.len() {
+                        let s = match row.try_get(i) {
+                            Ok(Some(v)) => v.to_string(),
+                            _ => self.null_display.clone(),
+                        };
+                        byte_count += s.len();
+                        vals.push(s);
+                    }
+                    rows.push(vals);
+                }
+            postgres::SimpleQueryMessage::CommandComplete(n) => completed = n,
+            _ => {}
+        }
+        }
+        if rows.len() > max_rows {
+            truncated = true;
+            if let Some(extra) = rows.pop() {
+                for val in extra {
+                    byte_count = byte_count.saturating_sub(val.len());
+                }
+            }
+        }
+        let total = rows.len();
+        Ok(((columns, rows, truncated, total, byte_count), completed))
+    }
     pub fn connect(
         host: &str,
         port: u16,
@@ -162,9 +147,9 @@ impl PgConnection {
             cfg.password(password);
         }
         cfg.connect_timeout(std::time::Duration::from_secs(10));
-        let client = cfg
-            .connect(postgres::NoTls)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let client = cfg.connect(postgres::NoTls).map_err(|e| {
+            anyhow::anyhow!("{}", friendly_connect_error(host, port, database, user, &e.to_string()))
+        })?;
         let cancel_token = client.cancel_token();
         Ok(Arc::new(Self {
             client: Mutex::new(client),
@@ -173,88 +158,45 @@ impl PgConnection {
         }))
     }
 
-    fn do_query(
-        &self,
-        sql: &str,
-        max_rows: usize,
-        fetch_limit: Option<usize>,
-    ) -> anyhow::Result<QueryData> {
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
-        let stmt = client
-            .prepare(sql)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let col_names: Vec<String> =
-            stmt.columns().iter().map(|c| c.name().to_string()).collect();
-        if col_names.is_empty() {
-            return Ok((vec!["Result".into()], vec![], false, 0, 0));
-        }
-        let limit = fetch_limit.unwrap_or(max_rows + 1);
-        let rows: Vec<postgres::Row> = client
-            .query(&stmt, &[])
-            .map_err(|e| anyhow::anyhow!("{}", e))?
-            .into_iter()
-            .take(limit)
-            .collect();
-        drop(client);
-        Ok(rows_to_data(col_names, rows, max_rows, &self.null_display))
-    }
-
     fn run_query(&self, sql: &str, max_rows: usize) -> QueryRow {
         let start = std::time::Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;
         let trimmed = sql.trim();
 
         if trimmed.eq_ignore_ascii_case("commit") || trimmed.eq_ignore_ascii_case("end") {
-            return match self.simple_exec("COMMIT") {
-                Ok(n) => {
-                    let mut row = QueryRow::notice("COMMIT", elapsed(), max_rows);
-                    row.row_count = n as usize;
-                    row.rows_affected = Some(n);
-                    row
-                }
+            return match self.do_simple("COMMIT", 1) {
+                Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
             };
         }
         if trimmed.eq_ignore_ascii_case("rollback") || trimmed.eq_ignore_ascii_case("abort") {
-            return match self.simple_exec("ROLLBACK") {
+            return match self.do_simple("ROLLBACK", 1) {
                 Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
             };
         }
 
-        if is_query_sql_for(DbType::Postgres, trimmed) {
-            return match self.do_query(sql, max_rows, None) {
-                Ok(data) => QueryRow::from_query(data, elapsed(), 0, max_rows),
-                Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
-            };
-        }
-
-        match self.simple_exec(sql) {
-            Ok(affected) => {
-                let mut row = QueryRow::notice(
-                    &format!("Statement executed. Rows affected: {}", affected),
-                    elapsed(),
-                    max_rows,
-                );
-                row.row_count = affected as usize;
-                row.rows_affected = Some(affected);
-                row
+        // One path for everything: statements returning rows (SELECT, but
+        // also INSERT/UPDATE/DELETE ... RETURNING, EXPLAIN, SHOW, …) display
+        // as tables; the rest become "rows affected" notices from the
+        // completion tag.
+        match self.do_simple(sql, max_rows) {
+            Ok((data, completed)) => {
+                if data.0.is_empty() {
+                    let mut row = QueryRow::notice(
+                        &format!("Statement executed. Rows affected: {}", completed),
+                        elapsed(),
+                        max_rows,
+                    );
+                    row.row_count = completed as usize;
+                    row.rows_affected = Some(completed);
+                    row
+                } else {
+                    QueryRow::from_query(data, elapsed(), 0, max_rows)
+                }
             }
             Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
         }
-    }
-
-    fn simple_exec(&self, sql: &str) -> anyhow::Result<u64> {
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
-        client
-            .execute(sql, &[])
-            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     fn run_query_paged(&self, sql: &str, page_offset: usize, page_size: usize) -> QueryRow {
@@ -266,8 +208,8 @@ impl PgConnection {
             page_size + 1,
             page_offset
         );
-        match self.do_query(&paged_sql, page_size, Some(page_size + 1)) {
-            Ok(data) => QueryRow::from_query(
+        match self.do_simple(&paged_sql, page_size) {
+            Ok((data, _)) => QueryRow::from_query(
                 data,
                 start.elapsed().as_millis() as u64,
                 page_offset,
@@ -316,8 +258,8 @@ impl PgConnection {
         if inner.is_empty() {
             return QueryRow::error("Nothing to explain.".into(), elapsed(), 0, max_rows);
         }
-        match self.do_query(&pg_explain_sql(inner), max_rows, None) {
-            Ok(data) => QueryRow::from_query(data, elapsed(), 0, max_rows),
+        match self.do_simple(&pg_explain_sql(inner), max_rows) {
+            Ok((data, _)) => QueryRow::from_query(data, elapsed(), 0, max_rows),
             Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
         }
     }
@@ -433,5 +375,34 @@ mod tests {
     fn pg_explain_builder() {
         assert_eq!(pg_explain_sql("select 1;"), "EXPLAIN select 1");
         assert!(pg_explain_sql("  select * from t  ").starts_with("EXPLAIN select"));
+    }
+
+    #[test]
+    fn pg_connect_error_is_verbose_without_password() {
+        let msg = friendly_connect_error(
+            "db1",
+            5432,
+            "myapp",
+            "bob",
+            "connection refused (os error 111)",
+        );
+        assert!(msg.contains("postgres://bob@db1:5432/myapp"));
+        assert!(msg.contains("connection refused"));
+        assert!(msg.contains("pg_isready"));
+        assert!(!msg.contains("s3cret"));
+    }
+
+    #[test]
+    fn pg_connect_error_hints() {
+        let auth = friendly_connect_error("h", 1, "d", "u", "password authentication failed");
+        assert!(auth.contains("PGUSER/PGPASSWORD"));
+        let db = friendly_connect_error("h", 1, "d", "u", "database \"x\" does not exist");
+        assert!(db.contains("PGDATABASE"));
+        let hba = friendly_connect_error("h", 1, "d", "u", "no pg_hba.conf entry for host");
+        assert!(hba.contains("pg_hba.conf"));
+        let other = friendly_connect_error("h", 1, "d", "u", "some weird thing");
+        assert!(other.contains("some weird thing"));
+        let nouser = friendly_connect_error("h", 1, "d", "", "boom");
+        assert!(nouser.contains("<no user>"));
     }
 }

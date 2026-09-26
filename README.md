@@ -124,8 +124,10 @@ All connection parameters can be supplied via CLI flags, environment variables, 
 If a `.env` file exists in the directory frog is started from, its variables are used as a second-priority source — after real environment variables. Precedence per setting:
 
 ```
-CLI flag  >  environment variable (ORACLE_* / PG* / FROG_*)  >  .env  >  built-in default
+CLI flag  >  environment variable (ORACLE_* / PG* / FROG_* / DATABASE_URL)  >  .env  >  built-in default
 ```
+
+Precedence is **per setting**: individual env vars/flags always beat the same field inside a connect string, no matter where the connect string came from. So real `PGHOST` beats `HOST=` inside a `.env` `ORACLE_CONNECT`. A connect descriptor also belongs to its backend: overriding `--db-type` drops the descriptor's host/port (names like service/database are kept, since `-S` doubles as a dbname alias).
 
 Example `.env` (Oracle):
 
@@ -150,9 +152,12 @@ PGUSER=scott
 PGPASSWORD=tiger
 # or a URL instead of the individual fields:
 # ORACLE_CONNECT=postgres://scott:tiger@db1.local:5432/myapp
+# (DATABASE_URL works as a fallback for ORACLE_CONNECT)
 ```
 
-Supported keys: `ORACLE_CONNECT`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
+Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
+
+> **Dialog shows defaults?** The `.env` is read from the directory frog is *started* in — a `.env` elsewhere is ignored. If nothing configures the connection, frog prints `no connection settings from CLI flags, env vars or ./.env …` at startup and `frog --help` lists every variable it understands.
 
 At startup frog prints one line summarizing what the `.env` contributed, for example:
 
