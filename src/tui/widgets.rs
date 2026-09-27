@@ -1,5 +1,7 @@
 use crate::db::connection::QueryRow;
-use crate::db::session_manager::{ConnectionDialog, Session, SessionManager, SessionMode};
+use crate::db::session_manager::{
+    ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode,
+};
 use crate::db::DbType;
 use crate::tui::app::{ActiveWindow, ResultFormat};
 use ratatui::{prelude::*, widgets::*};
@@ -97,6 +99,7 @@ pub fn render_status_bar(
         SessionMode::SessionView => "[SESSIONS]",
         SessionMode::Help => "[HELP]",
         SessionMode::History => "[HISTORY]",
+        SessionMode::DbExplorer => "[EXPLORER]",
         SessionMode::ConnectionPickerDialog => "[CONNECTING...]",
     };
 
@@ -968,6 +971,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+O              Open connection dialog (Type/Host/Port/Service|DB/User/Password)"),
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Session browser — pick a session, Enter shows EXPLAIN plan"),
+        Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
     ];
@@ -1140,4 +1144,623 @@ pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
     let p =
         Paragraph::new(text).block(Block::default().title(" Info Panel ").borders(Borders::ALL));
     f.render_widget(p, area);
+}
+
+/// F12 DB explorer (DBeaver-style): object tree + detail pane with a live
+/// Object tree + detail pane (live 20-row preview in the result-viewer
+/// style for row-bearing objects, DDL/source for the rest).
+///
+/// Returns the (tree_area, detail_area) inner rects so the app can map mouse
+/// clicks/scrolls. Layout adapts to small windows: side-by-side on wide
+/// screens, stacked tree-over-detail on narrow ones, tree-only when tiny.
+pub fn render_db_explorer(
+    sm: &mut SessionManager,
+    result_format: ResultFormat,
+    f: &mut Frame,
+    area: Rect,
+) -> (Rect, Rect) {
+    // Degenerate window: don't attempt any split, just say so.
+    if area.height < 5 || area.width < 24 {
+        let p = Paragraph::new("Window too small for the explorer — enlarge it or press Esc.")
+            .style(Style::default().fg(Color::Yellow))
+            .block(
+                Block::default()
+                    .title(" DB Explorer (F12) ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+        f.render_widget(p, area);
+        return (Rect::default(), Rect::default());
+    }
+
+    // Wide screens: tree | detail. Narrow: tree over detail.
+    let wide = area.width >= 80;
+    let (tree_area, detail_area, stacked) = if wide {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(area);
+        (cols[0], cols[1], false)
+    } else if area.height >= 14 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Min(5)])
+            .split(area);
+        (rows[0], rows[1], true)
+    } else {
+        // Short window: the tree gets everything, preview hint in the title.
+        (area, Rect::default(), false)
+    };
+    let show_detail = detail_area.height >= 4 && detail_area.width >= 20;
+
+    let total_rows = sm.explorer_visible_rows().len();
+    let scroll = {
+        let sess = sm.active_session_mut();
+        // Clamp scroll + keep the cursor visible (wheel may have moved the view).
+        let cursor = sess.explorer_cursor.min(total_rows.saturating_sub(1));
+        sess.explorer_cursor = cursor;
+        let tree_view_h = tree_area.height.saturating_sub(2) as usize;
+        if total_rows == 0 {
+            sess.explorer_scroll = 0;
+        } else if tree_view_h == 0 {
+            sess.explorer_scroll = sess.explorer_scroll.min(total_rows - 1);
+        } else {
+            if cursor < sess.explorer_scroll {
+                sess.explorer_scroll = cursor;
+            } else if cursor >= sess.explorer_scroll + tree_view_h {
+                sess.explorer_scroll = cursor + 1 - tree_view_h;
+            }
+            sess.explorer_scroll = sess
+                .explorer_scroll
+                .min(total_rows.saturating_sub(1));
+        }
+        sess.explorer_scroll
+    };
+    let tree_view_h = tree_area.height.saturating_sub(2) as usize;
+
+    render_explorer_tree(sm, f, tree_area, scroll, tree_view_h, show_detail || stacked);
+    if show_detail {
+        render_explorer_detail(sm, result_format, f, detail_area);
+    }
+    (tree_area, detail_area)
+}
+
+/// Left pane of the explorer: the object tree itself.
+fn render_explorer_tree(
+    sm: &SessionManager,
+    f: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    view_h: usize,
+    detail_hidden: bool,
+) {
+    let sess = sm.active_session();
+    let rows = sm.explorer_visible_rows();
+    let cursor = sess.explorer_cursor.min(rows.len().saturating_sub(1));
+    let inner_w = area.width.saturating_sub(2) as usize;
+
+    let filter_note = if sess.explorer_filtering {
+        format!("  [Filter: {}▏ Enter/Esc done]", sess.explorer_filter)
+    } else if sess.explorer_filter.is_empty() {
+        String::new()
+    } else {
+        format!("  [Filter: {}]", sess.explorer_filter)
+    };
+    let title = if detail_hidden {
+        format!(
+            " DB Explorer — ↑↓ move · →/Enter expand · s SELECT→editor · d reload · / filter · r refresh · Esc back{} ",
+            filter_note
+        )
+    } else {
+        format!(
+            " Objects ({} shown{}){} ",
+            rows.len(),
+            if sess.explorer_filter.is_empty() {
+                String::new()
+            } else {
+                " · filtered".into()
+            },
+            filter_note
+        )
+    };
+
+    if !sess.explorer_loaded {
+        let p = Paragraph::new("⟳ Loading schemas…")
+            .style(Style::default().fg(Color::Yellow))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+        f.render_widget(p, area);
+        return;
+    }
+    if rows.is_empty() {
+        let body = sess
+            .explorer_error
+            .clone()
+            .unwrap_or_else(|| "No objects match the filter — clear it with Esc.".into());
+        let p = Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Red))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+        f.render_widget(p, area);
+        return;
+    }
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(view_h.max(1))
+        .map(|(idx, row)| explorer_tree_line(sess, row, idx == cursor, inner_w))
+        .collect();
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(p, area);
+
+    // Thin scrollbar so wheel/keyboard position is visible in deep trees.
+    if rows.len() > view_h.max(1) && area.height >= 5 {
+        let mut state = ScrollbarState::new(rows.len().saturating_sub(1))
+            .position(scroll.min(rows.len().saturating_sub(1)));
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::default().fg(Color::DarkGray)),
+            area,
+            &mut state,
+        );
+    }
+}
+
+/// One tree line: indent + expand glyph + name + kind badge / column detail.
+fn explorer_tree_line(sess: &Session, row: &ExplorerRow, selected: bool, inner_w: usize) -> Line<'static> {
+    let base = if selected {
+        Style::default()
+            .bg(Color::Rgb(60, 60, 100))
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let truncate = |s: String| -> String {
+        if inner_w == 0 {
+            return String::new();
+        }
+        let mut out = String::new();
+        let mut w = 0usize;
+        for ch in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if w + cw > inner_w {
+                break;
+            }
+            out.push(ch);
+            w += cw;
+        }
+        out
+    };
+    let text: String = match row {
+        ExplorerRow::Schema { idx } => {
+            let s = &sess.explorer_schemas[*idx];
+            let glyph = if s.expanded { "▾" } else { "▸" };
+            match s.groups.as_ref() {
+                Some(g) => format!("{} {} ({} types)", glyph, s.name, g.len()),
+                None => format!("{} {}", glyph, s.name),
+            }
+        }
+        ExplorerRow::Group { sidx, gidx } => {
+            let g = &sess.explorer_schemas[*sidx].groups.as_ref().unwrap()[*gidx];
+            let glyph = if g.expanded { "▾" } else { "▸" };
+            let loaded = g.objects.as_ref().map(|o| o.len()).unwrap_or(0);
+            if g.objects.is_some() {
+                format!("  {} {} ({})", glyph, g.label(), loaded)
+            } else {
+                format!("  {} {} ({})", glyph, g.label(), g.count)
+            }
+        }
+        ExplorerRow::Table { sidx, gidx, tidx } => {
+            let t = &sess.explorer_schemas[*sidx].groups.as_ref().unwrap()[*gidx]
+                .objects
+                .as_ref()
+                .unwrap()[*tidx];
+            if t.is_expandable() {
+                let glyph = if t.expanded { "▾" } else { "▸" };
+                format!("    {} {} [{}]", glyph, t.name, t.kind)
+            } else {
+                format!("    ƒ {} [{}]", t.name, t.kind)
+            }
+        }
+        ExplorerRow::Column {
+            sidx,
+            gidx,
+            tidx,
+            cidx,
+        } => {
+            let c = &sess.explorer_schemas[*sidx].groups.as_ref().unwrap()[*gidx]
+                .objects
+                .as_ref()
+                .unwrap()[*tidx]
+                .columns
+                .as_ref()
+                .unwrap()[*cidx];
+            format!(
+                "      • {} {}{}",
+                c.name,
+                c.data_type,
+                if c.nullable { "" } else { " NOT NULL" }
+            )
+        }
+    };
+    // Kind badges get a tint when the row isn't selected.
+    let mut line = truncate(text);
+    if !selected {
+        // Keep it a single span (cheap); selection already stands out.
+        return Line::from(Span::styled(line, base));
+    }
+    line.push(' ');
+    Line::from(Span::styled(line, base))
+}
+
+/// Right (or bottom) pane: info/DDL paragraph plus — for row-bearing
+/// objects — the preview rendered with the real result viewer, so it looks
+/// exactly like an executed query (same Table/Markdown/ASCII style).
+fn render_explorer_detail(
+    sm: &SessionManager,
+    result_format: ResultFormat,
+    f: &mut Frame,
+    area: Rect,
+) {
+    let sess = sm.active_session();
+    let rows = sm.explorer_visible_rows();
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let fit = |s: &str| -> String {
+        if inner_w == 0 {
+            return String::new();
+        }
+        let mut out = String::new();
+        let mut w = 0usize;
+        for ch in s.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if w + cw > inner_w {
+                break;
+            }
+            out.push(ch);
+            w += cw;
+        }
+        out
+    };
+    // Hard-truncate each line to the pane width (wrap would fight the
+    // vertical scroll offset).
+    let fit_line = |l: &Line| -> Line<'static> {
+        let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        Line::from(Span::styled(
+            fit(&s),
+            l.spans.first().map(|sp| sp.style).unwrap_or_default(),
+        ))
+    };
+
+    let detail: ExplorerDetail = match rows.get(sess.explorer_cursor) {
+        None => ExplorerDetail::Text(
+            " Detail ".into(),
+            vec![Line::from(Span::styled(
+                sess.explorer_error
+                    .clone()
+                    .unwrap_or_else(|| "Nothing to show.".into()),
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+        Some(ExplorerRow::Schema { idx }) => {
+            ExplorerDetail::Text(format!(" Detail — {} ", sess.explorer_schemas[*idx].name), {
+                let s = &sess.explorer_schemas[*idx];
+                let mut lines = vec![Line::from(Span::styled(
+                    format!("Schema {}", s.name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                match s.groups.as_ref() {
+                    Some(groups) => {
+                        for g in groups {
+                            lines.push(Line::from(format!("  {} ({})", g.label(), g.count)));
+                        }
+                    }
+                    None => lines.push(Line::from(Span::styled(
+                        "Press → or Enter to list its type folders.",
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                }
+                if let Some(err) = s.load_error.as_ref() {
+                    lines.push(Line::from(Span::styled(
+                        err.clone(),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                lines
+            })
+        }
+        Some(ExplorerRow::Group { sidx, gidx }) => {
+            ExplorerDetail::Text(
+                format!(
+                    " Detail — {}.{} ",
+                    sess.explorer_schemas[*sidx].name,
+                    sess.explorer_schemas[*sidx]
+                        .groups
+                        .as_ref()
+                        .and_then(|g| g.get(*gidx))
+                        .map(|g| g.label())
+                        .unwrap_or("?")
+                ),
+                {
+                    let s = &sess.explorer_schemas[*sidx];
+                    let g = s.groups.as_ref().and_then(|g| g.get(*gidx));
+                    let mut lines = vec![Line::from(Span::styled(
+                        format!(
+                            "{} in {}",
+                            g.map(|g| g.label()).unwrap_or("?"),
+                            s.name
+                        ),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ))];
+                    match g.and_then(|g| g.objects.as_ref()) {
+                        Some(objs) if !objs.is_empty() => {
+                            lines.push(Line::from(format!("{} object(s), first few:", objs.len())));
+                            for o in objs.iter().take(30) {
+                                lines.push(Line::from(format!("  {} [{}]", o.name, o.kind)));
+                            }
+                            if objs.len() > 30 {
+                                lines.push(Line::from(Span::styled(
+                                    format!("… and {} more (filter with /)", objs.len() - 30),
+                                    Style::default().fg(Color::DarkGray),
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Some(err) = g.and_then(|g| g.load_error.as_ref()) {
+                        lines.push(Line::from(Span::styled(
+                            err.clone(),
+                            Style::default().fg(Color::Red),
+                        )));
+                    } else if g.map(|g| g.objects.is_none()).unwrap_or(true) {
+                        lines.push(Line::from(Span::styled(
+                            "Press → or Enter to list its objects.",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    lines
+                },
+            )
+        }
+        Some(ExplorerRow::Table { sidx, gidx, tidx })
+        | Some(ExplorerRow::Column {
+            sidx, gidx, tidx, ..
+        }) => explorer_object_detail(sess, *sidx, *gidx, *tidx),
+    };
+
+    match detail {
+        ExplorerDetail::Text(title, content) => {
+            let view_h = area.height.saturating_sub(2) as usize;
+            let total = content.len();
+            let skip = sess
+                .explorer_detail_scroll
+                .min(total.saturating_sub(1));
+            let visible: Vec<Line> = content
+                .into_iter()
+                .skip(skip)
+                .take(view_h.max(1))
+                .map(|l| fit_line(&l))
+                .collect();
+            let p = Paragraph::new(visible).block(
+                Block::default()
+                    .title(format!(
+                        " {} · PgUp/PgDn scroll ({} lines) · s SELECT→editor · d reload ",
+                        title.trim(),
+                        total
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            f.render_widget(p, area);
+        }
+        ExplorerDetail::Split(title, top, preview) => {
+            // Info on top (fixed, truncated), live result viewer below with
+            // the same style as executed SQL. Needs room for both.
+            let total_h = area.height as usize;
+            let need_top = top.len() + 2;
+            if total_h >= need_top + 8 {
+                let top_h = (need_top.min(total_h - 8)).max(3) as u16;
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(top_h), Constraint::Min(8)])
+                    .split(area);
+                let shown = (top_h as usize).saturating_sub(2);
+                let visible: Vec<Line> =
+                    top.into_iter().take(shown).map(|l| fit_line(&l)).collect();
+                let p = Paragraph::new(visible).block(
+                    Block::default()
+                        .title(format!(" {} ", title.trim()))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                );
+                f.render_widget(p, chunks[0]);
+                render_table(
+                    sess,
+                    &Some(preview),
+                    TableViewState {
+                        scroll_offset: sess.explorer_detail_scroll,
+                        col_scroll_offset: 0,
+                        result_format,
+                        focused: false,
+                    },
+                    f,
+                    chunks[1],
+                );
+            } else {
+                // Too short to split: info + hint, scrollable.
+                let mut content = top;
+                content.push(Line::from(Span::styled(
+                    "…preview below — enlarge the window to see the result table…",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let view_h = area.height.saturating_sub(2) as usize;
+                let total = content.len();
+                let skip = sess.explorer_detail_scroll.min(total.saturating_sub(1));
+                let visible: Vec<Line> = content
+                    .into_iter()
+                    .skip(skip)
+                    .take(view_h.max(1))
+                    .map(|l| fit_line(&l))
+                    .collect();
+                let p = Paragraph::new(visible).block(
+                    Block::default()
+                        .title(format!(" {} ", title.trim()))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                );
+                f.render_widget(p, area);
+            }
+        }
+    }
+}
+
+/// Explorer detail content: either a plain scrollable paragraph, or info
+/// lines on top with the live result viewer below (same style as SQL output).
+enum ExplorerDetail<'a> {
+    Text(String, Vec<Line<'static>>),
+    Split(String, Vec<Line<'static>>, &'a QueryRow),
+}
+
+/// Detail for one object: info/DDL lines plus, for row-bearing objects with
+/// loaded preview data, the preview itself (rendered as a result table).
+fn explorer_object_detail(
+    sess: &Session,
+    sidx: usize,
+    gidx: usize,
+    tidx: usize,
+) -> ExplorerDetail<'_> {
+    use ExplorerDetail as D;
+    let (schema_name, t) = match sess
+        .explorer_schemas
+        .get(sidx)
+        .and_then(|s| {
+            s.groups
+                .as_ref()
+                .and_then(|g| g.get(gidx))
+                .and_then(|g| g.objects.as_ref())
+                .and_then(|o| o.get(tidx))
+                .map(|t| (s.name.clone(), t))
+        }) {
+        Some(v) => v,
+        None => return D::Text(" Detail ".into(), vec![]),
+    };
+    let title = format!(" Detail — {}.{} [{}] ", schema_name, t.name, t.kind);
+    let header = Line::from(Span::styled(
+        format!("{}.{} — {}", schema_name, t.name, t.kind),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    // Column section for expandable objects.
+    let mut top = vec![header];
+    if t.is_expandable() {
+        match t.columns.as_ref() {
+            Some(cols) if !cols.is_empty() => {
+                top.push(Line::from(Span::styled(
+                    format!("Columns ({}):", cols.len()),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for c in cols {
+                    top.push(Line::from(format!(
+                        "  {} {}{}",
+                        c.name,
+                        c.data_type,
+                        if c.nullable { "" } else { " NOT NULL" }
+                    )));
+                }
+            }
+            _ => {
+                if let Some(err) = t.load_error.as_ref() {
+                    top.push(Line::from(Span::styled(
+                        err.clone(),
+                        Style::default().fg(Color::Red),
+                    )));
+                } else if t.columns.is_none() {
+                    top.push(Line::from(Span::styled(
+                        "Columns not loaded — expand with →.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    top.push(Line::from(Span::styled(
+                        "(no columns)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+    }
+
+    // DDL/source section for definition-bearing objects.
+    if t.has_ddl() {
+        top.push(Line::from(""));
+        top.push(Line::from(Span::styled(
+            "Definition:",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if t.ddl_loading {
+            top.push(Line::from(Span::styled(
+                "⟳ Loading definition…",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(err) = t.ddl_error.as_ref() {
+            top.push(Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red),
+            )));
+        } else if let Some(ddl) = t.ddl.as_ref() {
+            for l in ddl.lines() {
+                top.push(Line::from(Span::raw(l.to_string())));
+            }
+        } else {
+            top.push(Line::from(Span::styled(
+                "Press d to load the definition.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    // Live 20-row preview in result-viewer style (same as executed SQL).
+    if let Some(qr) = t.preview.as_ref() {
+        return D::Split(title, top, qr);
+    }
+    if t.has_preview() {
+        top.push(Line::from(""));
+        top.push(Line::from(if t.preview_loading {
+            Span::styled(
+                "⟳ Loading preview…",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            Span::styled(
+                "Preview pending…",
+                Style::default().fg(Color::DarkGray),
+            )
+        }));
+    }
+    D::Text(title, top)
 }

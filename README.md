@@ -189,6 +189,7 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
 | `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter` = explain plan) / History |
+| `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), 20-row preview in result style (`Ctrl+D` switches format), DDL/source |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |

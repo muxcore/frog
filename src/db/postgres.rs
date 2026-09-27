@@ -1,5 +1,5 @@
 use super::connection::{
-    DbConnection, DbSessionInfo, DbType, QueryData, QueryRow,
+    ColumnInfo, DbConnection, DbSessionInfo, DbType, QueryData, QueryRow,
 };
 use std::sync::{Arc, Mutex};
 
@@ -263,6 +263,444 @@ impl PgConnection {
             Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
         }
     }
+
+    fn explorer_schemas(&self) -> anyhow::Result<Vec<String>> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        let stmt = client
+            .prepare(
+                "SELECT nspname FROM pg_namespace \
+                 WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema' \
+                 ORDER BY CASE WHEN nspname = 'public' THEN 0 ELSE 1 END, nspname LIMIT 500",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let n: String = row.try_get(0).unwrap_or_default();
+            if !n.trim().is_empty() {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    fn explorer_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        // Relation-type folders from pg_catalog (covers tables, views,
+        // matviews, foreign tables, indexes, sequences). relkinds:
+        // r/p = table, v = view, m = matview, f = foreign, i = index,
+        // S = sequence.
+        let stmt = client
+            .prepare(
+                "SELECT CASE c.relkind WHEN 'v' THEN 'VIEWS' WHEN 'm' THEN 'MVIEWS' \
+                 WHEN 'f' THEN 'FOREIGN' WHEN 'i' THEN 'INDEXES' \
+                 WHEN 'S' THEN 'SEQUENCES' ELSE 'TABLES' END, COUNT(*) \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f','i','S') \
+                 GROUP BY 1",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[&schema])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let g: String = row.try_get(0).unwrap_or_default();
+            let n: i64 = row.try_get(1).unwrap_or(0);
+            if !g.is_empty() && n > 0 {
+                out.push((g, n as u64));
+            }
+        }
+        // Routine folders from information_schema (only visible ones).
+        let stmt = client
+            .prepare(
+                "SELECT CASE WHEN routine_type = 'PROCEDURE' THEN 'PROCEDURES' \
+                 ELSE 'FUNCTIONS' END, COUNT(*) \
+                 FROM information_schema.routines WHERE routine_schema = $1 GROUP BY 1",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[&schema])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        for row in rows {
+            let g: String = row.try_get(0).unwrap_or_default();
+            let n: i64 = row.try_get(1).unwrap_or(0);
+            if !g.is_empty() && n > 0 {
+                out.push((g, n as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    fn explorer_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        // Every folder query takes the schema as its single $1 parameter.
+        let sql = match group {
+            "TABLES" => {
+                "SELECT c.relname, 'TABLE' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind IN ('r','p') \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "VIEWS" => {
+                "SELECT c.relname, 'VIEW' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'v' \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "MVIEWS" => {
+                "SELECT c.relname, 'MVIEW' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'm' \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "FOREIGN" => {
+                "SELECT c.relname, 'FOREIGN TABLE' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'f' \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "INDEXES" => {
+                "SELECT c.relname, 'INDEX' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'i' \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "SEQUENCES" => {
+                "SELECT c.relname, 'SEQUENCE' FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'S' \
+                 ORDER BY 1 LIMIT 2000"
+            }
+            "FUNCTIONS" => {
+                "SELECT routine_name, 'FUNCTION' FROM information_schema.routines \
+                 WHERE routine_schema = $1 AND routine_type = 'FUNCTION' \
+                 ORDER BY 1 LIMIT 500"
+            }
+            "PROCEDURES" => {
+                "SELECT routine_name, 'PROCEDURE' FROM information_schema.routines \
+                 WHERE routine_schema = $1 AND routine_type = 'PROCEDURE' \
+                 ORDER BY 1 LIMIT 500"
+            }
+            _ => return Ok(Vec::new()),
+        };
+        let stmt = client
+            .prepare(sql)
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[&schema])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let n: String = row.try_get(0).unwrap_or_default();
+            let k: String = row.try_get(1).unwrap_or_default();
+            if !n.trim().is_empty() {
+                out.push((n, if k.is_empty() { "TABLE".into() } else { k }));
+            }
+        }
+        Ok(out)
+    }
+
+    fn explorer_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        match kind {
+            // pg_get_viewdef reconstructs the query behind views AND
+            // materialized views.
+            "VIEW" | "MVIEW" => {
+                let stmt = client
+                    .prepare(
+                        "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                match rows.into_iter().next() {
+                    Some(row) => {
+                        let def: String = row.try_get(0).unwrap_or_default();
+                        if def.trim().is_empty() {
+                            Err(anyhow::anyhow!(
+                                "no definition for {}.{} (no access?)",
+                                schema,
+                                name
+                            ))
+                        } else if kind == "MVIEW" {
+                            Ok(format!(
+                                "CREATE MATERIALIZED VIEW {}.{} AS\n{}",
+                                pg_quote_ident(schema),
+                                pg_quote_ident(name),
+                                def
+                            ))
+                        } else {
+                            Ok(format!(
+                                "CREATE OR REPLACE VIEW {}.{} AS\n{}",
+                                pg_quote_ident(schema),
+                                pg_quote_ident(name),
+                                def
+                            ))
+                        }
+                    }
+                    None => Err(anyhow::anyhow!("view {}.{} not found", schema, name)),
+                }
+            }
+            "TABLE" | "FOREIGN TABLE" => {
+                // Synthesize CREATE TABLE from pg_attribute (same lock).
+                let stmt = client
+                    .prepare(
+                        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                         NOT a.attnotnull FROM pg_catalog.pg_attribute a \
+                         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2 \
+                         AND a.attnum > 0 AND NOT a.attisdropped \
+                         ORDER BY a.attnum LIMIT 1000",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                if rows.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "no columns visible for {}.{} (no access?)",
+                        schema,
+                        name
+                    ));
+                }
+                let mut ddl = format!(
+                    "CREATE TABLE {}.{} (\n",
+                    pg_quote_ident(schema),
+                    pg_quote_ident(name)
+                );
+                for (i, row) in rows.iter().enumerate() {
+                    let cn: String = row.try_get(0).unwrap_or_default();
+                    let ct: String = row.try_get(1).unwrap_or_default();
+                    let nu: bool = row.try_get(2).unwrap_or(true);
+                    ddl.push_str(&format!(
+                        "  {} {}{}",
+                        pg_quote_ident(&cn),
+                        if ct.is_empty() { "?" } else { &ct },
+                        if nu { "" } else { " NOT NULL" }
+                    ));
+                    if i + 1 < rows.len() {
+                        ddl.push(',');
+                    }
+                    ddl.push('\n');
+                }
+                ddl.push_str(");");
+                Ok(ddl)
+            }
+            "INDEX" => {
+                let stmt = client
+                    .prepare(
+                        "SELECT pg_get_indexdef(c.oid) FROM pg_class c \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                match rows.into_iter().next() {
+                    Some(row) => {
+                        let def: String = row.try_get(0).unwrap_or_default();
+                        if def.trim().is_empty() {
+                            Err(anyhow::anyhow!(
+                                "no index definition for {}.{} (no access?)",
+                                schema,
+                                name
+                            ))
+                        } else {
+                            Ok(format!("{};", def.trim_end_matches(';')))
+                        }
+                    }
+                    None => Err(anyhow::anyhow!("index {}.{} not found", schema, name)),
+                }
+            }
+            "SEQUENCE" => {
+                // pg_sequences reports NUMERIC (not bigint) values, so cast
+                // to text — reading them as i64 fails with a db error.
+                let stmt = client
+                    .prepare(
+                        "SELECT start_value::text, minimum_value::text, \
+                         maximum_value::text, increment_by::text, \
+                         cycle_option::text, cache_size::text FROM pg_sequences \
+                         WHERE schemaname = $1 AND sequencename = $2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                match rows.into_iter().next() {
+                    Some(row) => {
+                        let start: String = row.try_get(0).unwrap_or_else(|_| "1".into());
+                        let min: String = row.try_get(1).unwrap_or_else(|_| "1".into());
+                        let max: String = row.try_get(2).unwrap_or_default();
+                        let inc: String = row.try_get(3).unwrap_or_else(|_| "1".into());
+                        let cycle: String = row.try_get(4).unwrap_or_default();
+                        let cache: String = row.try_get(5).unwrap_or_else(|_| "1".into());
+                        let cycled = matches!(
+                            cycle.to_ascii_lowercase().as_str(),
+                            "t" | "true" | "yes" | "y" | "1"
+                        );
+                        Ok(format!(
+                            "CREATE SEQUENCE {}.{}\n  START WITH {}\n  INCREMENT BY {}\n  \
+                             MINVALUE {}\n  MAXVALUE {}\n  {}\n  CACHE {};",
+                            pg_quote_ident(schema),
+                            pg_quote_ident(name),
+                            start,
+                            inc,
+                            min,
+                            max,
+                            if cycled { "CYCLE" } else { "NO CYCLE" },
+                            cache
+                        ))
+                    }
+                    None => Err(anyhow::anyhow!("sequence {}.{} not found", schema, name)),
+                }
+            }
+            _ => {
+                // Functions/procedures: first overload wins (note it).
+                let stmt = client
+                    .prepare(
+                        "SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE n.nspname = $1 AND p.proname = $2 \
+                         ORDER BY p.oid LIMIT 2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let mut it = rows.into_iter();
+                match it.next() {
+                    Some(row) => {
+                        let def: String = row.try_get(0).unwrap_or_default();
+                        if def.trim().is_empty() {
+                            Err(anyhow::anyhow!(
+                                "no source for {} {}.{} (no access?)",
+                                kind,
+                                schema,
+                                name
+                            ))
+                        } else if it.next().is_some() {
+                            Ok(format!(
+                                "-- NOTE: {}.{} is overloaded; showing first overload.\n{}",
+                                schema, name, def
+                            ))
+                        } else {
+                            Ok(def)
+                        }
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "no source for {} {}.{} (no access?)",
+                        kind,
+                        schema,
+                        name
+                    )),
+                }
+            }
+        }
+    }
+
+    fn explorer_columns(
+        &self,
+        schema: &str,
+        table: &str,
+        _kind: &str,
+    ) -> anyhow::Result<Vec<ColumnInfo>> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        // pg_attribute (not information_schema) so materialized views and
+        // foreign tables report columns too; format_type renders e.g.
+        // 'character varying(50)' / 'timestamp with time zone'.
+        let stmt = client
+            .prepare(
+                "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                 NOT a.attnotnull FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                 AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum LIMIT 1000",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[&schema, &table])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let n: String = row.try_get(0).unwrap_or_default();
+            let t: String = row.try_get(1).unwrap_or_default();
+            let nu: bool = row.try_get(2).unwrap_or(true);
+            if n.trim().is_empty() {
+                continue;
+            }
+            out.push(ColumnInfo {
+                name: n,
+                data_type: if t.is_empty() { "?".into() } else { t },
+                nullable: nu,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Quote a Postgres identifier (schema/table/column) with double quotes.
+pub(crate) fn pg_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Render a driver error with everything the server told us. A bare
+/// `to_string()` on some driver errors is just "db error", which hides the
+/// SQLSTATE + message needed to diagnose dictionary-query failures.
+pub(crate) fn verbose_pg_error(e: &postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db) => {
+            let mut out = format!("{}: {}", db.code().code(), db.message());
+            if let Some(d) = db.detail() {
+                if !d.is_empty() {
+                    out.push_str("\nDetail: ");
+                    out.push_str(d);
+                }
+            }
+            if let Some(h) = db.hint() {
+                if !h.is_empty() {
+                    out.push_str("\nHint: ");
+                    out.push_str(h);
+                }
+            }
+            out
+        }
+        None => e.to_string(),
+    }
+}
+
+/// Build a 20-row preview query for the explorer detail pane.
+pub(crate) fn pg_preview_sql(schema: &str, table: &str, limit: usize) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {}",
+        pg_quote_ident(schema),
+        pg_quote_ident(table),
+        limit
+    )
 }
 
 /// Build the `EXPLAIN <sql>` statement (pure, testable).
@@ -338,6 +776,21 @@ impl DbConnection for PgConnection {
     fn explain_plan(&self, sql: &str, max_rows: usize) -> QueryRow {
         self.run_explain(sql, max_rows)
     }
+    fn list_schemas(&self) -> anyhow::Result<Vec<String>> {
+        self.explorer_schemas()
+    }
+    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>> {
+        self.explorer_columns(schema, name, kind)
+    }
+    fn list_object_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        self.explorer_groups(schema)
+    }
+    fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
+        self.explorer_objects(schema, group)
+    }
+    fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
+        self.explorer_ddl(schema, name, kind)
+    }
     fn db_type(&self) -> DbType {
         DbType::Postgres
     }
@@ -369,6 +822,16 @@ mod tests {
         // plumbing without needing a live server.
         let res = PgConnection::connect("127.0.0.1", 1, "postgres", "u", "p", "(NULL)");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn pg_ident_quoting_and_preview() {
+        assert_eq!(pg_quote_ident("public"), "\"public\"");
+        assert_eq!(pg_quote_ident("we\"ird"), "\"we\"\"ird\"");
+        assert_eq!(
+            pg_preview_sql("public", "emp", 20),
+            "SELECT * FROM \"public\".\"emp\" LIMIT 20"
+        );
     }
 
     #[test]

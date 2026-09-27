@@ -52,6 +52,14 @@ impl DbType {
     }
 }
 
+/// Column metadata for the F12 DB explorer tree.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+}
+
 /// Backend-agnostic database connection. Implemented by Oracle and Postgres
 /// connections so sessions can hold either behind an `Arc<dyn DbConnection>`.
 pub trait DbConnection: Send + Sync {
@@ -67,6 +75,21 @@ pub trait DbConnection: Send + Sync {
     fn session_sql(&self, info: &DbSessionInfo) -> anyhow::Result<String>;
     /// Explain plan for an arbitrary SQL statement, as a displayable result.
     fn explain_plan(&self, sql: &str, max_rows: usize) -> QueryRow;
+    /// F12 DB explorer: schemas/users visible to us (capped for big DBs).
+    fn list_schemas(&self) -> anyhow::Result<Vec<String>>;
+    /// F12 DB explorer: type-group folders present in one schema, as
+    /// (GROUP_KEY, object_count) — only non-empty groups. Keys: TABLES,
+    /// VIEWS, MVIEWS, FOREIGN, INDEXES, SEQUENCES, FUNCTIONS, PROCEDURES,
+    /// PACKAGES, TRIGGERS, TYPES.
+    fn list_object_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>>;
+    /// F12 DB explorer: objects of one type group as (object_name, kind)
+    /// where kind is e.g. "TABLE", "VIEW", "MVIEW", "INDEX", "PROCEDURE".
+    fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>>;
+    /// F12 DB explorer: columns of a table-like object or index, in order.
+    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>>;
+    /// F12 DB explorer: DDL/source text for any object (tables synthesize
+    /// CREATE TABLE from columns; views/procedures read the dictionary).
+    fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String>;
 }
 
 pub struct OracleConnection {
@@ -515,6 +538,465 @@ impl OracleConnection {
         ))
     }
 
+    /// F12 explorer: schemas visible to us, capped so huge DBs stay usable.
+    pub fn list_schemas(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .statement("SELECT USERNAME FROM ALL_USERS ORDER BY USERNAME")
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt.query(&[]).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            if !name.trim().is_empty() {
+                out.push(name);
+            }
+            if out.len() >= 500 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// F12 explorer: which type-group folders one schema has, with counts.
+    pub fn list_object_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        let sql = "SELECT OBJECT_TYPE, COUNT(*) FROM ALL_OBJECTS WHERE OWNER = :1 \
+                   AND OBJECT_TYPE IN ('TABLE','VIEW','MATERIALIZED VIEW','INDEX', \
+                   'SEQUENCE','PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY', \
+                   'TRIGGER','TYPE') GROUP BY OBJECT_TYPE";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let rows = stmt
+            .query(&[&owned])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Several dictionary types fold into one explorer folder.
+        let mut counts: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let otype: String = row.get(0).unwrap_or_default();
+            let n: i64 = row.get(1).unwrap_or(0);
+            let key = match otype.as_str() {
+                "TABLE" => "TABLES",
+                "VIEW" => "VIEWS",
+                "MATERIALIZED VIEW" => "MVIEWS",
+                "INDEX" => "INDEXES",
+                "SEQUENCE" => "SEQUENCES",
+                "PROCEDURE" => "PROCEDURES",
+                "FUNCTION" => "FUNCTIONS",
+                "PACKAGE" | "PACKAGE BODY" => "PACKAGES",
+                "TRIGGER" => "TRIGGERS",
+                "TYPE" => "TYPES",
+                _ => continue,
+            };
+            *counts.entry(key).or_insert(0) += n.max(0) as u64;
+        }
+        Ok(counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+
+    /// F12 explorer: objects of one type-group folder, ordered by name.
+    pub fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let owned = schema.to_uppercase();
+        let sql = match group {
+            "TABLES" => {
+                "SELECT TABLE_NAME, 'TABLE' FROM ALL_TABLES WHERE OWNER = :1 ORDER BY 1"
+            }
+            "VIEWS" => {
+                "SELECT VIEW_NAME, 'VIEW' FROM ALL_VIEWS WHERE OWNER = :1 ORDER BY 1"
+            }
+            "MVIEWS" => {
+                "SELECT MVIEW_NAME, 'MVIEW' FROM ALL_MVIEWS WHERE OWNER = :1 ORDER BY 1"
+            }
+            "INDEXES" => {
+                "SELECT INDEX_NAME, 'INDEX' FROM ALL_INDEXES WHERE OWNER = :1 ORDER BY 1"
+            }
+            "SEQUENCES" => {
+                "SELECT SEQUENCE_NAME, 'SEQUENCE' FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER = :1 ORDER BY 1"
+            }
+            "PACKAGES" => {
+                "SELECT OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS WHERE OWNER = :1 \
+                 AND OBJECT_TYPE IN ('PACKAGE','PACKAGE BODY') ORDER BY 1"
+            }
+            "PROCEDURES" => {
+                "SELECT OBJECT_NAME, 'PROCEDURE' FROM ALL_OBJECTS WHERE OWNER = :1 \
+                 AND OBJECT_TYPE = 'PROCEDURE' ORDER BY 1"
+            }
+            "FUNCTIONS" => {
+                "SELECT OBJECT_NAME, 'FUNCTION' FROM ALL_OBJECTS WHERE OWNER = :1 \
+                 AND OBJECT_TYPE = 'FUNCTION' ORDER BY 1"
+            }
+            "TRIGGERS" => {
+                "SELECT OBJECT_NAME, 'TRIGGER' FROM ALL_OBJECTS WHERE OWNER = :1 \
+                 AND OBJECT_TYPE = 'TRIGGER' ORDER BY 1"
+            }
+            "TYPES" => {
+                "SELECT OBJECT_NAME, 'TYPE' FROM ALL_OBJECTS WHERE OWNER = :1 \
+                 AND OBJECT_TYPE = 'TYPE' ORDER BY 1"
+            }
+            _ => return Ok(Vec::new()),
+        };
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt
+            .query(&[&owned])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            let kind: String = row.get(1).unwrap_or_default();
+            if !name.trim().is_empty() {
+                out.push((name, kind));
+            }
+            if out.len() >= 2000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// F12 explorer: key columns of one index (position + sort order).
+    fn list_index_columns(&self, schema: &str, index: &str) -> anyhow::Result<Vec<ColumnInfo>> {
+        let sql = "SELECT COLUMN_NAME, COLUMN_POSITION, DESCEND FROM ALL_IND_COLUMNS \
+                   WHERE INDEX_OWNER = :1 AND INDEX_NAME = :2 ORDER BY COLUMN_POSITION";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let iname = index.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &iname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            let pos: i32 = row.get(1).unwrap_or(0);
+            let descend: String = row.get(2).unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            out.push(ColumnInfo {
+                name,
+                data_type: format!(
+                    "KEY #{}{}",
+                    pos,
+                    if descend.eq_ignore_ascii_case("DESC") {
+                        " DESC"
+                    } else {
+                        ""
+                    }
+                ),
+                nullable: true,
+            });
+            if out.len() >= 100 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// F12 explorer: DDL/source for one object. Tables synthesize CREATE TABLE
+    /// from ALL_TAB_COLUMNS; views read ALL_VIEWS; code reads ALL_SOURCE.
+    pub fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
+        match kind {
+            "TABLE" | "FOREIGN TABLE" => {
+                let cols = self.list_columns(schema, name, kind)?;
+                if cols.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "no columns visible for {}.{} (no access?)",
+                        schema,
+                        name
+                    ));
+                }
+                let mut ddl = format!("CREATE TABLE {}.{} (\n", schema, name);
+                for (i, c) in cols.iter().enumerate() {
+                    ddl.push_str(&format!(
+                        "  {} {}{}",
+                        c.name,
+                        c.data_type,
+                        if c.nullable { "" } else { " NOT NULL" }
+                    ));
+                    if i + 1 < cols.len() {
+                        ddl.push(',');
+                    }
+                    ddl.push('\n');
+                }
+                ddl.push_str(");");
+                Ok(ddl)
+            }
+            "VIEW" => {
+                let sql =
+                    "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2";
+                let mut stmt = self
+                    .conn
+                    .statement(sql)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let owned = schema.to_uppercase();
+                let tname = name.to_uppercase();
+                let rows = stmt
+                    .query(&[&owned, &tname])
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                for row_result in rows {
+                    let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let text: String = row.get(0).unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        return Ok(format!(
+                            "CREATE OR REPLACE VIEW {}.{} AS\n{}",
+                            schema, name, text
+                        ));
+                    }
+                }
+                Err(anyhow::anyhow!(
+                    "view text for {}.{} not visible (no access?)",
+                    schema,
+                    name
+                ))
+            }
+            "INDEX" => self.index_ddl(schema, name),
+            "SEQUENCE" => self.sequence_ddl(schema, name),
+            "MVIEW" => {
+                let sql =
+                    "SELECT QUERY FROM ALL_MVIEWS WHERE OWNER = :1 AND MVIEW_NAME = :2";
+                let mut stmt = self
+                    .conn
+                    .statement(sql)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let owned = schema.to_uppercase();
+                let tname = name.to_uppercase();
+                let rows = stmt
+                    .query(&[&owned, &tname])
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                for row_result in rows {
+                    let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let text: String = row.get(0).unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        return Ok(format!(
+                            "CREATE MATERIALIZED VIEW {}.{} AS\n{}",
+                            schema, name, text
+                        ));
+                    }
+                }
+                Err(anyhow::anyhow!(
+                    "materialized view text for {}.{} not visible (no access?)",
+                    schema,
+                    name
+                ))
+            }
+            _ => {
+                // Code objects: ALL_SOURCE holds one row per line.
+                // TYPE must match OBJECT_TYPE ('PACKAGE' = spec, 'PACKAGE BODY'
+                // would be a separate row in ALL_OBJECTS).
+                let sql = "SELECT TEXT FROM ALL_SOURCE WHERE OWNER = :1 AND NAME = :2 \
+                           AND TYPE = :3 ORDER BY LINE";
+                let mut stmt = self
+                    .conn
+                    .statement(sql)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let owned = schema.to_uppercase();
+                let oname = name.to_uppercase();
+                let otype = kind.to_uppercase();
+                let rows = stmt
+                    .query(&[&owned, &oname, &otype])
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let mut out = String::new();
+                let mut lines = 0usize;
+                for row_result in rows {
+                    let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let text: String = row.get(0).unwrap_or_default();
+                    out.push_str(&text);
+                    if !text.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    lines += 1;
+                    if lines >= 500 {
+                        out.push_str("-- ... truncated at 500 lines ...\n");
+                        break;
+                    }
+                }
+                if out.trim().is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "no source for {} {}.{} (need SELECT on ALL_SOURCE?)",
+                        kind,
+                        schema,
+                        name
+                    ));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// F12 explorer: columns of one table-like object (or the key columns
+    /// of an index), in ordinal order.
+    pub fn list_columns(
+        &self,
+        schema: &str,
+        table: &str,
+        kind: &str,
+    ) -> anyhow::Result<Vec<ColumnInfo>> {
+        if kind == "INDEX" {
+            return self.list_index_columns(schema, table);
+        }
+        let sql = "SELECT COLUMN_NAME, DATA_TYPE, NULLABLE FROM ALL_TAB_COLUMNS \
+                   WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let tname = table.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &tname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            let dtype: String = row.get(1).unwrap_or_default();
+            let nullable: String = row.get(2).unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            out.push(ColumnInfo {
+                name,
+                data_type: if dtype.is_empty() {
+                    "?".into()
+                } else {
+                    dtype
+                },
+                nullable: nullable.trim().eq_ignore_ascii_case("Y"),
+            });
+            if out.len() >= 1000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// F12 explorer: CREATE INDEX reconstructed from ALL_INDEXES +
+    /// ALL_IND_COLUMNS (no DBMS_METADATA privileges needed).
+    fn index_ddl(&self, schema: &str, index: &str) -> anyhow::Result<String> {
+        let sql = "SELECT TABLE_OWNER, TABLE_NAME, UNIQUENESS FROM ALL_INDEXES \
+                   WHERE OWNER = :1 AND INDEX_NAME = :2";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let iname = index.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &iname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let (towner, tname, unique) = match rows.into_iter().next() {
+            Some(row_result) => {
+                let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                let to: String = row.get(0).unwrap_or_default();
+                let tn: String = row.get(1).unwrap_or_default();
+                let uq: String = row.get(2).unwrap_or_default();
+                (to, tn, uq.eq_ignore_ascii_case("UNIQUE"))
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "index {}.{} not visible (no access?)",
+                    schema,
+                    index
+                ))
+            }
+        };
+        let cols = self.list_index_columns(schema, index)?;
+        if cols.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no key columns visible for index {}.{}",
+                schema,
+                index
+            ));
+        }
+        // ColumnInfo.data_type holds "KEY #pos [DESC]"; strip the prefix.
+        let keys: Vec<String> = cols
+            .iter()
+            .map(|c| {
+                if c.data_type.ends_with(" DESC") {
+                    format!("{} DESC", c.name)
+                } else {
+                    c.name.clone()
+                }
+            })
+            .collect();
+        Ok(format!(
+            "CREATE {}INDEX {}.{} ON {}.{} ({});",
+            if unique { "UNIQUE " } else { "" },
+            schema,
+            index,
+            towner,
+            tname,
+            keys.join(", ")
+        ))
+    }
+
+    /// F12 explorer: CREATE SEQUENCE from ALL_SEQUENCES (numbers come back
+    /// as strings so huge MAXVALUEs can't overflow).
+    fn sequence_ddl(&self, schema: &str, name: &str) -> anyhow::Result<String> {
+        let sql = "SELECT MIN_VALUE, MAX_VALUE, INCREMENT_BY, CYCLE_FLAG, CACHE_SIZE \
+                   FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER = :1 AND SEQUENCE_NAME = :2";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let sname = name.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &sname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        match rows.into_iter().next() {
+            Some(row_result) => {
+                let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                let min: String = row.get(0).unwrap_or_default();
+                let max: String = row.get(1).unwrap_or_default();
+                let inc: String = row.get(2).unwrap_or_default();
+                let cycle: String = row.get(3).unwrap_or_default();
+                let cache: String = row.get(4).unwrap_or_default();
+                Ok(format!(
+                    "CREATE SEQUENCE {}.{}\n  INCREMENT BY {}\n  MINVALUE {}\n  \
+                     MAXVALUE {}\n  {}CYCLE\n  CACHE {};",
+                    schema,
+                    name,
+                    inc,
+                    min,
+                    max,
+                    if cycle.eq_ignore_ascii_case("Y") {
+                        ""
+                    } else {
+                        "NO"
+                    },
+                    cache
+                ))
+            }
+            None => Err(anyhow::anyhow!(
+                "sequence {}.{} not visible (no access?)",
+                schema,
+                name
+            )),
+        }
+    }
+
     /// Explain plan via `EXPLAIN PLAN` + `DBMS_XPLAN.DISPLAY`, using a unique
     /// statement id so concurrent frog explains don't clobber each other.
     pub fn explain_plan_for(&self, sql: &str, max_rows: usize) -> QueryRow {
@@ -585,6 +1067,21 @@ impl DbConnection for OracleConnection {
     }
     fn explain_plan(&self, sql: &str, max_rows: usize) -> QueryRow {
         self.explain_plan_for(sql, max_rows)
+    }
+    fn list_schemas(&self) -> anyhow::Result<Vec<String>> {
+        self.list_schemas()
+    }
+    fn list_object_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        self.list_object_groups(schema)
+    }
+    fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
+        self.list_objects(schema, group)
+    }
+    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>> {
+        self.list_columns(schema, name, kind)
+    }
+    fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
+        self.object_ddl(schema, name, kind)
     }
     fn db_type(&self) -> DbType {
         DbType::Oracle

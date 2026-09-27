@@ -10,6 +10,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
 /// Convert a screen-column offset into a byte offset on `line`, walking chars
@@ -51,6 +52,10 @@ pub struct App {
     editor_area: Rect,
     results_area: Rect,
     sidebar_area: Rect,
+    explorer_area: Rect,
+    explorer_detail_area: Rect,
+    /// Last explorer tree click (visible row, time) for double-click detect.
+    last_explorer_click: Option<(usize, Instant)>,
     command_mode: bool,
     command_input: String,
     command_error: Option<String>,
@@ -93,6 +98,9 @@ impl App {
             editor_area: Rect::default(),
             results_area: Rect::default(),
             sidebar_area: Rect::default(),
+            explorer_area: Rect::default(),
+            explorer_detail_area: Rect::default(),
+            last_explorer_click: None,
             command_mode: false,
             command_input: String::new(),
             command_error: None,
@@ -160,6 +168,7 @@ impl App {
     ) -> anyhow::Result<()> {
         while !self.should_quit {
             self.session_manager.poll_result();
+            self.session_manager.poll_explorer();
             self.session_manager.poll_conn_result();
             self.session_manager.check_connections();
             self.session_manager.tick_statuses();
@@ -236,6 +245,13 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // F12 explorer owns its area fullscreen: clicks select, gutter /
+        // double-click toggles, wheel scrolls the pane under the cursor.
+        if self.session_manager.active_session().mode == SessionMode::DbExplorer
+            && self.handle_explorer_mouse(mouse)
+        {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 let in_editor = self
@@ -348,6 +364,10 @@ impl App {
         }
         if mode == SessionMode::SessionView {
             self.handle_session_view(key);
+            return;
+        }
+        if mode == SessionMode::DbExplorer {
+            self.handle_db_explorer(key);
             return;
         }
 
@@ -538,6 +558,17 @@ impl App {
                 self.session_manager.active_session_mut().mode = SessionMode::History;
                 return;
             }
+            (KeyModifiers::NONE, KeyCode::F(12)) => {
+                // Toggle the DB explorer like a fullscreen browser (cf. F2).
+                let mode = self.session_manager.active_session().mode.clone();
+                if mode == SessionMode::DbExplorer {
+                    self.session_manager.active_session_mut().mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                } else {
+                    self.session_manager.enter_db_explorer();
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -622,6 +653,7 @@ impl App {
             | SessionMode::SessionView
             | SessionMode::Help
             | SessionMode::History
+            | SessionMode::DbExplorer
             | SessionMode::ConnectionPickerDialog => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     session.mode = SessionMode::Query;
@@ -788,6 +820,196 @@ impl App {
         }
     }
 
+    /// F12 DB explorer: tree navigation + preview/DDL detail pane.
+    fn handle_db_explorer(&mut self, key: event::KeyEvent) {
+        // Never trap the user: Ctrl+Q always quits.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
+            self.should_quit = true;
+            return;
+        }
+        // Same result style switch as the main viewer: the explorer preview
+        // is rendered with the shared result viewer.
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
+            self.result_format = match self.result_format {
+                ResultFormat::Table => ResultFormat::Markdown,
+                ResultFormat::Markdown => ResultFormat::Ascii,
+                ResultFormat::Ascii => ResultFormat::Table,
+            };
+            return;
+        }
+        // Filter input captures most keystrokes until Enter/Esc.
+        if self.session_manager.active_session().explorer_filtering {
+            let session = self.session_manager.active_session_mut();
+            match key.code {
+                KeyCode::Esc => {
+                    session.explorer_filter.clear();
+                    session.explorer_filtering = false;
+                    session.explorer_cursor = 0;
+                    session.explorer_scroll = 0;
+                }
+                KeyCode::Enter => {
+                    session.explorer_filtering = false;
+                    session.explorer_cursor = 0;
+                    session.explorer_scroll = 0;
+                }
+                KeyCode::Backspace => {
+                    session.explorer_filter.pop();
+                    session.explorer_cursor = 0;
+                    session.explorer_scroll = 0;
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    session.explorer_filter.push(c);
+                    session.explorer_cursor = 0;
+                    session.explorer_scroll = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                let session = self.session_manager.active_session_mut();
+                session.mode = SessionMode::Query;
+                session.explorer_filtering = false;
+                self.active_window = ActiveWindow::Editor;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.session_manager.move_explorer_cursor(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                self.session_manager.move_explorer_cursor(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Enter => {
+                self.session_manager.toggle_explorer_cursor();
+            }
+            KeyCode::Char(' ') => {
+                self.session_manager.toggle_explorer_cursor();
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                self.session_manager.collapse_explorer_cursor();
+            }
+            KeyCode::PageUp => {
+                let session = self.session_manager.active_session_mut();
+                session.explorer_detail_scroll =
+                    session.explorer_detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let session = self.session_manager.active_session_mut();
+                session.explorer_detail_scroll =
+                    session.explorer_detail_scroll.saturating_add(10);
+            }
+            KeyCode::Home => {
+                let session = self.session_manager.active_session_mut();
+                session.explorer_cursor = 0;
+                session.explorer_scroll = 0;
+                session.explorer_detail_scroll = 0;
+                self.session_manager.maybe_load_detail_for_cursor();
+            }
+            KeyCode::End => {
+                let len = self.session_manager.explorer_visible_rows().len();
+                {
+                    let session = self.session_manager.active_session_mut();
+                    session.explorer_cursor = len.saturating_sub(1);
+                    session.explorer_detail_scroll = 0;
+                }
+                self.session_manager.maybe_load_detail_for_cursor();
+            }
+            KeyCode::Char('/') => {
+                let session = self.session_manager.active_session_mut();
+                session.explorer_filtering = true;
+            }
+            KeyCode::Char('r') => self.session_manager.refresh_explorer_node(),
+            KeyCode::Char('R') => self.session_manager.refresh_explorer(),
+            // Reload the preview/DDL under the cursor.
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.session_manager.reload_explorer_detail()
+            }
+            // Copy SELECT * FROM <object> into the editor and go back.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if let Some(sql) = self.session_manager.explorer_sql_for_cursor() {
+                    let session = self.session_manager.active_session_mut();
+                    session.editor.set_text(&sql);
+                    session.mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                    session.set_status(format!("Loaded into editor: {}", sql));
+                } else {
+                    self.session_manager.active_session_mut().set_status(
+                        "Select a table/view/mview first (folders, code and indexes have no SELECT)",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mouse inside the fullscreen explorer. Returns true when the event was
+    /// consumed (i.e. we are in explorer mode with a usable layout).
+    fn handle_explorer_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let tree = self.explorer_area;
+        let detail = self.explorer_detail_area;
+        if tree.width == 0 || tree.height == 0 {
+            return false;
+        }
+        let pos = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                if detail.width > 0 && detail.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_add(3);
+                } else if tree.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_scroll = s.explorer_scroll.saturating_add(3);
+                }
+                return true;
+            }
+            MouseEventKind::ScrollUp => {
+                if detail.width > 0 && detail.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_sub(3);
+                } else if tree.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_scroll = s.explorer_scroll.saturating_sub(3);
+                }
+                return true;
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if !tree.contains(pos) {
+                    return false;
+                }
+                // Content starts one row below the block border.
+                let rel = mouse.row.saturating_sub(tree.y + 1) as usize;
+                let sess = self.session_manager.active_session();
+                let total = self.session_manager.explorer_visible_rows().len();
+                if rel >= total {
+                    return true;
+                }
+                let idx = (sess.explorer_scroll + rel).min(total.saturating_sub(1));
+                let gutter = mouse.column <= tree.x + 3;
+                let now = Instant::now();
+                let double = matches!(self.last_explorer_click, Some((last, t))
+                    if last == idx && now.duration_since(t).as_millis() < 500);
+                self.last_explorer_click = Some((idx, now));
+                if gutter || double {
+                    // Arrow click / double-click: select + expand/collapse.
+                    {
+                        let s = self.session_manager.active_session_mut();
+                        s.explorer_cursor = idx;
+                        s.explorer_detail_scroll = 0;
+                    }
+                    self.session_manager.toggle_explorer_cursor();
+                } else {
+                    // Single click: select + kick off preview/DDL.
+                    self.session_manager.explorer_select(idx);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        // In explorer mode clicks/wheel elsewhere are swallowed so the
+        // underlying editor layout doesn't steal focus mid-browse.
+        true
+    }
+
     fn handle_conn_dialog(&mut self, key: event::KeyEvent) {
         let session = self.session_manager.active_session_mut();
         let dlg = &mut session.conn_dialog;
@@ -869,6 +1091,16 @@ impl App {
         match mode {
             SessionMode::SessionView => {
                 render_session_overview(&mut self.session_manager, f, chunks[1]);
+            }
+            SessionMode::DbExplorer => {
+                let (tree, detail) = render_db_explorer(
+                    &mut self.session_manager,
+                    self.result_format,
+                    f,
+                    chunks[1],
+                );
+                self.explorer_area = tree;
+                self.explorer_detail_area = detail;
             }
             SessionMode::Help => {
                 render_help(f, chunks[1]);
