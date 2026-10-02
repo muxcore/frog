@@ -594,14 +594,12 @@ impl SqlEditor {
 pub struct Session {
     pub id: usize,
     pub name: String,
-    pub conn: Option<Arc<dyn DbConnection>>,
     pub is_connected: bool,
     pub connecting: bool,
     pub connect_error: Option<String>,
     pub query_history: Vec<String>,
     pub history_cursor: usize,
     pub results: Vec<QueryRow>,
-    pub current_result_idx: usize,
     pub scroll_offset: usize,
     pub col_scroll_offset: usize,
     pub editor: SqlEditor,
@@ -640,6 +638,13 @@ pub struct Session {
     /// Last F2 list failure (e.g. missing V$SESSION privileges), shown in
     /// the browser instead of an unexplained empty table.
     pub session_view_error: Option<String>,
+    /// Cached F2 session list (v$session / pg_stat_activity). Refreshed on
+    /// demand and automatically every `SessionManager::session_refresh_secs`.
+    /// Caching avoids hitting the database on every UI frame / cursor move —
+    /// previously `fresh_session_list()` queried on each render (~20fps).
+    pub session_list_cache: Vec<DbSessionInfo>,
+    /// When `session_list_cache` was last refreshed.
+    pub session_list_since: Option<std::time::Instant>,
     /// F12 DB explorer: cached schema tree (lazy-loaded per level).
     pub explorer_schemas: Vec<ExplorerSchema>,
     /// Whether the top-level schema list was loaded at least once.
@@ -648,8 +653,6 @@ pub struct Session {
     pub explorer_cursor: usize,
     /// Vertical scroll offset of the explorer tree pane.
     pub explorer_scroll: usize,
-    /// Horizontal scroll (chars) for long object names.
-    pub explorer_hscroll: usize,
     /// Scroll of the detail/columns pane.
     pub explorer_detail_scroll: usize,
     /// Substring filter (case-insensitive); empty = no filter.
@@ -1098,7 +1101,6 @@ impl ConnectionDialog {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionMode {
     Query,
-    Results,
     SessionView,
     Help,
     History,
@@ -1127,14 +1129,12 @@ impl Session {
         Self {
             id,
             name: format!("Session {}", id),
-            conn: None,
             is_connected: false,
             connecting: false,
             connect_error: None,
             query_history: load_history(),
             history_cursor: 0,
             results: Vec::new(),
-            current_result_idx: 0,
             scroll_offset: 0,
             col_scroll_offset: 0,
             editor: SqlEditor::new(),
@@ -1155,11 +1155,12 @@ impl Session {
             plan_scroll: 0,
             plan_hscroll: 0,
             session_view_error: None,
+            session_list_cache: Vec::new(),
+            session_list_since: None,
             explorer_schemas: Vec::new(),
             explorer_loaded: false,
             explorer_cursor: 0,
             explorer_scroll: 0,
-            explorer_hscroll: 0,
             explorer_detail_scroll: 0,
             explorer_filter: String::new(),
             explorer_filtering: false,
@@ -1189,6 +1190,8 @@ pub struct SessionManager {
     pub max_rows: usize,
     /// Display string for NULL cells (from UiConfig.null_display).
     pub null_display: String,
+    /// F2 session browser auto-refresh interval, seconds (default 60, 0 = manual only).
+    pub session_refresh_secs: u64,
 }
 
 impl Default for SessionManager {
@@ -1276,6 +1279,7 @@ impl SessionManager {
             autocommit: true,
             max_rows: 10000,
             null_display: "(NULL)".into(),
+            session_refresh_secs: 60,
         }
     }
 
@@ -1314,7 +1318,6 @@ impl SessionManager {
             columns: vec![],
             rows: vec![],
             truncated: false,
-            row_count: 0,
             elapsed_ms: 0,
             is_error: true,
             error_msg: Some(msg),
@@ -1611,7 +1614,6 @@ impl SessionManager {
                     columns: vec![],
                     rows: vec![],
                     truncated: false,
-                    row_count: 0,
                     elapsed_ms: 0,
                     is_error: true,
                     error_msg: Some("Not connected. Use Ctrl+O to connect.".into()),
@@ -1798,7 +1800,6 @@ impl SessionManager {
                 } else {
                     // Fresh query result
                     sess.results.push(qr);
-                    sess.current_result_idx = sess.results.len().saturating_sub(1);
                     sess.scroll_offset = 0;
                 }
 
@@ -1806,7 +1807,6 @@ impl SessionManager {
                 if sess.results.len() > cap {
                     let excess = sess.results.len() - cap;
                     sess.results.drain(0..excess);
-                    sess.current_result_idx = sess.current_result_idx.saturating_sub(excess);
                 }
             }
         }
@@ -1836,22 +1836,89 @@ impl SessionManager {
 
     /// Refresh the F2 list, recording any failure on the active session so
     /// the browser can show it (e.g. missing dictionary privileges).
-    pub(crate) fn fresh_session_list(&mut self) -> Vec<DbSessionInfo> {
+    /// Updates the cache + timestamp and clamps the cursor into range.
+    pub fn refresh_session_list(&mut self) -> Vec<DbSessionInfo> {
         let idx = self.active_idx;
         match self.get_session_info() {
             Ok(list) => {
-                self.sessions[idx].session_view_error = None;
-                list
+                let sess = &mut self.sessions[idx];
+                sess.session_view_error = None;
+                sess.session_list_cache = list;
+                sess.session_list_since = Some(std::time::Instant::now());
+                if !sess.session_list_cache.is_empty() {
+                    sess.session_view_cursor =
+                        sess.session_view_cursor.min(sess.session_list_cache.len() - 1);
+                } else {
+                    sess.session_view_cursor = 0;
+                }
+                sess.session_list_cache.clone()
             }
             Err(msg) => {
-                self.sessions[idx].session_view_error = Some(msg);
+                let sess = &mut self.sessions[idx];
+                sess.session_view_error = Some(msg);
+                sess.session_list_cache.clear();
+                sess.session_list_since = Some(std::time::Instant::now());
+                sess.session_view_cursor = 0;
                 vec![]
             }
         }
     }
 
-    /// Open the F2 session browser: reset selection/plan state and preload
-    /// the current SQL of the first row (best effort).
+    /// Cached F2 list (no DB hit). Renderers and cursor movement must use
+    /// this — never query the database from a draw call.
+    pub fn cached_session_list(&self) -> Vec<DbSessionInfo> {
+        self.sessions[self.active_idx].session_list_cache.clone()
+    }
+
+    /// Seconds since the last F2 list refresh (None = never refreshed).
+    pub fn session_list_age_secs(&self) -> Option<u64> {
+        self.sessions[self.active_idx]
+            .session_list_since
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// Whether the cached F2 list is stale and due for auto-refresh.
+    /// `session_refresh_secs == 0` disables auto-refresh (manual `R` only),
+    /// except that a never-fetched list still counts as stale.
+    pub fn session_list_stale(&self) -> bool {
+        let sess = &self.sessions[self.active_idx];
+        match sess.session_list_since {
+            None => true,
+            Some(since) => {
+                if self.session_refresh_secs == 0 {
+                    false
+                } else {
+                    since.elapsed()
+                        >= std::time::Duration::from_secs(self.session_refresh_secs)
+                }
+            }
+        }
+    }
+
+    /// TTL-guarded F2 list: returns the cache when fresh, otherwise refreshes.
+    /// Use this for cursor moves / SQL loads; renderers must use
+    /// `cached_session_list()` instead to stay side-effect free.
+    pub(crate) fn fresh_session_list(&mut self) -> Vec<DbSessionInfo> {
+        if self.session_list_stale() {
+            self.refresh_session_list()
+        } else {
+            self.cached_session_list()
+        }
+    }
+
+    /// Periodic auto-refresh for the F2 browser. Called every frame from the
+    /// TUI loop; only queries when the browser is open and the TTL expired.
+    pub fn tick_session_view(&mut self) {
+        if self.sessions[self.active_idx].mode != SessionMode::SessionView {
+            return;
+        }
+        if self.session_list_stale() {
+            self.refresh_session_list();
+        }
+    }
+
+    /// Open the F2 session browser: reset selection/plan state, force a
+    /// refresh and preload the current SQL of the first row (best effort).
     pub fn enter_session_view(&mut self) {
         let idx = self.active_idx;
         {
@@ -1865,10 +1932,13 @@ impl SessionManager {
             s.plan_hscroll = 0;
             s.session_view_error = None;
         }
+        self.refresh_session_list();
         self.load_selected_sql();
     }
 
     /// Move the F2 highlight and preload that row's SQL (best effort).
+    /// Uses the TTL-guarded list so arrow keys only refresh when the
+    /// configured interval expired — never a DB query per keypress.
     pub fn move_session_cursor(&mut self, delta: isize) {
         let len = self.fresh_session_list().len();
         if len == 0 {
@@ -1885,10 +1955,16 @@ impl SessionManager {
 
     /// Load the full SQL text of the highlighted F2 row into `plan_sql_text`.
     /// Clears any previous plan; failures surface as a status message.
+    /// Reads from the cache — call `refresh_session_list()` first when a
+    /// fresh list is required (enter / auto-refresh tick / manual `R`).
     pub fn load_selected_sql(&mut self) {
         let idx = self.active_idx;
         let cursor = self.sessions[idx].session_view_cursor;
-        let info = match self.fresh_session_list().into_iter().nth(cursor) {
+        let info = match self.sessions[idx]
+            .session_list_cache
+            .get(cursor)
+            .cloned()
+        {
             Some(info) => info,
             None => {
                 let s = &mut self.sessions[idx];
@@ -2593,17 +2669,6 @@ impl SessionManager {
         self.clamp_explorer_cursor();
     }
 
-    /// Mouse support: select a visible row; toggles when it is expandable.
-    pub fn explorer_click(&mut self, visible_idx: usize) {
-        let len = self.explorer_visible_rows().len();
-        if len == 0 {
-            return;
-        }
-        self.sessions[self.active_idx].explorer_cursor = visible_idx.min(len - 1);
-        self.sessions[self.active_idx].explorer_detail_scroll = 0;
-        self.toggle_explorer_cursor();
-    }
-
     /// Mouse support: select a visible row WITHOUT toggling expansion
     /// (used to distinguish single-click select from arrow/double-click).
     pub fn explorer_select(&mut self, visible_idx: usize) {
@@ -2616,18 +2681,22 @@ impl SessionManager {
         self.maybe_load_detail_for_cursor();
     }
 
+    /// (sidx, gidx, tidx) of the object under the cursor (tables/views, or
+    /// a column's parent table). None on folders, schemas and empty trees.
+    fn cursor_object_idx(&self) -> Option<(usize, usize, usize)> {
+        let rows = self.explorer_visible_rows();
+        match rows.get(self.sessions[self.active_idx].explorer_cursor)?.clone() {
+            ExplorerRow::Table { sidx, gidx, tidx } => Some((sidx, gidx, tidx)),
+            ExplorerRow::Column { sidx, gidx, tidx, .. } => Some((sidx, gidx, tidx)),
+            _ => None,
+        }
+    }
+
     /// Build `SELECT * FROM schema.table` for the row under the cursor
     /// (row-bearing objects, or a column's parent) and put it into the
     /// editor. Returns None for folders, code, indexes and Oracle sequences.
     pub fn explorer_sql_for_cursor(&mut self) -> Option<String> {
-        let rows = self.explorer_visible_rows();
-        let cur = self.sessions[self.active_idx].explorer_cursor;
-        let row = rows.get(cur)?.clone();
-        let (sidx, gidx, tidx) = match row {
-            ExplorerRow::Table { sidx, gidx, tidx } => (sidx, gidx, tidx),
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => (sidx, gidx, tidx),
-            _ => return None,
-        };
+        let (sidx, gidx, tidx) = self.cursor_object_idx()?;
         let sess = &self.sessions[self.active_idx];
         let schema = sess.explorer_schemas.get(sidx)?.name.clone();
         let obj = self.object_ref(sidx, gidx, tidx)?;
@@ -2690,15 +2759,8 @@ impl SessionManager {
     /// for row-bearing objects, DDL/source for the rest. Cached results are
     /// reused; at most one flight per object.
     pub fn maybe_load_detail_for_cursor(&mut self) {
-        let rows = self.explorer_visible_rows();
-        let cur = self.sessions[self.active_idx].explorer_cursor;
-        let Some(row) = rows.get(cur).cloned() else {
+        let Some((sidx, gidx, tidx)) = self.cursor_object_idx() else {
             return;
-        };
-        let (sidx, gidx, tidx) = match row {
-            ExplorerRow::Table { sidx, gidx, tidx } => (sidx, gidx, tidx),
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => (sidx, gidx, tidx),
-            _ => return,
         };
         let Some(obj) = self.object_ref(sidx, gidx, tidx) else {
             return;
@@ -2714,15 +2776,8 @@ impl SessionManager {
 
     /// Force a reload of the preview/DDL under the cursor (`d` key).
     pub fn reload_explorer_detail(&mut self) {
-        let rows = self.explorer_visible_rows();
-        let cur = self.sessions[self.active_idx].explorer_cursor;
-        let Some(row) = rows.get(cur).cloned() else {
+        let Some((sidx, gidx, tidx)) = self.cursor_object_idx() else {
             return;
-        };
-        let (sidx, gidx, tidx) = match row {
-            ExplorerRow::Table { sidx, gidx, tidx } => (sidx, gidx, tidx),
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => (sidx, gidx, tidx),
-            _ => return,
         };
         if let Some(t) = self.object_mut(sidx, gidx, tidx) {
             t.preview = None;
@@ -2771,7 +2826,6 @@ impl SessionManager {
                     columns: vec![],
                     rows: vec![],
                     truncated: false,
-                    row_count: 0,
                     elapsed_ms: 0,
                     is_error: true,
                     error_msg: Some("Not connected. Use Ctrl+O to connect.".into()),
@@ -2839,6 +2893,33 @@ impl SessionManager {
         });
     }
 
+    /// Mutable access to a cached object by (session id, schema, name,
+    /// kind). Names alone don't identify objects — a table and a function
+    /// may share one.
+    fn find_cached_object<'a>(
+        sessions: &'a mut [Session],
+        sid: usize,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> Option<&'a mut ExplorerTable> {
+        let sess = sessions.iter_mut().find(|s| s.id == sid)?;
+        for s in sess.explorer_schemas.iter_mut().filter(|s| s.name == schema) {
+            let Some(groups) = s.groups.as_mut() else {
+                continue;
+            };
+            for g in groups.iter_mut() {
+                let Some(objs) = g.objects.as_mut() else {
+                    continue;
+                };
+                if let Some(e) = objs.iter_mut().find(|o| o.name == name && o.kind == kind) {
+                    return Some(e);
+                }
+            }
+        }
+        None
+    }
+
     /// Drain finished background preview/DDL loads into the tree cache.
     /// Called every frame (like `poll_result`).
     pub fn poll_explorer(&mut self) {
@@ -2855,33 +2936,11 @@ impl SessionManager {
                     kind,
                     result,
                 } => {
-                    if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) {
-                        // Match by (schema, name, kind): a table and a
-                        // function may share a name.
-                        let mut target: Option<&mut ExplorerTable> = None;
-                        'search: for s in
-                            sess.explorer_schemas.iter_mut().filter(|s| s.name == schema)
-                        {
-                            let Some(groups) = s.groups.as_mut() else {
-                                continue;
-                            };
-                            for g in groups.iter_mut() {
-                                let Some(objs) = g.objects.as_mut() else {
-                                    continue;
-                                };
-                                if let Some(e) = objs
-                                    .iter_mut()
-                                    .find(|o| o.name == table && o.kind == kind)
-                                {
-                                    target = Some(e);
-                                    break 'search;
-                                }
-                            }
-                        }
-                        if let Some(e) = target {
-                            e.preview = Some(result);
-                            e.preview_loading = false;
-                        }
+                    if let Some(e) =
+                        Self::find_cached_object(&mut self.sessions, sid, &schema, &table, &kind)
+                    {
+                        e.preview = Some(result);
+                        e.preview_loading = false;
                     }
                 }
                 ExplorerMsg::Ddl {
@@ -2891,40 +2950,20 @@ impl SessionManager {
                     kind,
                     result,
                 } => {
-                    if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) {
-                        let mut target: Option<&mut ExplorerTable> = None;
-                        'search: for s in
-                            sess.explorer_schemas.iter_mut().filter(|s| s.name == schema)
-                        {
-                            let Some(groups) = s.groups.as_mut() else {
-                                continue;
-                            };
-                            for g in groups.iter_mut() {
-                                let Some(objs) = g.objects.as_mut() else {
-                                    continue;
-                                };
-                                if let Some(e) = objs
-                                    .iter_mut()
-                                    .find(|o| o.name == name && o.kind == kind)
-                                {
-                                    target = Some(e);
-                                    break 'search;
-                                }
+                    if let Some(e) =
+                        Self::find_cached_object(&mut self.sessions, sid, &schema, &name, &kind)
+                    {
+                        match result {
+                            Ok(text) => {
+                                e.ddl = Some(text);
+                                e.ddl_error = None;
+                            }
+                            Err(err) => {
+                                e.ddl = None;
+                                e.ddl_error = Some(explorer_error_hint(&err));
                             }
                         }
-                        if let Some(e) = target {
-                            match result {
-                                Ok(text) => {
-                                    e.ddl = Some(text);
-                                    e.ddl_error = None;
-                                }
-                                Err(err) => {
-                                    e.ddl = None;
-                                    e.ddl_error = Some(explorer_error_hint(&err));
-                                }
-                            }
-                            e.ddl_loading = false;
-                        }
+                        e.ddl_loading = false;
                     }
                 }
             }

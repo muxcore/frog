@@ -46,6 +46,7 @@ descriptor belongs to its backend (switching backend drops its host/port).\n\
 \n\
   Other:\n\
     FROG_CONFIG=~/.config/frog/prod.yml  FROG_MAX_ROWS=10000  FROG_NO_AUTOCOMMIT=true\n\
+    FROG_SESSION_REFRESH_SECS=60 (F2 auto-refresh, seconds; 0 = manual only)\n\
 \n\
   A .env file in the startup directory is read as a fallback for all of the above.\n"
 )]
@@ -81,6 +82,11 @@ pub struct CliArgs {
 
     #[arg(short = 'n', long, env = "FROG_NO_AUTOCOMMIT")]
     pub no_autocommit: bool,
+
+    /// How often the F2 session browser auto-refreshes, in seconds (default 60).
+    /// 0 disables auto-refresh (manual refresh with R).
+    #[arg(long = "session-refresh-secs", env = "FROG_SESSION_REFRESH_SECS")]
+    pub session_refresh_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,18 +114,12 @@ pub struct ConnectionEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
-    pub theme: Option<String>,
-    pub tab_size: Option<usize>,
-    pub date_format: Option<String>,
     pub null_display: Option<String>,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: Some("dark".into()),
-            tab_size: Some(4),
-            date_format: Some("%Y-%m-%d %H:%M:%S".into()),
             null_display: Some("(NULL)".into()),
         }
     }
@@ -130,6 +130,10 @@ pub struct DefaultsConfig {
     pub max_rows: Option<usize>,
     pub autocommit: Option<bool>,
     pub max_history: Option<usize>,
+    /// F2 session browser auto-refresh interval in seconds (default 60, 0 = manual only).
+    /// Accepts `session_refresh` as a YAML alias for convenience.
+    #[serde(default, alias = "session_refresh")]
+    pub session_refresh_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +143,7 @@ pub struct Config {
     pub max_rows: usize,
     pub autocommit: bool,
     pub max_history: usize,
+    pub session_refresh_secs: u64,
     pub saved_connections: Vec<ConnectionEntry>,
 }
 
@@ -245,6 +250,27 @@ impl Config {
             .and_then(|d| d.max_history)
             .unwrap_or(1000);
 
+        // F2 session browser auto-refresh interval, seconds. Default 60, 0 = manual only.
+        // Precedence: CLI flag / FROG_SESSION_REFRESH_SECS env > FROG_SESSION_REFRESH
+        // env alias > .env (either key) > config.yml defaults.session_refresh_secs
+        // (alias: session_refresh) > built-in default.
+        let session_refresh_secs = args
+            .session_refresh_secs
+            .or_else(|| env_get("FROG_SESSION_REFRESH").and_then(|s| s.trim().parse::<u64>().ok()))
+            .or_else(|| {
+                dotenv_map
+                    .get("FROG_SESSION_REFRESH_SECS")
+                    .or_else(|| dotenv_map.get("FROG_SESSION_REFRESH"))
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            })
+            .or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.defaults.as_ref())
+                    .and_then(|d| d.session_refresh_secs)
+            })
+            .unwrap_or(60);
+
         let mut saved_connections = config_file
             .as_ref()
             .and_then(|c| c.connections.clone())
@@ -257,6 +283,7 @@ impl Config {
             max_rows,
             autocommit,
             max_history,
+            session_refresh_secs,
             saved_connections,
         }
     }
@@ -433,20 +460,6 @@ impl Config {
         }
     }
 
-    /// Oracle EZCONNECT string for the startup connection (postgres callers
-    /// should use the full `ConnectionParams` instead).
-    pub fn connect_string(&self) -> String {
-        match self.connection.db_type {
-            DbType::Oracle => self.connection.oracle_connect_string(),
-            DbType::Postgres => format!(
-                "host={} port={} dbname={} user={}",
-                self.connection.host,
-                self.connection.port,
-                self.connection.database,
-                self.connection.user,
-            ),
-        }
-    }
 }
 
 /// Default postgres database: the user name, else `postgres` (psql convention).

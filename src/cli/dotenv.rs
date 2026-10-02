@@ -13,6 +13,8 @@ const ENV_KEYS: &[&str] = &[
     "FROG_CONFIG",
     "FROG_MAX_ROWS",
     "FROG_NO_AUTOCOMMIT",
+    "FROG_SESSION_REFRESH_SECS",
+    "FROG_SESSION_REFRESH",
     "FROG_DB_TYPE",
     "PGHOST",
     "PGPORT",

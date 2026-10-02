@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
     session_manager.max_history = config.max_history;
     session_manager.autocommit = config.autocommit;
     session_manager.max_rows = config.max_rows;
+    session_manager.session_refresh_secs = config.session_refresh_secs;
     session_manager.null_display = config
         .ui
         .null_display

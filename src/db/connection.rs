@@ -43,13 +43,6 @@ impl DbType {
         }
     }
 
-    /// Short label used in session names / status UI.
-    pub fn short_label(self) -> &'static str {
-        match self {
-            DbType::Oracle => "ora",
-            DbType::Postgres => "pg",
-        }
-    }
 }
 
 /// Column metadata for the F12 DB explorer tree.
@@ -103,7 +96,6 @@ pub struct QueryRow {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub truncated: bool,
-    pub row_count: usize,
     pub elapsed_ms: u64,
     pub is_error: bool,
     pub error_msg: Option<String>,
@@ -124,7 +116,6 @@ impl QueryRow {
             columns: vec![],
             rows: vec![],
             truncated: false,
-            row_count: 0,
             elapsed_ms,
             is_error: true,
             error_msg: Some(msg),
@@ -147,7 +138,6 @@ impl QueryRow {
             columns,
             rows,
             truncated,
-            row_count: total_fetched,
             elapsed_ms,
             is_error: false,
             error_msg: None,
@@ -164,7 +154,6 @@ impl QueryRow {
             columns: vec!["Result".into()],
             rows: vec![vec![text.to_string()]],
             truncated: false,
-            row_count: 1,
             elapsed_ms,
             is_error: false,
             error_msg: None,
@@ -179,6 +168,34 @@ impl QueryRow {
 
 /// (columns, rows, truncated, total_fetched, byte_count)
 pub(crate) type QueryData = (Vec<String>, Vec<Vec<String>>, bool, usize, usize);
+
+/// Assemble `CREATE TABLE <qualified> (...)` from column metadata. `quote`
+/// wraps identifiers (identity on Oracle, double quotes on Postgres).
+pub(crate) fn format_create_table(
+    qualified: &str,
+    cols: &[ColumnInfo],
+    quote: impl Fn(&str) -> String,
+) -> String {
+    let mut ddl = format!("CREATE TABLE {} (\n", qualified);
+    for (i, c) in cols.iter().enumerate() {
+        ddl.push_str(&format!(
+            "  {} {}{}",
+            quote(&c.name),
+            if c.data_type.is_empty() {
+                "?"
+            } else {
+                &c.data_type
+            },
+            if c.nullable { "" } else { " NOT NULL" }
+        ));
+        if i + 1 < cols.len() {
+            ddl.push(',');
+        }
+        ddl.push('\n');
+    }
+    ddl.push_str(");");
+    ddl
+}
 
 /// Map an Oracle error to a message, collapsing user cancellations.
 fn clean_error(e: &oracle::Error) -> String {
@@ -324,7 +341,6 @@ impl OracleConnection {
                     elapsed(),
                     max_rows,
                 );
-                row.row_count = affected as usize;
                 row.rows_affected = Some(affected);
                 row
             }
@@ -466,8 +482,8 @@ impl OracleConnection {
 
     pub fn query_v_session(&self) -> Result<Vec<DbSessionInfo>, anyhow::Error> {
         let sql = r#"
-            SELECT s.sid, s.serial#, s.username, s.status, s.osuser,
-                   s.machine, s.program, s.sql_id, s.prev_sql_id,
+            SELECT s.sid, s.serial#, s.username, s.status,
+                   s.machine, s.program, s.sql_id,
                    TO_CHAR(s.logon_time, 'YYYY-MM-DD HH24:MI:SS') AS logon_time
             FROM v$session s
             WHERE s.type != 'BACKGROUND'
@@ -485,11 +501,9 @@ impl OracleConnection {
                 serial: row.get("SERIAL#").unwrap_or(0),
                 username: row.get("USERNAME").unwrap_or_default(),
                 status: row.get("STATUS").unwrap_or_default(),
-                osuser: row.get("OSUSER").unwrap_or_default(),
                 machine: row.get("MACHINE").unwrap_or_default(),
                 program: row.get("PROGRAM").unwrap_or_default(),
                 sql_id: row.get("SQL_ID").unwrap_or_default(),
-                prev_sql_id: row.get("PREV_SQL_ID").unwrap_or_default(),
                 logon_time: row.get("LOGON_TIME").unwrap_or_default(),
             });
         }
@@ -720,21 +734,11 @@ impl OracleConnection {
                         name
                     ));
                 }
-                let mut ddl = format!("CREATE TABLE {}.{} (\n", schema, name);
-                for (i, c) in cols.iter().enumerate() {
-                    ddl.push_str(&format!(
-                        "  {} {}{}",
-                        c.name,
-                        c.data_type,
-                        if c.nullable { "" } else { " NOT NULL" }
-                    ));
-                    if i + 1 < cols.len() {
-                        ddl.push(',');
-                    }
-                    ddl.push('\n');
-                }
-                ddl.push_str(");");
-                Ok(ddl)
+                Ok(format_create_table(
+                    &format!("{}.{}", schema, name),
+                    &cols,
+                    |s| s.to_string(),
+                ))
             }
             "VIEW" => {
                 let sql =
@@ -1094,11 +1098,9 @@ pub struct DbSessionInfo {
     pub serial: i32,
     pub username: String,
     pub status: String,
-    pub osuser: String,
     pub machine: String,
     pub program: String,
     pub sql_id: String,
-    pub prev_sql_id: String,
     pub logon_time: String,
 }
 

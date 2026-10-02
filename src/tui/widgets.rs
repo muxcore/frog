@@ -95,7 +95,6 @@ pub fn render_status_bar(
 ) {
     let mode_str = match session.mode {
         SessionMode::Query => "[QUERY]",
-        SessionMode::Results => "[RESULTS]",
         SessionMode::SessionView => "[SESSIONS]",
         SessionMode::Help => "[HELP]",
         SessionMode::History => "[HISTORY]",
@@ -209,7 +208,7 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else {
-        " SQL Editor (Ctrl+Enter: run stmt | F5: run script | Ctrl+:: run @file | Ctrl+/-: resize) "
+        " SQL Editor (Ctrl+Enter/F9: run stmt | F5: run script | Ctrl+:: run @file | Ctrl+/-: resize) "
     };
 
     let block = Block::default()
@@ -381,36 +380,21 @@ pub fn render_table(
 
         match result_format {
             ResultFormat::Markdown => {
-                let total_cols = qr.columns.len();
-                let start_col = col_scroll_offset.min(total_cols.saturating_sub(1));
-                let end_col = (start_col + 10).min(total_cols);
-                let visible_cols = &qr.columns[start_col..end_col];
+                let range = visible_col_range(qr.columns.len(), col_scroll_offset);
+                let visible_cols = &qr.columns[range.clone()];
 
                 // Apply vertical scroll (rows) just like Table mode.
                 let avail_height = area.height.saturating_sub(3) as usize;
-                let rows: Vec<&Vec<String>> = qr
+                let rows: Vec<&[String]> = qr
                     .rows
                     .iter()
                     .skip(scroll_offset)
                     .take(avail_height)
+                    .map(|r| &r[range.clone()])
                     .collect();
 
-                let mut md_text = String::new();
-                md_text.push_str("| ");
-                md_text.push_str(&visible_cols.join(" | "));
-                md_text.push_str(" |\n|");
-                for _ in visible_cols {
-                    md_text.push_str("---|");
-                }
-                md_text.push('\n');
                 let visible_rows = rows.len();
-                for row in &rows {
-                    let visible_row: Vec<&str> =
-                        row[start_col..end_col].iter().map(|s| s.as_str()).collect();
-                    md_text.push_str("| ");
-                    md_text.push_str(&visible_row.join(" | "));
-                    md_text.push_str(" |\n");
-                }
+                let md_text = markdown_table(visible_cols, &rows);
                 let p = Paragraph::new(md_text)
                     .style(Style::default().fg(Color::White))
                     .block(
@@ -428,8 +412,7 @@ pub fn render_table(
                 return;
             }
             ResultFormat::Ascii => {
-                let total_cols = qr.columns.len();
-                let start_col = col_scroll_offset.min(total_cols.saturating_sub(1));
+                let start_col = visible_col_range(qr.columns.len(), col_scroll_offset).start;
                 let avail_height = area.height.saturating_sub(3) as usize;
                 let ascii_text = format_ascii_table(qr, start_col, scroll_offset, avail_height);
                 let p = Paragraph::new(ascii_text)
@@ -470,14 +453,9 @@ pub fn render_table(
         }
 
         let total_cols = qr.columns.len();
-        let start_col = col_scroll_offset.min(total_cols.saturating_sub(1));
-        let visible_cols: Vec<String> = qr
-            .columns
-            .iter()
-            .skip(start_col)
-            .take(10)
-            .cloned()
-            .collect();
+        let range = visible_col_range(total_cols, col_scroll_offset);
+        let start_col = range.start;
+        let visible_cols: Vec<String> = qr.columns[range].to_vec();
 
         let header = Row::new(visible_cols.clone())
             .style(
@@ -574,6 +552,32 @@ pub fn render_table(
     }
 }
 
+/// Column window for the 10-wide horizontal viewport shared by the
+/// Table/Markdown/ASCII result formats.
+fn visible_col_range(total_cols: usize, start_col: usize) -> std::ops::Range<usize> {
+    let start = start_col.min(total_cols.saturating_sub(1));
+    start..(start + 10).min(total_cols)
+}
+
+/// Markdown table over a column window + row slices. Shared by the Markdown
+/// result format (windowed) and Ctrl+Y clipboard export (full range).
+pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
+    let mut md = String::new();
+    md.push_str("| ");
+    md.push_str(&columns.join(" | "));
+    md.push_str(" |\n|");
+    for _ in columns {
+        md.push_str("---|");
+    }
+    md.push('\n');
+    for row in rows {
+        md.push_str("| ");
+        md.push_str(&row.join(" | "));
+        md.push_str(" |\n");
+    }
+    md
+}
+
 /// Format a result page as an ASCII table using display width (so wide /
 /// multibyte characters align correctly).
 pub fn format_ascii_table(
@@ -586,10 +590,7 @@ pub fn format_ascii_table(
         return "No data to display".to_string();
     }
 
-    let num_cols = qr.columns.len();
-    let start = start_col.min(num_cols.saturating_sub(1));
-    let end = (start + 10).min(num_cols);
-    let visible_range = start..end;
+    let visible_range = visible_col_range(qr.columns.len(), start_col);
 
     let mut col_widths = Vec::new();
     for i in visible_range.clone() {
@@ -679,14 +680,25 @@ fn format_bytes(bytes: usize) -> String {
 
 pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rect) {
     let db_type = sm.active_db_type();
-    let db_sessions = sm.fresh_session_list();
+    // Render from the cache — never hit the DB from a draw call. The list is
+    // refreshed on open, automatically every `session_refresh_secs` (via
+    // `tick_session_view()` in the main loop) and manually with `R`.
+    let db_sessions = sm.cached_session_list();
+    let refresh_secs = sm.session_refresh_secs;
+    let age_secs = sm.session_list_age_secs();
+    let refresh_label = match (refresh_secs, age_secs) {
+        (0, Some(age)) => format!("manual (R) · {}s ago", age),
+        (0, None) => "manual (R)".to_string(),
+        (secs, Some(age)) => format!("auto {}s · {}s ago · R refresh", secs, age),
+        (secs, None) => format!("auto {}s · R refresh", secs),
+    };
     let sess = sm.active_session();
     let cursor = sess
         .session_view_cursor
         .min(db_sessions.len().saturating_sub(1));
-    let (title, headers): (&str, Vec<&str>) = match db_type {
+    let (title_base, headers): (&str, Vec<&str>) = match db_type {
         DbType::Oracle => (
-            " v$session — ↑/↓ pick · Enter explain · Esc back ",
+            "v$session",
             vec![
                 "SID",
                 "Serial#",
@@ -699,7 +711,7 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             ],
         ),
         DbType::Postgres => (
-            " pg_stat_activity — ↑/↓ pick · Enter explain · Esc back ",
+            "pg_stat_activity",
             vec![
                 "PID",
                 "—",
@@ -712,6 +724,10 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             ],
         ),
     };
+    let title = format!(
+        " {} — ↑/↓ pick · Enter explain · r sql · R refresh · Esc back · {} ",
+        title_base, refresh_label
+    );
     let header = Row::new(headers)
     .style(
         Style::default()
@@ -728,14 +744,14 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
     // Empty list: show why (privileges / not connected) instead of a bare
     // table — an unexplained empty F2 looks like "no sessions".
     if db_sessions.is_empty() {
-        let (title, body, style) = match &sess.session_view_error {
+        let (err_title, body, style) = match &sess.session_view_error {
             Some(err) => (
-                " Sessions — error (press r to retry, Esc to go back) ",
+                format!(" Sessions — error ({} · press R to retry, Esc to go back) ", refresh_label),
                 err.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             None => (
-                " Sessions ",
+                format!(" Sessions — {} ", refresh_label),
                 "No other sessions found.".to_string(),
                 Style::default().fg(Color::DarkGray),
             ),
@@ -745,7 +761,7 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             .style(style)
             .block(
                 Block::default()
-                    .title(title)
+                    .title(err_title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Red)),
             );
@@ -821,7 +837,7 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
         .split(panes[1]);
 
     let sql_title = match &sess.plan_for {
-        Some(who) => format!(" Current SQL — session {} (r: reload) ", who),
+        Some(who) => format!(" Current SQL — session {} (r: reload sql) ", who),
         None => " Current SQL ".to_string(),
     };
     let sql_text = sess
@@ -938,7 +954,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             " ─ SQL Execution ─ ",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+Enter / Alt+Enter / F9  Execute statement under cursor"),
+        Line::from("  Ctrl+Enter / Alt+Enter / F8 / F9  Execute statement under cursor"),
         Line::from("  F5 / Ctrl+R         Execute all statements as script"),
         Line::from("  Ctrl+:              Command bar (e.g. @file.sql, @@inc, clear)"),
         Line::from("  Ctrl+C / Esc          Cancel running query"),

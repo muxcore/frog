@@ -1,5 +1,5 @@
 use super::connection::{
-    ColumnInfo, DbConnection, DbSessionInfo, DbType, QueryData, QueryRow,
+    ColumnInfo, DbConnection, DbSessionInfo, DbType, QueryData, QueryRow, format_create_table,
 };
 use std::sync::{Arc, Mutex};
 
@@ -188,7 +188,6 @@ impl PgConnection {
                         elapsed(),
                         max_rows,
                     );
-                    row.row_count = completed as usize;
                     row.rows_affected = Some(completed);
                     row
                 } else {
@@ -482,28 +481,19 @@ impl PgConnection {
                         name
                     ));
                 }
-                let mut ddl = format!(
-                    "CREATE TABLE {}.{} (\n",
-                    pg_quote_ident(schema),
-                    pg_quote_ident(name)
-                );
-                for (i, row) in rows.iter().enumerate() {
-                    let cn: String = row.try_get(0).unwrap_or_default();
-                    let ct: String = row.try_get(1).unwrap_or_default();
-                    let nu: bool = row.try_get(2).unwrap_or(true);
-                    ddl.push_str(&format!(
-                        "  {} {}{}",
-                        pg_quote_ident(&cn),
-                        if ct.is_empty() { "?" } else { &ct },
-                        if nu { "" } else { " NOT NULL" }
-                    ));
-                    if i + 1 < rows.len() {
-                        ddl.push(',');
-                    }
-                    ddl.push('\n');
-                }
-                ddl.push_str(");");
-                Ok(ddl)
+                let cols: Vec<ColumnInfo> = rows
+                    .iter()
+                    .map(|row| ColumnInfo {
+                        name: row.try_get(0).unwrap_or_default(),
+                        data_type: row.try_get(1).unwrap_or_default(),
+                        nullable: row.try_get(2).unwrap_or(true),
+                    })
+                    .collect();
+                Ok(format_create_table(
+                    &format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(name)),
+                    &cols,
+                    pg_quote_ident,
+                ))
             }
             "INDEX" => {
                 let stmt = client
@@ -760,11 +750,9 @@ impl DbConnection for PgConnection {
                 serial: 0,
                 username,
                 status: if state.is_empty() { "?".into() } else { state },
-                osuser: client_addr.clone(),
                 machine: client_addr,
                 program: app,
                 sql_id: short_query,
-                prev_sql_id: String::new(),
                 logon_time: started,
             });
         }

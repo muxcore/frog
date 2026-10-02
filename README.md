@@ -155,7 +155,7 @@ PGPASSWORD=tiger
 # (DATABASE_URL works as a fallback for ORACLE_CONNECT)
 ```
 
-Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
+Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` accepted as an alias), `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
 
 > **Dialog shows defaults?** The `.env` is read from the directory frog is *started* in — a `.env` elsewhere is ignored. If nothing configures the connection, frog prints `no connection settings from CLI flags, env vars or ./.env …` at startup and `frog --help` lists every variable it understands.
 
@@ -188,7 +188,7 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Ctrl+F` | Fetch next page of results |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter` = explain plan) / History |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list) / History |
 | `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), 20-row preview in result style (`Ctrl+D` switches format), DDL/source |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
@@ -235,16 +235,15 @@ defaults:
   max_rows: 10000
   autocommit: true
   max_history: 1000
+  session_refresh_secs: 60  # F2 auto-refresh interval, seconds; 0 = manual (R) only
 ui:
-  tab_size: 4
-  date_format: "%Y-%m-%d %H:%M:%S"
   null_display: "(NULL)"
 ```
 
 ## Backend notes
 
 - **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET` — `Ctrl+F` fetches more on both.
-- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads, `PgUp`/`PgDn` scroll the plan.
+- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `PgUp`/`PgDn` scroll the plan. Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
 - **F2 privileges (Oracle)**: the browser needs dictionary access. If F2 shows an error about it, ask your DBA for e.g.:
   ```sql
   GRANT SELECT_CATALOG_ROLE TO scott;

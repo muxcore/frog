@@ -37,6 +37,17 @@ pub enum ResultFormat {
     Ascii,
 }
 
+impl ResultFormat {
+    /// Table → Markdown → ASCII → Table…
+    pub fn cycle(self) -> Self {
+        match self {
+            ResultFormat::Table => ResultFormat::Markdown,
+            ResultFormat::Markdown => ResultFormat::Ascii,
+            ResultFormat::Ascii => ResultFormat::Table,
+        }
+    }
+}
+
 pub struct App {
     config: Config,
     session_manager: SessionManager,
@@ -172,6 +183,7 @@ impl App {
             self.session_manager.poll_conn_result();
             self.session_manager.check_connections();
             self.session_manager.tick_statuses();
+            self.session_manager.tick_session_view();
 
             terminal.draw(|f| self.ui(f))?;
 
@@ -454,18 +466,12 @@ impl App {
                     let mut text = String::new();
                     match self.result_format {
                         ResultFormat::Markdown => {
-                            text.push_str("| ");
-                            text.push_str(&last_res.columns.join(" | "));
-                            text.push_str(" |\n|");
-                            for _ in &last_res.columns {
-                                text.push_str("---|");
-                            }
-                            text.push('\n');
-                            for row in &last_res.rows {
-                                text.push_str("| ");
-                                text.push_str(&row.join(" | "));
-                                text.push_str(" |\n");
-                            }
+                            let refs: Vec<&[String]> = last_res
+                                .rows
+                                .iter()
+                                .map(|r| r.as_slice())
+                                .collect();
+                            text.push_str(&markdown_table(&last_res.columns, &refs));
                         }
                         ResultFormat::Ascii => {
                             text.push_str(&format_ascii_table(
@@ -504,11 +510,7 @@ impl App {
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
-                self.result_format = match self.result_format {
-                    ResultFormat::Table => ResultFormat::Markdown,
-                    ResultFormat::Markdown => ResultFormat::Ascii,
-                    ResultFormat::Ascii => ResultFormat::Table,
-                };
+                self.result_format = self.result_format.cycle();
                 return;
             }
             (KeyModifiers::NONE, KeyCode::Tab) | (KeyModifiers::SHIFT, KeyCode::BackTab) => {
@@ -649,8 +651,7 @@ impl App {
                     }
                 }
             },
-            SessionMode::Results
-            | SessionMode::SessionView
+            SessionMode::SessionView
             | SessionMode::Help
             | SessionMode::History
             | SessionMode::DbExplorer
@@ -792,7 +793,17 @@ impl App {
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
                 self.session_manager.explain_selected();
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
+            KeyCode::Char('r') => {
+                self.session_manager.load_selected_sql();
+            }
+            KeyCode::Char('R') => {
+                // Manual list refresh (auto-refresh interval is configurable,
+                // see --session-refresh-secs / FROG_SESSION_REFRESH_SECS).
+                self.session_manager.refresh_session_list();
+                self.session_manager.load_selected_sql();
+            }
+            KeyCode::F(5) => {
+                self.session_manager.refresh_session_list();
                 self.session_manager.load_selected_sql();
             }
             KeyCode::PageUp => {
@@ -830,11 +841,7 @@ impl App {
         // Same result style switch as the main viewer: the explorer preview
         // is rendered with the shared result viewer.
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
-            self.result_format = match self.result_format {
-                ResultFormat::Table => ResultFormat::Markdown,
-                ResultFormat::Markdown => ResultFormat::Ascii,
-                ResultFormat::Ascii => ResultFormat::Table,
-            };
+            self.result_format = self.result_format.cycle();
             return;
         }
         // Filter input captures most keystrokes until Enter/Esc.
