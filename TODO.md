@@ -26,19 +26,23 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 
 | Key | Action |
 |---|---|
-| `Ctrl+Enter` | Execute statement at cursor |
-| `F5` | Run all statements as script |
+| `Ctrl+Enter` / `Alt+Enter` / `Ctrl+J` / `F8` / `F9` | Execute statement at cursor |
+| `F5` / `Ctrl+R` | Run all statements as script |
 | `Ctrl+:` | Command bar (e.g. `@file.sql`, `@@inc.sql`, `clear`, `cls`) |
 | `Tab` | Cycle focus: Editor / Results / Sidebar |
-| `Ctrl+M` | Maximize/restore focused panel |
+| `Ctrl+Z` / `F11` | Maximize/restore focused panel |
 | `Ctrl+B` | Toggle sidebar |
+| `Alt+Up` / `Alt+Down` | Grow / shrink SQL editor height |
 | `Ctrl+Y` | Copy results to clipboard |
-| `Ctrl+D` | Toggle Markdown table format |
+| `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
+| `Ctrl+F` | Fetch next page of results |
 | `Ctrl+O` | Connection dialog |
-| `Ctrl+C` | Cancel query |
-| `Ctrl+T/W` | New / close session tab |
-| `Ctrl+Left/Right` | Switch session tabs |
-| `F1/F2/F3` | Help / v$session / History |
+| `Ctrl+C` / `Esc` | Cancel running query |
+| `Ctrl+T` / `Ctrl+W` | New / close session tab |
+| `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction) / History |
+| `F12` | DB explorer |
+| `Ctrl+M` | Toggle mouse capture |
 | `Ctrl+Q` | Quit |
 | Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results |
 

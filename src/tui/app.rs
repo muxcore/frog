@@ -796,6 +796,19 @@ impl App {
             KeyCode::Char('r') => {
                 self.session_manager.load_selected_sql();
             }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // ACTIVE-only filter toggle (a again shows all).
+                self.session_manager.toggle_session_active_filter();
+            }
+            KeyCode::Char('s') => {
+                // Cycle sort column: 1st press sorts by 1st column,
+                // 2nd press by 2nd column, … then back to DB order.
+                self.session_manager.cycle_session_sort();
+            }
+            KeyCode::Char('S') => {
+                // Toggle sort direction for the current sort column.
+                self.session_manager.toggle_session_sort_dir();
+            }
             KeyCode::Char('R') => {
                 // Manual list refresh (auto-refresh interval is configurable,
                 // see --session-refresh-secs / FROG_SESSION_REFRESH_SECS).

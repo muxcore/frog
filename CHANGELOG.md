@@ -2,6 +2,21 @@
 
 All notable changes to frog are documented here.
 
+## [0.4.0] - 2026-10-05
+
+### Added
+- F2 session browser: `a` toggles the ACTIVE-only filter (press again to
+  show all), `s` cycles the sort column across all 8 visible columns
+  (then back to DB order), `S` toggles sort direction. The header shows
+  ▲/▼ on the sorted column and the title bar shows filter/sort state.
+
+### Docs
+- Keybinding docs synced for consistency across README, in-app help
+  (F1), editor title and session browser title: execute statement is
+  `Ctrl+Enter / Alt+Enter / Ctrl+J / F8 / F9`, run script is
+  `F5 / Ctrl+R`, `Ctrl+D` cycles Table → Markdown → ASCII, session
+  browser lists `Enter`/`e`, `r`, `R`/`F5`, `a`, `s`/`S` everywhere.
+
 ## [0.3.1] - 2026-10-02
 
 ### Added

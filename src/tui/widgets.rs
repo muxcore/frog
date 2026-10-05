@@ -208,7 +208,7 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else {
-        " SQL Editor (Ctrl+Enter/F9: run stmt | F5: run script | Ctrl+:: run @file | Ctrl+/-: resize) "
+        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Alt+Up/Down: resize) "
     };
 
     let block = Block::default()
@@ -680,10 +680,11 @@ fn format_bytes(bytes: usize) -> String {
 
 pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rect) {
     let db_type = sm.active_db_type();
-    // Render from the cache — never hit the DB from a draw call. The list is
-    // refreshed on open, automatically every `session_refresh_secs` (via
-    // `tick_session_view()` in the main loop) and manually with `R`.
-    let db_sessions = sm.cached_session_list();
+    // Render from the visible (filtered/sorted) list — never hit the DB from
+    // a draw call. The list is refreshed on open, automatically every
+    // `session_refresh_secs` (via `tick_session_view()` in the main loop)
+    // and manually with `R`.
+    let db_sessions = sm.visible_session_list();
     let refresh_secs = sm.session_refresh_secs;
     let age_secs = sm.session_list_age_secs();
     let refresh_label = match (refresh_secs, age_secs) {
@@ -696,6 +697,12 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
     let cursor = sess
         .session_view_cursor
         .min(db_sessions.len().saturating_sub(1));
+    let (active_only, sort_col, sort_desc) = (
+        sess.session_view_active_only,
+        sess.session_view_sort_col,
+        sess.session_view_sort_desc,
+    );
+    let total_cached = sess.session_list_cache.len();
     let (title_base, headers): (&str, Vec<&str>) = match db_type {
         DbType::Oracle => (
             "v$session",
@@ -724,11 +731,35 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             ],
         ),
     };
+    let filter_label = if active_only {
+        format!("ACTIVE only [{}/{}] (a: all)", db_sessions.len(), total_cached)
+    } else {
+        "all (a: ACTIVE)".to_string()
+    };
+    let sort_label = match sort_col {
+        None => "unsorted (s: sort)".to_string(),
+        Some(c) => {
+            let name = headers.get(c).copied().unwrap_or("?");
+            let arrow = if sort_desc { "▼" } else { "▲" };
+            format!("{}{} (s: next, S: dir)", name, arrow)
+        }
+    };
     let title = format!(
-        " {} — ↑/↓ pick · Enter explain · r sql · R refresh · Esc back · {} ",
-        title_base, refresh_label
+        " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {} ",
+        title_base, filter_label, sort_label, refresh_label
     );
-    let header = Row::new(headers)
+    let header_cells: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            if Some(i) == sort_col {
+                format!("{}{}", h, if sort_desc { "▼" } else { "▲" })
+            } else {
+                h.to_string()
+            }
+        })
+        .collect();
+    let header = Row::new(header_cells)
     .style(
         Style::default()
             .bg(Color::Rgb(40, 40, 60))
@@ -741,14 +772,22 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
         .constraints([Constraint::Percentage(45), Constraint::Min(8)])
         .split(area);
 
-    // Empty list: show why (privileges / not connected) instead of a bare
-    // table — an unexplained empty F2 looks like "no sessions".
+    // Empty list: show why (privileges / not connected / ACTIVE filter)
+    // instead of a bare table — an unexplained empty F2 looks like "no sessions".
     if db_sessions.is_empty() {
         let (err_title, body, style) = match &sess.session_view_error {
             Some(err) => (
                 format!(" Sessions — error ({} · press R to retry, Esc to go back) ", refresh_label),
                 err.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            None if active_only && total_cached > 0 => (
+                format!(" Sessions — {} ", refresh_label),
+                format!(
+                    "No ACTIVE sessions ({} total, press a to show all).",
+                    total_cached
+                ),
+                Style::default().fg(Color::DarkGray),
             ),
             None => (
                 format!(" Sessions — {} ", refresh_label),
@@ -954,7 +993,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             " ─ SQL Execution ─ ",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+Enter / Alt+Enter / F8 / F9  Execute statement under cursor"),
+        Line::from("  Ctrl+Enter / Alt+Enter / Ctrl+J / F8 / F9  Execute statement under cursor"),
         Line::from("  F5 / Ctrl+R         Execute all statements as script"),
         Line::from("  Ctrl+:              Command bar (e.g. @file.sql, @@inc, clear)"),
         Line::from("  Ctrl+C / Esc          Cancel running query"),
@@ -986,7 +1025,8 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         )),
         Line::from("  Ctrl+O              Open connection dialog (Type/Host/Port/Service|DB/User/Password)"),
         Line::from("  F1                  This help screen"),
-        Line::from("  F2                  Session browser — pick a session, Enter shows EXPLAIN plan"),
+        Line::from("  F2                  Session browser — pick a session, Enter/e shows EXPLAIN plan"),
+        Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
         Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),

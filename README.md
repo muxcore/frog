@@ -16,7 +16,7 @@ Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
 - **SQL history** — persisted to `frog_history.txt` next to the binary and browsable in-app.
 - **Oracle + Postgres** — pick the backend with `--db-type` or the `Type:` row in the connection dialog (`Ctrl+O`). Postgres needs no client libraries.
-- **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style).
+- **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style). `a` filters ACTIVE sessions only, `s`/`S` sorts columns.
 - **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
 
 ![Demo GIF](multimedia/demo.gif)
@@ -175,20 +175,20 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 
 | Key | Action |
 |---|---|
-| `Ctrl+Enter` / `Alt+Enter` | Execute statement at cursor |
-| `F5` | Run all statements as script |
+| `Ctrl+Enter` / `Alt+Enter` / `Ctrl+J` / `F8` / `F9` | Execute statement at cursor |
+| `F5` / `Ctrl+R` | Run all statements as script |
 | `Ctrl+:` | Open command bar (`@file.sql` runs a script, `clear`/`cls` clears results) |
 | `Tab` | Cycle focus: Editor / Results / Sidebar |
 | `Ctrl+Z` / `F11` | Maximize/restore focused panel |
 | `Ctrl+B` | Toggle sidebar |
 | `Ctrl+Y` | Copy results to clipboard |
-| `Ctrl+D` | Toggle Markdown table format |
+| `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+F` | Fetch next page of results |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list) / History |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction) / History |
 | `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), 20-row preview in result style (`Ctrl+D` switches format), DDL/source |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
@@ -243,7 +243,7 @@ ui:
 ## Backend notes
 
 - **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET` — `Ctrl+F` fetches more on both.
-- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `PgUp`/`PgDn` scroll the plan. Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
+- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `a` toggles the ACTIVE-only filter, `s` cycles the sort column, `S` toggles sort direction, `PgUp`/`PgDn` scroll the plan. Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
 - **F2 privileges (Oracle)**: the browser needs dictionary access. If F2 shows an error about it, ask your DBA for e.g.:
   ```sql
   GRANT SELECT_CATALOG_ROLE TO scott;

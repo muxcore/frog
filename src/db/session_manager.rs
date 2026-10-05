@@ -625,6 +625,12 @@ pub struct Session {
     pub exec_lock: Arc<Mutex<()>>,
     /// F2 browser: index of the highlighted session row.
     pub session_view_cursor: usize,
+    /// F2 browser: when true, only ACTIVE sessions are shown (`a` toggles).
+    pub session_view_active_only: bool,
+    /// F2 browser: sorted column index (0..SESSION_VIEW_COL_COUNT), None = DB order (`s` cycles).
+    pub session_view_sort_col: Option<usize>,
+    /// F2 browser: sort direction for `session_view_sort_col` (`S` toggles).
+    pub session_view_sort_desc: bool,
     /// Full SQL text of the highlighted F2 row (loaded on demand).
     pub plan_sql_text: Option<String>,
     /// Which session `plan_sql_text`/`plan_result` belong to (`"<sid> <user>"`).
@@ -1149,6 +1155,9 @@ impl Session {
             job_seq: 0,
             exec_lock: Arc::new(Mutex::new(())),
             session_view_cursor: 0,
+            session_view_active_only: false,
+            session_view_sort_col: None,
+            session_view_sort_desc: false,
             plan_sql_text: None,
             plan_for: None,
             plan_result: None,
@@ -1834,6 +1843,184 @@ impl SessionManager {
         }
     }
 
+    /// Number of visible columns in the F2 session browser (shared by
+    /// Oracle + Postgres layouts, so `s` cycling is stable across backends).
+    pub const SESSION_VIEW_COL_COUNT: usize = 8;
+
+    /// Whether a session row counts as ACTIVE (Oracle `ACTIVE` / Postgres
+    /// `active`, case-insensitive).
+    pub fn session_info_is_active(info: &DbSessionInfo) -> bool {
+        info.status.eq_ignore_ascii_case("active")
+    }
+
+    /// Short header label for a session-browser sort column (Oracle naming;
+    /// Postgres maps to the same positions).
+    pub fn session_view_col_label(col: usize) -> &'static str {
+        match col {
+            0 => "SID",
+            1 => "Serial#",
+            2 => "User",
+            3 => "Status",
+            4 => "Machine",
+            5 => "Program",
+            6 => "SQL_ID",
+            7 => "Logon Time",
+            _ => "?",
+        }
+    }
+
+    fn compare_session_info(a: &DbSessionInfo, b: &DbSessionInfo, col: usize) -> std::cmp::Ordering {
+        match col {
+            0 => a.sid.cmp(&b.sid),
+            1 => a.serial.cmp(&b.serial),
+            2 => a
+                .username
+                .to_lowercase()
+                .cmp(&b.username.to_lowercase())
+                .then_with(|| a.username.cmp(&b.username)),
+            3 => a
+                .status
+                .to_lowercase()
+                .cmp(&b.status.to_lowercase())
+                .then_with(|| a.status.cmp(&b.status)),
+            4 => a
+                .machine
+                .to_lowercase()
+                .cmp(&b.machine.to_lowercase())
+                .then_with(|| a.machine.cmp(&b.machine)),
+            5 => a
+                .program
+                .to_lowercase()
+                .cmp(&b.program.to_lowercase())
+                .then_with(|| a.program.cmp(&b.program)),
+            6 => a
+                .sql_id
+                .to_lowercase()
+                .cmp(&b.sql_id.to_lowercase())
+                .then_with(|| a.sql_id.cmp(&b.sql_id)),
+            7 => a.logon_time.cmp(&b.logon_time),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Apply the active session's F2 filter + sort to a raw list.
+    fn apply_session_view(&self, idx: usize, mut list: Vec<DbSessionInfo>) -> Vec<DbSessionInfo> {
+        let sess = &self.sessions[idx];
+        if sess.session_view_active_only {
+            list.retain(Self::session_info_is_active);
+        }
+        if let Some(col) = sess.session_view_sort_col {
+            let desc = sess.session_view_sort_desc;
+            list.sort_by(|a, b| {
+                let ord = Self::compare_session_info(a, b, col);
+                if desc { ord.reverse() } else { ord }
+            });
+        }
+        list
+    }
+
+    /// Clamp the F2 cursor into the visible (filtered/sorted) list.
+    fn clamp_session_cursor(&mut self, idx: usize) {
+        let visible_len = self.visible_session_list_len(idx);
+        let sess = &mut self.sessions[idx];
+        if visible_len == 0 {
+            sess.session_view_cursor = 0;
+        } else {
+            sess.session_view_cursor = sess.session_view_cursor.min(visible_len - 1);
+        }
+    }
+
+    fn visible_session_list_len(&self, idx: usize) -> usize {
+        let sess = &self.sessions[idx];
+        let mut len = 0;
+        for info in &sess.session_list_cache {
+            if sess.session_view_active_only && !Self::session_info_is_active(info) {
+                continue;
+            }
+            len += 1;
+        }
+        len
+    }
+
+    /// Toggle the ACTIVE-only filter (`a`). Resets the cursor + reloads SQL.
+    pub fn toggle_session_active_filter(&mut self) {
+        let idx = self.active_idx;
+        {
+            let sess = &mut self.sessions[idx];
+            sess.session_view_active_only = !sess.session_view_active_only;
+            sess.session_view_cursor = 0;
+            let msg = if sess.session_view_active_only {
+                "Session browser: showing ACTIVE sessions only (a to show all)"
+            } else {
+                "Session browser: showing all sessions"
+            };
+            sess.set_status(msg);
+        }
+        self.clamp_session_cursor(idx);
+        self.load_selected_sql();
+    }
+
+    /// Cycle the sort column (`s`): col0 → col1 → … → last → unsorted → col0…
+    /// Each step sorts ascending; `S` toggles the direction.
+    pub fn cycle_session_sort(&mut self) {
+        let idx = self.active_idx;
+        {
+            let sess = &mut self.sessions[idx];
+            sess.session_view_sort_col = match sess.session_view_sort_col {
+                None => Some(0),
+                Some(c) if c + 1 < Self::SESSION_VIEW_COL_COUNT => Some(c + 1),
+                Some(_) => None,
+            };
+            sess.session_view_sort_desc = false;
+            sess.session_view_cursor = 0;
+            let msg = match sess.session_view_sort_col {
+                None => "Session browser: cleared sorting (DB order)".to_string(),
+                Some(c) => format!(
+                    "Session browser: sorted by {} ▲ (s: next col, S: direction)",
+                    Self::session_view_col_label(c)
+                ),
+            };
+            sess.set_status(msg);
+        }
+        self.clamp_session_cursor(idx);
+        self.load_selected_sql();
+    }
+
+    /// Toggle sort direction (`S`). No-op message when nothing is sorted.
+    pub fn toggle_session_sort_dir(&mut self) {
+        let idx = self.active_idx;
+        {
+            let sess = &mut self.sessions[idx];
+            match sess.session_view_sort_col {
+                None => {
+                    sess.session_view_sort_col = Some(0);
+                    sess.session_view_sort_desc = false;
+                    sess.session_view_cursor = 0;
+                    sess.set_status(format!(
+                        "Session browser: sorted by {} ▲ (s: next col, S: direction)",
+                        Self::session_view_col_label(0)
+                    ));
+                }
+                Some(c) => {
+                    sess.session_view_sort_desc = !sess.session_view_sort_desc;
+                    sess.session_view_cursor = 0;
+                    let arrow = if sess.session_view_sort_desc {
+                        "▼"
+                    } else {
+                        "▲"
+                    };
+                    sess.set_status(format!(
+                        "Session browser: sorted by {} {} (s: next col, S: direction)",
+                        Self::session_view_col_label(c),
+                        arrow
+                    ));
+                }
+            }
+        }
+        self.clamp_session_cursor(idx);
+        self.load_selected_sql();
+    }
+
     /// Refresh the F2 list, recording any failure on the active session so
     /// the browser can show it (e.g. missing dictionary privileges).
     /// Updates the cache + timestamp and clamps the cursor into range.
@@ -1841,17 +2028,14 @@ impl SessionManager {
         let idx = self.active_idx;
         match self.get_session_info() {
             Ok(list) => {
-                let sess = &mut self.sessions[idx];
-                sess.session_view_error = None;
-                sess.session_list_cache = list;
-                sess.session_list_since = Some(std::time::Instant::now());
-                if !sess.session_list_cache.is_empty() {
-                    sess.session_view_cursor =
-                        sess.session_view_cursor.min(sess.session_list_cache.len() - 1);
-                } else {
-                    sess.session_view_cursor = 0;
+                {
+                    let sess = &mut self.sessions[idx];
+                    sess.session_view_error = None;
+                    sess.session_list_cache = list;
+                    sess.session_list_since = Some(std::time::Instant::now());
                 }
-                sess.session_list_cache.clone()
+                self.clamp_session_cursor(idx);
+                self.visible_session_list()
             }
             Err(msg) => {
                 let sess = &mut self.sessions[idx];
@@ -1868,6 +2052,15 @@ impl SessionManager {
     /// this — never query the database from a draw call.
     pub fn cached_session_list(&self) -> Vec<DbSessionInfo> {
         self.sessions[self.active_idx].session_list_cache.clone()
+    }
+
+    /// Visible F2 list: cache + ACTIVE filter + column sort. Renderers and
+    /// cursor movement must use this (never the raw cache) so the highlight
+    /// always indexes the rows actually shown.
+    pub fn visible_session_list(&self) -> Vec<DbSessionInfo> {
+        let idx = self.active_idx;
+        let raw = self.sessions[idx].session_list_cache.clone();
+        self.apply_session_view(idx, raw)
     }
 
     /// Seconds since the last F2 list refresh (None = never refreshed).
@@ -1897,12 +2090,12 @@ impl SessionManager {
 
     /// TTL-guarded F2 list: returns the cache when fresh, otherwise refreshes.
     /// Use this for cursor moves / SQL loads; renderers must use
-    /// `cached_session_list()` instead to stay side-effect free.
+    /// `visible_session_list()` instead to stay side-effect free.
     pub(crate) fn fresh_session_list(&mut self) -> Vec<DbSessionInfo> {
         if self.session_list_stale() {
             self.refresh_session_list()
         } else {
-            self.cached_session_list()
+            self.visible_session_list()
         }
     }
 
@@ -1925,6 +2118,9 @@ impl SessionManager {
             let s = &mut self.sessions[idx];
             s.mode = SessionMode::SessionView;
             s.session_view_cursor = 0;
+            s.session_view_active_only = false;
+            s.session_view_sort_col = None;
+            s.session_view_sort_desc = false;
             s.plan_sql_text = None;
             s.plan_for = None;
             s.plan_result = None;
@@ -1955,18 +2151,19 @@ impl SessionManager {
 
     /// Load the full SQL text of the highlighted F2 row into `plan_sql_text`.
     /// Clears any previous plan; failures surface as a status message.
-    /// Reads from the cache — call `refresh_session_list()` first when a
-    /// fresh list is required (enter / auto-refresh tick / manual `R`).
+    /// Reads from the visible (filtered/sorted) list — call
+    /// `refresh_session_list()` first when a fresh list is required
+    /// (enter / auto-refresh tick / manual `R`).
     pub fn load_selected_sql(&mut self) {
-        let idx = self.active_idx;
-        let cursor = self.sessions[idx].session_view_cursor;
-        let info = match self.sessions[idx]
-            .session_list_cache
-            .get(cursor)
-            .cloned()
-        {
+        let info = {
+            let idx = self.active_idx;
+            let cursor = self.sessions[idx].session_view_cursor;
+            self.visible_session_list().get(cursor).cloned()
+        };
+        let info = match info {
             Some(info) => info,
             None => {
+                let idx = self.active_idx;
                 let s = &mut self.sessions[idx];
                 s.plan_sql_text = None;
                 s.plan_result = None;
@@ -1975,6 +2172,7 @@ impl SessionManager {
             }
         };
         let label = format!("{} {}", info.sid, info.username);
+        let idx = self.active_idx;
         let id = self.sessions[idx].id;
         let conn = self
             .conn_map
@@ -3404,5 +3602,107 @@ mod tests {
         ed.delete();
         assert_eq!(ed.lines[0], "from v");
         assert!(ed.lines[0].is_char_boundary(ed.cursor_col));
+    }
+
+    fn fake_session_info(sid: i32, username: &str, status: &str) -> DbSessionInfo {
+        DbSessionInfo {
+            sid,
+            serial: sid * 10,
+            username: username.into(),
+            status: status.into(),
+            machine: "host".into(),
+            program: "prog".into(),
+            sql_id: String::new(),
+            logon_time: format!("2024-01-01 00:00:{:02}", sid.rem_euclid(60)),
+        }
+    }
+
+    #[test]
+    fn session_active_filter_toggles() {
+        let mut sm = SessionManager::new();
+        sm.sessions[0].session_list_cache = vec![
+            fake_session_info(1, "SCOTT", "ACTIVE"),
+            fake_session_info(2, "HR", "INACTIVE"),
+            fake_session_info(3, "SYS", "active"),
+        ];
+        assert_eq!(sm.visible_session_list().len(), 3);
+        sm.toggle_session_active_filter();
+        assert!(sm.sessions[0].session_view_active_only);
+        let visible = sm.visible_session_list();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(SessionManager::session_info_is_active));
+        sm.toggle_session_active_filter();
+        assert!(!sm.sessions[0].session_view_active_only);
+        assert_eq!(sm.visible_session_list().len(), 3);
+    }
+
+    #[test]
+    fn session_sort_cycles_columns() {
+        let mut sm = SessionManager::new();
+        sm.sessions[0].session_list_cache = vec![
+            fake_session_info(30, "C", "INACTIVE"),
+            fake_session_info(10, "A", "ACTIVE"),
+            fake_session_info(20, "B", "ACTIVE"),
+        ];
+        // Unsorted = DB order.
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.sid)
+                .collect::<Vec<_>>(),
+            vec![30, 10, 20]
+        );
+        // 1st s sorts by 1st column (SID asc).
+        sm.cycle_session_sort();
+        assert_eq!(sm.sessions[0].session_view_sort_col, Some(0));
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.sid)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        // 2nd s sorts by 2nd column (Serial# asc — mirrors SID here).
+        sm.cycle_session_sort();
+        assert_eq!(sm.sessions[0].session_view_sort_col, Some(1));
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.sid)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        // 3rd s sorts by 3rd column (User asc).
+        sm.cycle_session_sort();
+        assert_eq!(sm.sessions[0].session_view_sort_col, Some(2));
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.username.clone())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "C"]
+        );
+        // Direction toggle reverses.
+        sm.toggle_session_sort_dir();
+        assert!(sm.sessions[0].session_view_sort_desc);
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.username.clone())
+                .collect::<Vec<_>>(),
+            vec!["C", "B", "A"]
+        );
+        // Cycling through the rest wraps back to unsorted (DB order).
+        for _ in 2..SessionManager::SESSION_VIEW_COL_COUNT {
+            sm.cycle_session_sort();
+        }
+        assert_eq!(sm.sessions[0].session_view_sort_col, None);
+        assert_eq!(
+            sm.visible_session_list()
+                .iter()
+                .map(|s| s.sid)
+                .collect::<Vec<_>>(),
+            vec![30, 10, 20]
+        );
     }
 }
