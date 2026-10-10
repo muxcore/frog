@@ -2,6 +2,30 @@
 
 All notable changes to frog are documented here.
 
+## [0.5.0] - 2026-10-10
+
+### Added
+- `Alt+Y` copies the SQL statement at cursor to clipboard (built from
+  the editor buffer, so line numbers can never leak in).
+- Clipboard OSC52 fallback: `Ctrl+Y` / `Alt+Y` try the OS clipboard
+  first, then OSC52, so copy lands on the local clipboard over SSH /
+  headless (tmux needs `set -g set-clipboard on`, mintty needs
+  `AllowSetSelection=true`).
+- `Alt+M` toggles mouse capture (plain `ESC m` survives
+  git-bash/mintty and jump-host proxies where `Ctrl+M` arrives as
+  Enter). While `OFF` the editor gutter is hidden so a native
+  drag-select copies clean SQL; status bar and editor title show the
+  state.
+- Paste hardening for git-bash/mintty (no bracketed paste): input
+  queue is drained each frame so multi-KB pastes land quickly;
+  `CRLF`/`CR`-only breaks normalized, pasted tabs expand to spaces.
+
+### Fixed
+- Kitty keyboard enhancements are only requested when the terminal
+  reports support.
+- Middle-click paste over SSH with no X display hints at
+  `Shift+Ins` / `Ctrl+Shift+V` instead of failing silently.
+
 ## [0.4.0] - 2026-10-05
 
 ### Added
