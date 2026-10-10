@@ -169,7 +169,7 @@ pub fn render_status_bar(
         Span::raw("")
     } else {
         Span::styled(
-            " | Mouse:OFF (terminal select/copy)",
+            " | Mouse:OFF (Alt+M on, gutter hidden)",
             Style::default().fg(Color::Magenta),
         )
     };
@@ -188,7 +188,7 @@ pub fn render_status_bar(
         Span::styled(status_msg_part, Style::default().fg(Color::Cyan)),
         Span::raw(cursor_info),
         mouse_part,
-        Span::raw(" | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy"),
+        Span::raw(" | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"),
     ]);
 
     let bar = Paragraph::new(status_text)
@@ -196,7 +196,13 @@ pub fn render_status_bar(
     f.render_widget(bar, area);
 }
 
-pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect) {
+pub fn render_editor(
+    session: &Session,
+    focused: bool,
+    show_line_numbers: bool,
+    f: &mut Frame,
+    area: Rect,
+) {
     let border_color = if session.pending_query {
         Color::Yellow
     } else if focused {
@@ -207,8 +213,10 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
 
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
-    } else {
+    } else if show_line_numbers {
         " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Alt+Up/Down: resize) "
+    } else {
+        " SQL Editor — Mouse:OFF, gutter hidden for clean copy (Alt+M restores | Alt+Y copies SQL) "
     };
 
     let block = Block::default()
@@ -256,10 +264,18 @@ pub fn render_editor(session: &Session, focused: bool, f: &mut Frame, area: Rect
 
             let text_style = Style::default().bg(bg).fg(Color::White);
 
-            Line::from(vec![
-                Span::styled(line_num_str, num_style),
-                Span::styled(line_str.to_string(), text_style),
-            ])
+            if show_line_numbers {
+                Line::from(vec![
+                    Span::styled(line_num_str, num_style),
+                    Span::styled(line_str.to_string(), text_style),
+                ])
+            } else {
+                // Mouse:OFF native-selection mode: no gutter, so a terminal
+                // drag-select copies clean SQL without `  12 ` prefixes.
+                // (num_style/line_num_str intentionally unused here.)
+                let _ = (&line_num_str, &num_style);
+                Line::from(vec![Span::styled(line_str.to_string(), text_style)])
+            }
         })
         .collect();
 
@@ -986,8 +1002,10 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Mouse Drag Border   Resize panels horizontally"),
         Line::from("  Mouse Scroll        Scroll result table vertically"),
         Line::from("  Middle-click        Paste selection at cursor (tmux style)"),
-        Line::from("  Ctrl+M              Toggle mouse capture — while OFF the terminal"),
-        Line::from("                      handles select/copy natively (or hold Shift+drag)"),
+        Line::from("  Ctrl+M / Alt+M        Toggle mouse capture — while OFF the terminal"),
+        Line::from("                      handles select/copy natively, gutter hidden for clean"),
+        Line::from("                      SQL copy (or hold Shift+drag). Alt+M works on git-bash."),
+        Line::from("  Alt+Y               Copy SQL statement to clipboard (no line numbers, OSC52)"),
         Line::from(""),
         Line::from(Span::styled(
             " ─ SQL Execution ─ ",
@@ -1003,7 +1021,8 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  Ctrl+F              Fetch next page of results (100 rows)"),
-        Line::from("  Ctrl+Y              Copy results to clipboard"),
+        Line::from("  Ctrl+Y              Copy results to clipboard (OS + OSC52 for SSH)"),
+        Line::from("  Alt+Y               Copy SQL statement to clipboard (no line numbers)"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
         Line::from("  Arrow keys / PgUp/PgDn  Scroll results"),
         Line::from(""),

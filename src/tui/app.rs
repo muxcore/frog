@@ -13,6 +13,95 @@ use std::io::{self, Stdout};
 use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
+/// Outcome of a clipboard copy: which channel actually landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyOutcome {
+    /// Remote/local OS clipboard via arboard (X11/Wayland/macOS/Windows).
+    Os,
+    /// Terminal emulator clipboard via OSC52 (works over SSH).
+    Osc52,
+    /// Both channels landed.
+    Both,
+    /// Nothing worked.
+    Failed,
+}
+
+/// Max bytes offered via OSC52 (terminals cap it, often ~700KB).
+const MAX_OSC52_BYTES: usize = 500_000;
+
+/// Normalize pasted text: `CRLF` -> single `LF`, lone `CR` (git-bash sends
+/// CR-only line breaks) -> `LF`. Caller expands tabs / maps newlines per
+/// target (editor newline vs single-line field).
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Build the raw OSC52 (or tmux-wrapped) escape sequence for `text`.
+/// Pure (no I/O) so it can be unit-tested. Returns None for empty/oversize.
+fn build_osc52_sequence(text: &str, in_tmux: bool) -> Option<String> {
+    if text.is_empty() || text.len() > MAX_OSC52_BYTES {
+        return None;
+    }
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        text.as_bytes(),
+    );
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    if in_tmux {
+        Some(format!("\x1bPtmux;\x1b{}\x1b\\", osc52))
+    } else {
+        Some(osc52)
+    }
+}
+
+/// Write `text` to the terminal emulator clipboard with OSC52.
+///
+/// Unlike `arboard` (which needs an X11/Wayland display on the machine frog
+/// runs on), OSC52 rides the tty back to the *local* terminal, so it works
+/// over `ssh` — including git-bash/mintty with `AllowSetSelection=true`
+/// (and through tmux with `set -g set-clipboard on`, via DCS passthrough).
+/// Terminals without OSC52 support silently ignore the sequence.
+///
+/// Returns true when the bytes were handed to the tty successfully (which
+/// does *not* guarantee the terminal honored them).
+fn write_osc52(text: &str) -> bool {
+    use std::io::Write;
+    let in_tmux =
+        std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some();
+    let Some(sequence) = build_osc52_sequence(text, in_tmux) else {
+        return false;
+    };
+    // Prefer /dev/tty (direct handle to the controlling terminal, bypasses
+    // any stdout redirection by the TUI layer); fall back to stdout.
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        tty.write_all(sequence.as_bytes()).and_then(|_| tty.flush()).is_ok()
+    } else {
+        let mut out = io::stdout();
+        out.write_all(sequence.as_bytes()).and_then(|_| out.flush()).is_ok()
+    }
+}
+
+/// Copy `text` to the clipboard, preferring the OS clipboard and falling
+/// back to OSC52 so `Ctrl+Y`/`Alt+Y` keep working over SSH/headless.
+fn copy_to_clipboard(text: &str) -> CopyOutcome {
+    let os_ok = arboard::Clipboard::new()
+        .and_then(|mut cb| {
+            cb.set_text(text.to_string())
+                .map_err(|_| arboard::Error::ClipboardOccupied)
+        })
+        .is_ok();
+    // Always offer OSC52 as well: when arboard targets a *remote* X server
+    // (X forwarding) it won't reach the local Windows clipboard, while OSC52
+    // will. Harmless locally.
+    let osc_ok = write_osc52(text);
+    match (os_ok, osc_ok) {
+        (true, true) => CopyOutcome::Both,
+        (true, false) => CopyOutcome::Os,
+        (false, true) => CopyOutcome::Osc52,
+        (false, false) => CopyOutcome::Failed,
+    }
+}
+
 /// Convert a screen-column offset into a byte offset on `line`, walking chars
 /// by display width so multibyte / wide characters position correctly.
 fn byte_offset_for_column(line: &str, target_col: usize) -> usize {
@@ -72,10 +161,15 @@ pub struct App {
     command_error: Option<String>,
     /// When set, the command bar is in confirm mode for this @file command.
     command_confirm: Option<String>,
-    /// Whether frog captures mouse events. Toggled with Ctrl+M (tmux-style):
-    /// while OFF, the terminal handles selection/copy natively and pastes land
-    /// via bracketed paste.
+    /// Whether frog captures mouse events. Toggled with Ctrl+M / Alt+M
+    /// (tmux-style): while OFF, the terminal handles selection/copy natively
+    /// and pastes land via bracketed paste (or plain keys on terminals like
+    /// git-bash/mintty that don't emit bracketed paste).
     mouse_capture: bool,
+    /// Whether the Kitty keyboard protocol was actually enabled. Only true
+    /// when the terminal reports enhancement support — otherwise Ctrl+M /
+    /// Ctrl+Enter stay ambiguous with Enter and need their Alt- fallbacks.
+    keyboard_enhanced: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,22 +211,34 @@ impl App {
             command_error: None,
             command_confirm: None,
             mouse_capture: true,
+            keyboard_enhanced: false,
         })
     }
 
     pub fn run(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
+        // Only request Kitty keyboard enhancements when the terminal claims
+        // support — mintty/git-bash and proxies don't, and pushing
+        // unconditionally leaves Ctrl+M / Ctrl+Enter ambiguous anyway.
+        // (crossterm docs: only kitty/foot/WezTerm/Alacritty et al. support it.)
+        self.keyboard_enhanced =
+            matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
             EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
             crossterm::event::EnableBracketedPaste,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            ),
             crossterm::cursor::Show
         );
+        if self.keyboard_enhanced {
+            let _ = execute!(
+                stdout,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                ),
+            );
+        }
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -159,9 +265,14 @@ impl App {
 
         let res = self.run_loop(&mut terminal);
 
+        if self.keyboard_enhanced {
+            let _ = execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags,
+            );
+        }
         let _ = execute!(
             terminal.backend_mut(),
-            crossterm::event::PopKeyboardEnhancementFlags,
             LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture,
             crossterm::event::DisableBracketedPaste,
@@ -187,44 +298,94 @@ impl App {
 
             terminal.draw(|f| self.ui(f))?;
 
+            // git-bash/mintty doesn't emit bracketed paste — pastes arrive as
+            // a burst of individual key events. Handle the first event after a
+            // 50ms wait, then drain everything already queued so a multi-KB
+            // paste doesn't take N frames (one draw per char over SSH).
             if event::poll(std::time::Duration::from_millis(50))? {
-                match event::read()? {
-                    Event::Key(key) => self.handle_key(key),
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
-                    Event::Paste(text) => self.paste_text(&text),
-                    _ => {}
+                self.handle_event(event::read()?);
+                while event::poll(std::time::Duration::from_millis(0))? {
+                    self.handle_event(event::read()?);
                 }
             }
         }
         Ok(())
     }
 
+    fn handle_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(key) => self.handle_key(key),
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Paste(text) => self.paste_text(&text),
+            _ => {}
+        }
+    }
+
     /// Insert pasted text into the active target (command bar, connection
-    /// dialog field or SQL editor).
+    /// dialog field or SQL editor). Normalizes Windows (`\r\n`) and lone-`\r`
+    /// (git-bash sends CR-only line breaks) to `\n`, and expands tabs to
+    /// spaces (a literal Tab can't be typed — it cycles focus — and
+    /// `insert_char` drops control chars, so pasted indentation would vanish).
     fn paste_text(&mut self, text: &str) {
+        // Normalize once so `\r\n` becomes a single newline (not two) and a
+        // lone `\r` still breaks the line instead of joining two lines.
+        let normalized = normalize_paste(text);
         if self.command_mode {
-            self.command_input
-                .extend(text.chars().filter(|c| !c.is_control()));
+            self.command_input.extend(
+                normalized
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .flat_map(|c| {
+                        if c == '\n' {
+                            // Single-line bar: join lines with a space.
+                            vec![' ']
+                        } else {
+                            vec![c]
+                        }
+                    }),
+            );
             return;
         }
         let session = self.session_manager.active_session_mut();
         if session.mode == SessionMode::ConnectionPickerDialog {
-            for c in text.chars() {
+            for c in normalized.chars() {
+                if c == '\n' || c == '\t' {
+                    // Single-line field: skip newlines, expand tabs.
+                    if c == '\t' {
+                        for _ in 0..4 {
+                            session.conn_dialog.insert_char(' ');
+                        }
+                    }
+                    continue;
+                }
                 session.conn_dialog.insert_char(c);
             }
         } else {
-            for c in text.chars() {
+            for c in normalized.chars() {
                 if c == '\n' {
                     session.editor.newline();
-                } else if c != '\r' {
+                } else if c == '\t' {
+                    for _ in 0..4 {
+                        session.editor.insert_char(' ');
+                    }
+                } else {
                     session.editor.insert_char(c);
                 }
             }
         }
     }
 
+    /// Width of the editor line-number gutter. Zero while mouse capture is
+    /// OFF: the gutter is hidden then so a terminal-native selection copies
+    /// clean SQL without `  12 ` prefixes.
+    fn editor_gutter_width(&self) -> u16 {
+        if self.mouse_capture { 4 } else { 0 }
+    }
+
     /// Toggle mouse capture (tmux-style). While OFF the terminal handles text
     /// selection/copy natively; bracketed paste still reaches frog.
+    /// Bound to both Ctrl+M (needs Kitty CSI-u) and Alt+M (plain ESC m,
+    /// survives git-bash/mintty and jump-host proxies).
     fn toggle_mouse_capture(&mut self) {
         use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
         self.mouse_capture = !self.mouse_capture;
@@ -235,10 +396,97 @@ impl App {
             execute!(stdout, DisableMouseCapture)
         };
         let msg = if self.mouse_capture {
-            "Mouse capture ON"
+            "Mouse capture ON (Alt+M to release for native copy)"
         } else {
-            "Mouse capture OFF — select to copy with the terminal; middle-click/Ctrl+Shift+V pastes"
+            "Mouse:OFF — gutter hidden, drag to select clean SQL; Alt+M restores; paste via Shift+Ins/Ctrl+Shift+V"
         };
+        self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    /// Status text for a clipboard copy outcome (shared by Ctrl+Y / Alt+Y).
+    fn copy_status(outcome: CopyOutcome, chars: usize, what: &str) -> String {
+        match outcome {
+            CopyOutcome::Os | CopyOutcome::Both => {
+                format!("Copied {} ({} chars) to clipboard", what, chars)
+            }
+            CopyOutcome::Osc52 => format!(
+                "Copied {} ({} chars) via OSC52 — if paste is empty, set AllowSetSelection=true in mintty / enable set-clipboard in tmux",
+                what, chars
+            ),
+            CopyOutcome::Failed => format!(
+                "Copy failed ({} chars): no OS clipboard and OSC52 refused — use Mouse:OFF (Alt+M) + terminal selection",
+                chars
+            ),
+        }
+    }
+
+    /// Ctrl+Y: copy the last result set (no line numbers involved — the text
+    /// is built from the data, never from screen cells).
+    fn copy_results_to_clipboard(&mut self) {
+        if self.session_manager.active_session().results.is_empty() {
+            self.session_manager
+                .active_session_mut()
+                .set_status("No results to copy yet — run a query first (Alt+Enter/F8)");
+            return;
+        }
+        let (text, chars) = {
+            let session = self.session_manager.active_session();
+            // Unwrap is safe: emptiness checked above.
+            let last_res = session.results.last().expect("results non-empty");
+            let mut text = String::new();
+            match self.result_format {
+                ResultFormat::Markdown => {
+                    let refs: Vec<&[String]> =
+                        last_res.rows.iter().map(|r| r.as_slice()).collect();
+                    text.push_str(&markdown_table(&last_res.columns, &refs));
+                }
+                ResultFormat::Ascii => {
+                    text.push_str(&format_ascii_table(last_res, 0, 0, last_res.rows.len()));
+                }
+                ResultFormat::Table => {
+                    text.push_str(&last_res.columns.join("\t"));
+                    text.push('\n');
+                    for row in &last_res.rows {
+                        text.push_str(&row.join("\t"));
+                        text.push('\n');
+                    }
+                }
+            }
+            let n = text.chars().count();
+            (text, n)
+        };
+        let outcome = copy_to_clipboard(&text);
+        let msg = Self::copy_status(outcome, chars, "results");
+        self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    /// Alt+Y: copy the SQL under the cursor (statement, else full editor)
+    /// without line numbers — built from `editor.lines`, never screen cells.
+    fn copy_sql_to_clipboard(&mut self) {
+        // Grab owned text first so the immutable borrow ends before the
+        // mutable status update below.
+        let text_opt = {
+            let session = self.session_manager.active_session();
+            if let Some(stmt) = session.editor.current_statement() {
+                Some(stmt)
+            } else {
+                let t = session.editor.text();
+                if t.trim().is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            }
+        };
+        let Some(text) = text_opt else {
+            self.session_manager
+                .active_session_mut()
+                .set_status("Editor empty — nothing to copy");
+            return;
+        };
+        let chars = text.chars().count();
+        let outcome = copy_to_clipboard(&text);
+        let msg = Self::copy_status(outcome, chars, "SQL");
         self.session_manager.active_session_mut().set_status(msg);
     }
 
@@ -254,6 +502,27 @@ impl App {
             }
         }
         cb.get().text().ok().filter(|t| !t.is_empty())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_primary_selection() -> Option<String> {
+        arboard::Clipboard::new()
+            .ok()?
+            .get()
+            .text()
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Whether `key` toggles mouse capture. Ctrl+M needs the Kitty CSI-u
+    /// protocol; Alt+M (plain `ESC m`) survives git-bash/mintty and proxies,
+    /// so both are accepted (case-insensitive, Shift-tolerant).
+    fn is_mouse_toggle(key: event::KeyEvent) -> bool {
+        if !matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
+            return false;
+        }
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -290,10 +559,16 @@ impl App {
             MouseEventKind::Down(crossterm::event::MouseButton::Middle) => {
                 // tmux-style middle-click paste: place the cursor where the
                 // user clicked in the editor, then insert the primary selection.
+                // Over SSH (no X display) arboard fails — tell the user what
+                // to press instead of failing silently.
                 if self.editor_area.contains(Position::new(mouse.column, mouse.row)) {
                     self.click_editor(mouse.column, mouse.row);
                     if let Some(text) = Self::read_primary_selection() {
                         self.paste_text(&text);
+                    } else {
+                        self.session_manager.active_session_mut().set_status(
+                            "Middle-click paste unavailable here (no X clipboard) — use Shift+Ins / Ctrl+Shift+V",
+                        );
                     }
                 }
             }
@@ -333,13 +608,13 @@ impl App {
     /// Focus the editor and move the text cursor to the clicked position.
     fn click_editor(&mut self, column: u16, row: u16) {
         self.active_window = ActiveWindow::Editor;
+        let gutter = self.editor_gutter_width() as usize;
         let session = self.session_manager.active_session_mut();
         session.mode = SessionMode::Query;
         let raw_row = (row.saturating_sub(self.editor_area.y + 1)) as usize
             + session.editor.scroll_offset;
-        let line_num_width = 4usize;
         let target_col =
-            (column.saturating_sub(self.editor_area.x + 1 + line_num_width as u16)) as usize;
+            (column.saturating_sub(self.editor_area.x + 1 + gutter as u16)) as usize;
         let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
         session.editor.cursor_row = target_row;
         session.editor.cursor_col =
@@ -348,7 +623,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: event::KeyEvent) {
-        // The kitty keyboard protocol (enabled at startup) also delivers
+        // The kitty keyboard protocol (when enabled) also delivers
         // release events; process press/repeat only.
         if key.kind == event::KeyEventKind::Release {
             return;
@@ -356,6 +631,21 @@ impl App {
 
         if self.show_startup_help {
             self.show_startup_help = false;
+            return;
+        }
+
+        // Mouse toggle works in every mode (command bar, dialogs, browsers):
+        // Alt+M is the git-bash-safe alias for Ctrl+M.
+        if Self::is_mouse_toggle(key) {
+            self.toggle_mouse_capture();
+            return;
+        }
+        // Never trap the user: Ctrl+Q quits from anywhere (command bar,
+        // dialogs, browsers), not just the query view.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+        {
+            self.should_quit = true;
             return;
         }
 
@@ -442,13 +732,8 @@ impl App {
                 self.hide_sidebar = !self.hide_sidebar;
                 return;
             }
-            // tmux-style: toggle mouse capture so the terminal's native
-            // selection/copy can be used (Ctrl+M needs a CSI-u terminal, same
-            // as Ctrl+Enter).
-            (KeyModifiers::CONTROL, KeyCode::Char('m')) => {
-                self.toggle_mouse_capture();
-                return;
-            }
+            // NOTE: mouse toggle (Ctrl+M / Alt+M) is handled at the top of
+            // handle_key so it works in every mode, even without Kitty CSI-u.
             (KeyModifiers::CONTROL, KeyCode::Char('z')) | (KeyModifiers::NONE, KeyCode::F(11)) => {
                 self.maximized_box = match self.maximized_box {
                     None => Some(match self.active_window {
@@ -460,41 +745,18 @@ impl App {
                 };
                 return;
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('y')) => {
-                let session = self.session_manager.active_session();
-                if let Some(last_res) = session.results.last() {
-                    let mut text = String::new();
-                    match self.result_format {
-                        ResultFormat::Markdown => {
-                            let refs: Vec<&[String]> = last_res
-                                .rows
-                                .iter()
-                                .map(|r| r.as_slice())
-                                .collect();
-                            text.push_str(&markdown_table(&last_res.columns, &refs));
-                        }
-                        ResultFormat::Ascii => {
-                            text.push_str(&format_ascii_table(
-                                last_res,
-                                0,
-                                0,
-                                last_res.rows.len(),
-                            ));
-                        }
-                        ResultFormat::Table => {
-                            // TSV fallback
-                            text.push_str(&last_res.columns.join("\t"));
-                            text.push('\n');
-                            for row in &last_res.rows {
-                                text.push_str(&row.join("\t"));
-                                text.push('\n');
-                            }
-                        }
-                    }
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        let _ = clipboard.set_text(text);
-                    }
-                }
+            // Ctrl+Y: results (OS clipboard + OSC52 fallback for SSH).
+            (KeyModifiers::CONTROL, KeyCode::Char('y'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('Y')) => {
+                self.copy_results_to_clipboard();
+                return;
+            }
+            // Alt+Y: SQL under cursor, never with line numbers (built from
+            // editor.lines, plus OSC52 so it lands on the local clipboard
+            // over SSH). Plain `ESC y` survives git-bash like Alt+M/Alt+Enter.
+            (KeyModifiers::ALT, KeyCode::Char('y'))
+            | (KeyModifiers::ALT, KeyCode::Char('Y')) => {
+                self.copy_sql_to_clipboard();
                 return;
             }
             (KeyModifiers::ALT, KeyCode::Up) => {
@@ -1188,6 +1450,7 @@ impl App {
                         render_editor(
                             session,
                             self.active_window == ActiveWindow::Editor,
+                            self.mouse_capture,
                             f,
                             self.editor_area,
                         );
@@ -1214,6 +1477,7 @@ impl App {
                         render_editor(
                             session,
                             self.active_window == ActiveWindow::Editor,
+                            self.mouse_capture,
                             f,
                             self.editor_area,
                         );
@@ -1246,11 +1510,11 @@ impl App {
                     let row = session.editor.cursor_row;
                     let scroll = session.editor.scroll_offset;
                     if row >= scroll && row < scroll + vis_height {
-                        let line_num_width = 4u16;
-                        let max_text_width = area.width.saturating_sub(2 + line_num_width) as usize;
+                        let gutter = self.editor_gutter_width();
+                        let max_text_width = area.width.saturating_sub(2 + gutter) as usize;
                         let cx = area.x
                             + 1
-                            + line_num_width
+                            + gutter
                             + session.editor.cursor_col.min(max_text_width) as u16;
                         let cy = area.y + 1 + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
@@ -1276,5 +1540,74 @@ impl App {
         } else {
             render_status_bar(session, self.active_window, self.mouse_capture, f, chunks[2]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState};
+
+    fn key(mods: KeyModifiers, code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_lone_cr() {
+        assert_eq!(normalize_paste("a\r\nb"), "a\nb");
+        assert_eq!(normalize_paste("a\rb"), "a\nb");
+        assert_eq!(normalize_paste("a\nb"), "a\nb");
+        assert_eq!(normalize_paste("a\r\n\r\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_and_wraps_tmux() {
+        // "hi" -> aGk=
+        let seq = build_osc52_sequence("hi", false).expect("seq");
+        assert_eq!(seq, "\x1b]52;c;aGk=\x07");
+        let tmux = build_osc52_sequence("hi", true).expect("tmux seq");
+        assert!(tmux.starts_with("\x1bPtmux;\x1b"), "tmux wrap: {:?}", tmux);
+        assert!(tmux.ends_with("\x1b\\"), "tmux wrap: {:?}", tmux);
+        assert!(tmux.contains("aGk="), "tmux wrap: {:?}", tmux);
+    }
+
+    #[test]
+    fn osc52_rejects_empty_and_oversize() {
+        assert!(build_osc52_sequence("", false).is_none());
+        let big = "x".repeat(MAX_OSC52_BYTES + 1);
+        assert!(build_osc52_sequence(&big, false).is_none());
+    }
+
+    #[test]
+    fn mouse_toggle_accepts_ctrl_and_alt_forms() {
+        assert!(App::is_mouse_toggle(key(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('m')
+        )));
+        assert!(App::is_mouse_toggle(key(
+            KeyModifiers::ALT,
+            KeyCode::Char('m')
+        )));
+        assert!(App::is_mouse_toggle(key(
+            KeyModifiers::ALT,
+            KeyCode::Char('M')
+        )));
+        assert!(App::is_mouse_toggle(key(
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyCode::Char('M')
+        )));
+        assert!(!App::is_mouse_toggle(key(
+            KeyModifiers::NONE,
+            KeyCode::Char('m')
+        )));
+        assert!(!App::is_mouse_toggle(key(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('y')
+        )));
     }
 }

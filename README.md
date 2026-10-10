@@ -181,7 +181,8 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Tab` | Cycle focus: Editor / Results / Sidebar |
 | `Ctrl+Z` / `F11` | Maximize/restore focused panel |
 | `Ctrl+B` | Toggle sidebar |
-| `Ctrl+Y` | Copy results to clipboard |
+| `Ctrl+Y` | Copy results to clipboard (OS clipboard + OSC52 fallback for SSH) |
+| `Alt+Y` | Copy SQL statement at cursor to clipboard (never includes line numbers) |
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
 | `Ctrl+C` / `Esc` | Cancel running query |
@@ -191,17 +192,17 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction) / History |
 | `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), 20-row preview in result style (`Ctrl+D` switches format), DDL/source |
 | `Ctrl+Q` | Quit |
-| `Ctrl+M` | Toggle mouse capture (tmux-style copy/paste mode) |
+| `Ctrl+M` / `Alt+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |
 
 ### Copy & paste (tmux style)
 
-- **Middle-click** pastes the primary selection at the clicked position in the editor (falls back to the regular clipboard). Bracketed paste (`Ctrl+Shift+V`) works everywhere — editor, connection dialog and command bar.
-- Pressing **`Ctrl+M` turns mouse capture off**: select text with your terminal's native selection to copy it, paste freely, then press `Ctrl+M` again to re-enable frog's mouse handling (scrolling, click-to-focus, splitter drag). The status bar shows `Mouse:OFF` while capture is disabled.
+- **Middle-click** pastes the primary selection at the clicked position in the editor (falls back to the regular clipboard; over SSH with no X display it shows a hint to use `Shift+Ins` / `Ctrl+Shift+V` instead). Bracketed paste works everywhere — editor, connection dialog and command bar. Git-bash/mintty doesn't emit bracketed paste, so pastes arrive as fast key bursts — frog drains the input queue each frame so multi-KB pastes still land quickly; `CRLF`/`CR`-only line breaks are normalized and pasted tabs expand to spaces.
+- Pressing **`Ctrl+M` or `Alt+M` turns mouse capture off**: select text with your terminal's native selection to copy it, paste freely, then press `Alt+M` again to re-enable frog's mouse handling (scrolling, click-to-focus, splitter drag). The status bar shows `Mouse:OFF` while capture is disabled. While `OFF` the editor gutter (line numbers) is hidden so a drag-select copies clean SQL without `  12 ` prefixes.
 - On most terminals you can also hold **`Shift` while dragging** to use the native selection without toggling capture.
-- `Ctrl+Y` remains available to copy the current result set to the system clipboard.
+- `Ctrl+Y` copies the current result set (OS clipboard first, then OSC52 so it lands on your local clipboard over SSH — mintty needs `AllowSetSelection=true`, tmux needs `set -g set-clipboard on`). `Alt+Y` copies the SQL statement at the cursor, built from the editor buffer so line numbers can never leak in.
 
-> Like `Ctrl+Enter`, the `Ctrl+M` binding requires a terminal that emits modified-key (`CSI u`) sequences (e.g. Alacritty); otherwise it may arrive as plain Enter.
+> Like `Ctrl+Enter`, the `Ctrl+M` binding requires a terminal that emits modified-key (`CSI u`) sequences (e.g. Alacritty); otherwise it may arrive as plain Enter. Use **`Alt+M`** there — it is a plain `ESC m` sequence that survives git-bash/mintty and jump-host proxies. Frog only requests Kitty enhancements when the terminal reports support.
 
 > **Note on `Ctrl+Enter`:** it isn't an ASCII control character, so it only reaches
 > frog as a distinct key when the terminal emulator emits a modified-key (`CSI u`)
