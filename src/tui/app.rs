@@ -154,6 +154,26 @@ pub struct App {
     sidebar_area: Rect,
     explorer_area: Rect,
     explorer_detail_area: Rect,
+    /// F2 session viewer: top list height as % of the view (15..85).
+    /// Mirrors `editor_height` in the query tab — Alt+Up grows the list
+    /// (shrinking SQL+plan), Alt+Down shrinks it (growing SQL+plan).
+    session_list_pct: u16,
+    /// F2 session viewer: middle SQL pane height in rows (3..30).
+    /// Ctrl+Up grows it (shrinking plan), Ctrl+Down shrinks it (growing plan).
+    session_sql_height: u16,
+    /// F2 session viewer: which pane has focus (Tab cycles, click sets).
+    /// Controls the maximize target and the highlighted border.
+    session_view_focus: SessionViewPane,
+    /// F2 session viewer: when set, only this pane fills the view
+    /// (toggled with Ctrl+Z / F11, same as the query tab).
+    session_view_maximized: Option<SessionViewPane>,
+    /// Last F2 layout areas (for click-to-focus + splitter drag hit-testing).
+    session_view_area: Rect,
+    session_list_area: Rect,
+    session_sql_area: Rect,
+    session_plan_area: Rect,
+    /// Which F2 splitter is being mouse-dragged, if any.
+    session_resizing: Option<SessionResize>,
     /// Last explorer tree click (visible row, time) for double-click detect.
     last_explorer_click: Option<(usize, Instant)>,
     command_mode: bool,
@@ -170,6 +190,41 @@ pub struct App {
     /// when the terminal reports enhancement support — otherwise Ctrl+M /
     /// Ctrl+Enter stay ambiguous with Enter and need their Alt- fallbacks.
     keyboard_enhanced: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionViewPane {
+    #[default]
+    List,
+    Sql,
+    Plan,
+}
+
+impl SessionViewPane {
+    pub fn next(self) -> Self {
+        match self {
+            SessionViewPane::List => SessionViewPane::Sql,
+            SessionViewPane::Sql => SessionViewPane::Plan,
+            SessionViewPane::Plan => SessionViewPane::List,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            SessionViewPane::List => SessionViewPane::Plan,
+            SessionViewPane::Sql => SessionViewPane::List,
+            SessionViewPane::Plan => SessionViewPane::Sql,
+        }
+    }
+}
+
+/// Which F2 horizontal splitter is being mouse-dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionResize {
+    /// Boundary between the session list (top) and the SQL+plan detail.
+    List,
+    /// Boundary between the SQL pane and the explain-plan pane.
+    Sql,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,6 +260,15 @@ impl App {
             sidebar_area: Rect::default(),
             explorer_area: Rect::default(),
             explorer_detail_area: Rect::default(),
+            session_list_pct: 45,
+            session_sql_height: 7,
+            session_view_focus: SessionViewPane::List,
+            session_view_maximized: None,
+            session_view_area: Rect::default(),
+            session_list_area: Rect::default(),
+            session_sql_area: Rect::default(),
+            session_plan_area: Rect::default(),
+            session_resizing: None,
             last_explorer_click: None,
             command_mode: false,
             command_input: String::new(),
@@ -533,6 +597,13 @@ impl App {
         {
             return;
         }
+        // F2 session viewer owns its area fullscreen: click focuses a pane,
+        // drag on a horizontal splitter resizes, wheel scrolls list/plan.
+        if self.session_manager.active_session().mode == SessionMode::SessionView
+            && self.handle_session_view_mouse(mouse)
+        {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 let in_editor = self
@@ -574,6 +645,7 @@ impl App {
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 self.is_resizing = false;
+                self.session_resizing = None;
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 if self.is_resizing {
@@ -582,6 +654,9 @@ impl App {
                     let col = mouse.column as usize;
                     let pct = ((width.saturating_sub(col)) * 100) / width;
                     self.sidebar_split_pct = (pct as u16).clamp(10, 70);
+                }
+                if let Some(which) = self.session_resizing {
+                    self.drag_session_splitter(which, mouse.row);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -1034,17 +1109,70 @@ impl App {
 
     /// TOAD-style session browser: pick a session row, preview its current
     /// SQL and run EXPLAIN on it.
+    ///
+    /// Pane layout mirrors the query tab: Tab cycles focus (List/SQL/Plan),
+    /// Ctrl+Z/F11 maximizes the focused pane, Alt+Up/Down resizes the
+    /// session list (Alt+Down grows SQL+plan), Ctrl+Up/Down resizes the
+    /// SQL pane (Ctrl+Down grows the explain plan), and dragging a
+    /// horizontal splitter resizes with the mouse.
     fn handle_session_view(&mut self, key: event::KeyEvent) {
         // Never trap the user: Ctrl+Q always quits.
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
             self.should_quit = true;
             return;
         }
+        // Focus / zoom / resize — same as the query tab (Ctrl+Z/F11,
+        // Alt+Up/Down). Checked before plain navigation because e.g.
+        // Alt+Up shares KeyCode::Up with plain Up.
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.session_view_focus = self.session_view_focus.next();
+                // Keep maximize in sync when already zoomed: zoom follows focus.
+                if self.session_view_maximized.is_some() {
+                    self.session_view_maximized = Some(self.session_view_focus);
+                }
+                return;
+            }
+            (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::NONE, KeyCode::BackTab) => {
+                self.session_view_focus = self.session_view_focus.prev();
+                if self.session_view_maximized.is_some() {
+                    self.session_view_maximized = Some(self.session_view_focus);
+                }
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('z'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('Z'))
+            | (KeyModifiers::NONE, KeyCode::F(11)) => {
+                self.session_view_maximized = match self.session_view_maximized {
+                    None => Some(self.session_view_focus),
+                    Some(_) => None,
+                };
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Up) => {
+                self.session_list_pct = (self.session_list_pct + 5).min(85);
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Down) => {
+                self.session_list_pct = self.session_list_pct.saturating_sub(5).max(15);
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Up) => {
+                self.session_sql_height = (self.session_sql_height + 1).min(30);
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Down) => {
+                self.session_sql_height = self.session_sql_height.saturating_sub(1).max(3);
+                return;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 let session = self.session_manager.active_session_mut();
                 session.mode = SessionMode::Query;
                 self.active_window = ActiveWindow::Editor;
+                self.session_resizing = None;
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.session_manager.move_session_cursor(-1);
@@ -1292,6 +1420,175 @@ impl App {
         true
     }
 
+    /// Mouse inside the F2 session viewer. Click focuses a pane, drag on a
+    /// horizontal splitter resizes (same idea as the query-tab sidebar
+    /// splitter), wheel scrolls the list / plan under the cursor.
+    /// Returns true when the event was consumed.
+    fn handle_session_view_mouse(&mut self, mouse: MouseEvent) -> bool {
+        // While a pane is maximized the stored areas are stale for the
+        // hidden panes — still allow wheel scrolling of the visible pane
+        // and click/drag to restore? Keep it simple: when maximized, wheel
+        // scrolls the visible pane, any drag stops, clicks are swallowed.
+        if self.session_view_maximized.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    match self.session_view_focus {
+                        SessionViewPane::List => {
+                            self.session_manager.move_session_cursor(1);
+                        }
+                        SessionViewPane::Plan => {
+                            let s = self.session_manager.active_session_mut();
+                            s.plan_scroll = s.plan_scroll.saturating_add(3);
+                        }
+                        SessionViewPane::Sql => {}
+                    }
+                    return true;
+                }
+                MouseEventKind::ScrollUp => {
+                    match self.session_view_focus {
+                        SessionViewPane::List => {
+                            self.session_manager.move_session_cursor(-1);
+                        }
+                        SessionViewPane::Plan => {
+                            let s = self.session_manager.active_session_mut();
+                            s.plan_scroll = s.plan_scroll.saturating_sub(3);
+                        }
+                        SessionViewPane::Sql => {}
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    self.session_resizing = None;
+                    return true;
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    return true;
+                }
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    return true;
+                }
+                _ => return true,
+            }
+        }
+        if self.session_view_area.width == 0 || self.session_view_area.height == 0 {
+            return false;
+        }
+        let pos = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                if self.session_plan_area.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.plan_scroll = s.plan_scroll.saturating_add(3);
+                } else if self.session_list_area.contains(pos) {
+                    self.session_manager.move_session_cursor(1);
+                }
+                return true;
+            }
+            MouseEventKind::ScrollUp => {
+                if self.session_plan_area.contains(pos) {
+                    let s = self.session_manager.active_session_mut();
+                    s.plan_scroll = s.plan_scroll.saturating_sub(3);
+                } else if self.session_list_area.contains(pos) {
+                    self.session_manager.move_session_cursor(-1);
+                }
+                return true;
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Splitter hit-testing: the two panes abut, so the boundary
+                // row belongs to both — treat ±1 row as a grab handle.
+                let list_bottom = self
+                    .session_list_area
+                    .y
+                    .saturating_add(self.session_list_area.height);
+                let sql_bottom = self
+                    .session_sql_area
+                    .y
+                    .saturating_add(self.session_sql_area.height);
+                let in_h_range =
+                    mouse.column >= self.session_view_area.x && mouse.column < self.session_view_area.x + self.session_view_area.width.max(1);
+                if in_h_range && (mouse.row as i16 - list_bottom as i16).abs() <= 1 && self.session_list_area.height > 0 {
+                    self.session_resizing = Some(SessionResize::List);
+                    self.session_view_focus = SessionViewPane::List;
+                    return true;
+                }
+                if in_h_range && (mouse.row as i16 - sql_bottom as i16).abs() <= 1 && self.session_sql_area.height > 0 {
+                    self.session_resizing = Some(SessionResize::Sql);
+                    self.session_view_focus = SessionViewPane::Sql;
+                    return true;
+                }
+                if self.session_list_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::List;
+                    // Click-to-pick: move the session cursor to the clicked row.
+                    let rel = mouse.row.saturating_sub(self.session_list_area.y + 1) as usize;
+                    let total = self.session_manager.visible_session_list().len();
+                    if total > 0 {
+                        let sess = self.session_manager.active_session();
+                        // Mirror the table's keep-cursor-visible math: visible
+                        // rows = height - borders - header.
+                        let avail = self.session_list_area.height.saturating_sub(4) as usize;
+                        if avail > 0 && rel < avail {
+                            let cursor = sess.session_view_cursor.min(total.saturating_sub(1));
+                            let start = if cursor >= avail { cursor + 1 - avail } else { 0 };
+                            let idx = (start + rel).min(total.saturating_sub(1));
+                            if idx != cursor {
+                                self.session_manager.active_session_mut().session_view_cursor = idx;
+                                self.session_manager.load_selected_sql();
+                            }
+                        }
+                    }
+                    return true;
+                }
+                if self.session_sql_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Sql;
+                    return true;
+                }
+                if self.session_plan_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Plan;
+                    return true;
+                }
+                return false;
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                self.session_resizing = None;
+                return true;
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if let Some(which) = self.session_resizing {
+                    self.drag_session_splitter(which, mouse.row);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Apply a vertical splitter drag in the F2 viewer.
+    fn drag_session_splitter(&mut self, which: SessionResize, mouse_row: u16) {
+        let total = self.session_view_area.height as usize;
+        if total < 10 {
+            return;
+        }
+        match which {
+            SessionResize::List => {
+                let top = self.session_view_area.y as usize;
+                let row = mouse_row as usize;
+                let list_h = row.saturating_sub(top);
+                let pct = (list_h * 100 / total).clamp(15, 85) as u16;
+                self.session_list_pct = pct;
+            }
+            SessionResize::Sql => {
+                let sql_y = self.session_sql_area.y as usize;
+                let row = mouse_row as usize;
+                // Boundary row == sql_y + height, so height = row - sql_y.
+                let h = row.saturating_sub(sql_y).clamp(3, 30) as u16;
+                // Keep at least a few rows for the plan pane.
+                let max_h = (total.saturating_sub(8)).clamp(3, 30) as u16;
+                self.session_sql_height = h.min(max_h.max(3));
+            }
+        }
+    }
+
     fn handle_conn_dialog(&mut self, key: event::KeyEvent) {
         let session = self.session_manager.active_session_mut();
         let dlg = &mut session.conn_dialog;
@@ -1372,7 +1669,18 @@ impl App {
 
         match mode {
             SessionMode::SessionView => {
-                render_session_overview(&mut self.session_manager, f, chunks[1]);
+                let layout = SessionViewLayout {
+                    list_pct: self.session_list_pct,
+                    sql_height: self.session_sql_height,
+                    focus: self.session_view_focus,
+                    maximized: self.session_view_maximized,
+                };
+                let (list_a, sql_a, plan_a) =
+                    render_session_overview(&mut self.session_manager, layout, f, chunks[1]);
+                self.session_view_area = chunks[1];
+                self.session_list_area = list_a;
+                self.session_sql_area = sql_a;
+                self.session_plan_area = plan_a;
             }
             SessionMode::DbExplorer => {
                 let (tree, detail) = render_db_explorer(
@@ -1538,7 +1846,15 @@ impl App {
                 .min(bar.right().saturating_sub(1));
             f.set_cursor_position(Position::new(cx, bar.y));
         } else {
-            render_status_bar(session, self.active_window, self.mouse_capture, f, chunks[2]);
+            render_status_bar(
+                session,
+                self.active_window,
+                self.session_view_focus,
+                self.session_view_maximized,
+                self.mouse_capture,
+                f,
+                chunks[2],
+            );
         }
     }
 }
@@ -1609,5 +1925,105 @@ mod tests {
             KeyModifiers::CONTROL,
             KeyCode::Char('y')
         )));
+    }
+
+    fn test_app() -> App {
+        use crate::cli::{Config, ConnectionParams, UiConfig};
+        use crate::db::DbType;
+        let config = Config {
+            connection: ConnectionParams {
+                db_type: DbType::Oracle,
+                host: String::new(),
+                port: 1521,
+                service: String::new(),
+                database: String::new(),
+                user: String::new(),
+                password: None,
+            },
+            ui: UiConfig::default(),
+            max_rows: 10000,
+            autocommit: true,
+            max_history: 1000,
+            session_refresh_secs: 60,
+            saved_connections: Vec::new(),
+        };
+        App::new(config, SessionManager::new()).expect("app")
+    }
+
+    #[test]
+    fn session_view_pane_cycles() {
+        assert_eq!(SessionViewPane::List.next(), SessionViewPane::Sql);
+        assert_eq!(SessionViewPane::Sql.next(), SessionViewPane::Plan);
+        assert_eq!(SessionViewPane::Plan.next(), SessionViewPane::List);
+        assert_eq!(SessionViewPane::List.prev(), SessionViewPane::Plan);
+        assert_eq!(SessionViewPane::Sql.prev(), SessionViewPane::List);
+        assert_eq!(SessionViewPane::Plan.prev(), SessionViewPane::Sql);
+    }
+
+    #[test]
+    fn session_view_alt_up_down_resizes_list() {
+        let mut app = test_app();
+        assert_eq!(app.session_list_pct, 45);
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_list_pct, 50);
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_list_pct, 45);
+        // Clamps at 15..85.
+        app.session_list_pct = 85;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_list_pct, 85);
+        app.session_list_pct = 15;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_list_pct, 15);
+    }
+
+    #[test]
+    fn session_view_ctrl_up_down_resizes_sql() {
+        let mut app = test_app();
+        assert_eq!(app.session_sql_height, 7);
+        app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 8);
+        app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 7);
+        app.session_sql_height = 30;
+        app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 30);
+        app.session_sql_height = 3;
+        app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 3);
+    }
+
+    #[test]
+    fn session_view_tab_cycles_focus_and_ctrl_z_zooms() {
+        let mut app = test_app();
+        assert_eq!(app.session_view_focus, SessionViewPane::List);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.session_view_focus, SessionViewPane::Sql);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.session_view_focus, SessionViewPane::Plan);
+        app.handle_session_view(key(KeyModifiers::SHIFT, KeyCode::BackTab));
+        assert_eq!(app.session_view_focus, SessionViewPane::Sql);
+
+        assert_eq!(app.session_view_maximized, None);
+        app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Char('z')));
+        assert_eq!(
+            app.session_view_maximized,
+            Some(SessionViewPane::Sql)
+        );
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::F(11)));
+        assert_eq!(app.session_view_maximized, None);
+    }
+
+    #[test]
+    fn session_view_plain_up_still_navigates() {
+        // Alt+Up must resize (not navigate); plain Up navigates. With an
+        // empty list the cursor stays 0 either way — the observable
+        // difference is that plain Up leaves the layout untouched.
+        let mut app = test_app();
+        let before = app.session_list_pct;
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Up));
+        assert_eq!(app.session_list_pct, before);
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_list_pct, before + 5);
     }
 }

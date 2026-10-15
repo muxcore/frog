@@ -2,6 +2,15 @@
 
 All notable changes to frog are documented here.
 
+## [0.5.5] - 2026-10-15
+
+### Added
+- F2 session viewer pane layout matches the query tab: `Tab` cycles
+  focus List/SQL/Plan, `Ctrl+Z`/`F11` maximizes the focused pane,
+  `Alt+Up`/`Down` resizes the session list, `Ctrl+Up`/`Down` resizes
+  the SQL pane, mouse click focuses, drag on a horizontal splitter
+  resizes, wheel scrolls list/plan.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

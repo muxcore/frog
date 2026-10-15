@@ -40,11 +40,11 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction) / History |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = list size, `Ctrl+Up`/`Down` = SQL size) / History |
 | `F12` | DB explorer |
 | `Ctrl+M` | Toggle mouse capture |
 | `Ctrl+Q` | Quit |
-| Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results |
+| Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results; in F2: click focuses List/SQL/Plan, drag horizontal splitter resizes, wheel scrolls list/plan |
 
 ## Project Structure
 

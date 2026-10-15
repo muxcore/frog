@@ -3,7 +3,7 @@ use crate::db::session_manager::{
     ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode,
 };
 use crate::db::DbType;
-use crate::tui::app::{ActiveWindow, ResultFormat};
+use crate::tui::app::{ActiveWindow, ResultFormat, SessionViewPane};
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::UnicodeWidthStr;
 
@@ -89,6 +89,8 @@ pub fn render_command_bar(
 pub fn render_status_bar(
     session: &Session,
     active_window: ActiveWindow,
+    session_view_focus: SessionViewPane,
+    session_view_maximized: Option<SessionViewPane>,
     mouse_capture: bool,
     f: &mut Frame,
     area: Rect,
@@ -102,10 +104,23 @@ pub fn render_status_bar(
         SessionMode::ConnectionPickerDialog => "[CONNECTING...]",
     };
 
-    let focus_str = match active_window {
-        ActiveWindow::Editor => "Focus: EDITOR",
-        ActiveWindow::Results => "Focus: RESULTS",
-        ActiveWindow::Sidebar => "Focus: SIDEBAR",
+    let focus_str = if session.mode == SessionMode::SessionView {
+        let base = match session_view_focus {
+            SessionViewPane::List => "Focus: LIST",
+            SessionViewPane::Sql => "Focus: SQL",
+            SessionViewPane::Plan => "Focus: PLAN",
+        };
+        if session_view_maximized.is_some() {
+            format!("{} [MAX]", base)
+        } else {
+            base.to_string()
+        }
+    } else {
+        match active_window {
+            ActiveWindow::Editor => "Focus: EDITOR".to_string(),
+            ActiveWindow::Results => "Focus: RESULTS".to_string(),
+            ActiveWindow::Sidebar => "Focus: SIDEBAR".to_string(),
+        }
     };
 
     let conn_status = if session.connecting {
@@ -174,6 +189,12 @@ pub fn render_status_bar(
         )
     };
 
+    let hint = if session.mode == SessionMode::SessionView {
+        " | Tab: Focus | Alt+Up/Down: List | Ctrl+Up/Down: SQL | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
+    } else {
+        " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"
+    };
+
     let status_text = Line::from(vec![
         Span::styled(
             mode_str,
@@ -188,7 +209,7 @@ pub fn render_status_bar(
         Span::styled(status_msg_part, Style::default().fg(Color::Cyan)),
         Span::raw(cursor_info),
         mouse_part,
-        Span::raw(" | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"),
+        Span::raw(hint),
     ]);
 
     let bar = Paragraph::new(status_text)
@@ -694,7 +715,114 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rect) {
+/// Layout state for the F2 session viewer (owned by `App`, same idea as
+/// `editor_height` / `sidebar_split_pct` in the query tab).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionViewLayout {
+    /// Top list height as % of the view (15..85). Alt+Up grows the list,
+    /// Alt+Down shrinks it (growing SQL+plan).
+    pub list_pct: u16,
+    /// Middle SQL pane height in rows (3..30). Ctrl+Up grows it,
+    /// Ctrl+Down shrinks it (growing the explain plan).
+    pub sql_height: u16,
+    /// Which pane has focus (Tab cycles, click sets). Drives the
+    /// highlighted border and the Ctrl+Z maximize target.
+    pub focus: SessionViewPane,
+    /// When set, only this pane fills the view (Ctrl+Z / F11 toggles).
+    pub maximized: Option<SessionViewPane>,
+}
+
+fn f2_border(focused: bool) -> Color {
+    if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    }
+}
+
+pub fn render_session_overview(
+    sm: &mut SessionManager,
+    layout: SessionViewLayout,
+    f: &mut Frame,
+    area: Rect,
+) -> (Rect, Rect, Rect) {
+    // Maximized panes fill the whole view; hidden panes report empty areas
+    // so mouse hit-testing ignores them.
+    if let Some(which) = layout.maximized {
+        match which {
+            SessionViewPane::List => {
+                render_f2_list(sm, layout, true, true, f, area);
+                return (area, Rect::default(), Rect::default());
+            }
+            SessionViewPane::Sql => {
+                let sess = sm.active_session();
+                render_f2_sql(sess, true, true, f, area);
+                return (Rect::default(), area, Rect::default());
+            }
+            SessionViewPane::Plan => {
+                let sess = sm.active_session();
+                render_f2_plan(sess, true, true, f, area);
+                return (Rect::default(), Rect::default(), area);
+            }
+        }
+    }
+
+    let list_pct = layout.list_pct.clamp(15, 85);
+    let sql_h = layout.sql_height.clamp(3, 30);
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(list_pct),
+            Constraint::Min(8),
+        ])
+        .split(area);
+
+    let list_area = panes[0];
+    render_f2_list(
+        sm,
+        layout,
+        layout.focus == SessionViewPane::List,
+        false,
+        f,
+        list_area,
+    );
+
+    // --- detail panes: current SQL + explain plan ---
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(sql_h), Constraint::Min(3)])
+        .split(panes[1]);
+
+    {
+        let sess = sm.active_session();
+        render_f2_sql(
+            sess,
+            layout.focus == SessionViewPane::Sql,
+            false,
+            f,
+            detail[0],
+        );
+        render_f2_plan(
+            sess,
+            layout.focus == SessionViewPane::Plan,
+            false,
+            f,
+            detail[1],
+        );
+    }
+
+    (list_area, detail[0], detail[1])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_f2_list(
+    sm: &mut SessionManager,
+    layout: SessionViewLayout,
+    focused: bool,
+    maximized: bool,
+    f: &mut Frame,
+    area: Rect,
+) {
     let db_type = sm.active_db_type();
     // Render from the visible (filtered/sorted) list — never hit the DB from
     // a draw call. The list is refreshed on open, automatically every
@@ -719,6 +847,7 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
         sess.session_view_sort_desc,
     );
     let total_cached = sess.session_list_cache.len();
+    let session_view_error = sess.session_view_error.clone();
     let (title_base, headers): (&str, Vec<&str>) = match db_type {
         DbType::Oracle => (
             "v$session",
@@ -760,9 +889,14 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             format!("{}{} (s: next, S: dir)", name, arrow)
         }
     };
+    let zoom_hint = if maximized {
+        " [MAX] Ctrl+Z restore"
+    } else {
+        " · Tab focus · Alt+↑/↓ size · Ctrl+Z zoom"
+    };
     let title = format!(
-        " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {} ",
-        title_base, filter_label, sort_label, refresh_label
+        " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {}{} ",
+        title_base, filter_label, sort_label, refresh_label, zoom_hint
     );
     let header_cells: Vec<String> = headers
         .iter()
@@ -783,15 +917,10 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             .add_modifier(Modifier::BOLD),
     );
 
-    let panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(45), Constraint::Min(8)])
-        .split(area);
-
     // Empty list: show why (privileges / not connected / ACTIVE filter)
     // instead of a bare table — an unexplained empty F2 looks like "no sessions".
     if db_sessions.is_empty() {
-        let (err_title, body, style) = match &sess.session_view_error {
+        let (err_title, body, style) = match &session_view_error {
             Some(err) => (
                 format!(" Sessions — error ({} · press R to retry, Esc to go back) ", refresh_label),
                 err.clone(),
@@ -811,6 +940,11 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
                 Style::default().fg(Color::DarkGray),
             ),
         };
+        let border = if session_view_error.is_some() {
+            Color::Red
+        } else {
+            f2_border(focused)
+        };
         let p = Paragraph::new(body)
             .wrap(Wrap { trim: false })
             .style(style)
@@ -818,12 +952,13 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
                 Block::default()
                     .title(err_title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red)),
+                    .border_style(Style::default().fg(border)),
             );
-        f.render_widget(p, panes[0]);
-    } else {
+        f.render_widget(p, area);
+        return;
+    }
     // Keep the highlighted row visible.
-    let avail = panes[0].height.saturating_sub(4) as usize;
+    let avail = area.height.saturating_sub(4) as usize;
     let start = if avail == 0 {
         0
     } else if cursor >= avail {
@@ -880,22 +1015,35 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
         ],
     )
     .header(header)
-    .block(Block::default().title(title).borders(Borders::ALL));
+    .block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(f2_border(focused))),
+    );
 
-    f.render_widget(table, panes[0]);
-    } // end else (non-empty session list)
+    f.render_widget(table, area);
+    let _ = layout;
+}
 
-    // --- detail panes: current SQL + explain plan ---
-    let detail = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(3)])
-        .split(panes[1]);
-
-    let sql_title = match &sess.plan_for {
-        Some(who) => format!(" Current SQL — session {} (r: reload sql) ", who),
-        None => " Current SQL ".to_string(),
+fn render_f2_sql(session: &Session, focused: bool, maximized: bool, f: &mut Frame, area: Rect) {
+    let sql_title = match &session.plan_for {
+        Some(who) => {
+            if maximized {
+                format!(" Current SQL [MAX] — session {} (r: reload · Ctrl+Z restore) ", who)
+            } else {
+                format!(" Current SQL — session {} (r: reload · Ctrl+↑/↓ size · Tab focus · Ctrl+Z zoom) ", who)
+            }
+        }
+        None => {
+            if maximized {
+                " Current SQL [MAX] (Ctrl+Z restore) ".to_string()
+            } else {
+                " Current SQL (Ctrl+↑/↓ size · Tab focus · Ctrl+Z zoom) ".to_string()
+            }
+        }
     };
-    let sql_text = sess
+    let sql_text = session
         .plan_sql_text
         .as_deref()
         .unwrap_or("↑/↓ selects a session · its SQL loads here · Enter runs EXPLAIN");
@@ -906,11 +1054,9 @@ pub fn render_session_overview(sm: &mut SessionManager, f: &mut Frame, area: Rec
             Block::default()
                 .title(sql_title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(f2_border(focused))),
         );
-    f.render_widget(sql_para, detail[0]);
-
-    render_plan_pane(sess, f, detail[1]);
+    f.render_widget(sql_para, area);
 }
 
 /// Slice `s` from char offset `skip` (plan-pane horizontal scroll).
@@ -922,12 +1068,17 @@ fn hslice(s: &str, skip: usize) -> String {
 }
 
 /// Bottom F2 pane: the stored explain plan (or a hint when none ran yet).
-fn render_plan_pane(session: &Session, f: &mut Frame, area: Rect) {
+fn render_plan_pane(session: &Session, focused: bool, maximized: bool, f: &mut Frame, area: Rect) {
+    let title = if maximized {
+        " Explain plan [MAX] — Ctrl+Z restore · PgUp/PgDn: scroll · ←/→: sideways "
+    } else {
+        " Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways · Alt+↓ grow · Ctrl+Z zoom · Tab focus "
+    };
     let block = || {
         Block::default()
-            .title(" Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways ")
+            .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(f2_border(focused)))
     };
     let Some(qr) = session.plan_result.as_ref() else {
         let p = Paragraph::new("Press Enter to EXPLAIN the SQL above.")
@@ -974,6 +1125,10 @@ fn render_plan_pane(session: &Session, f: &mut Frame, area: Rect) {
         .style(Style::default().fg(Color::White))
         .block(block());
     f.render_widget(p, area);
+}
+
+fn render_f2_plan(session: &Session, focused: bool, maximized: bool, f: &mut Frame, area: Rect) {
+    render_plan_pane(session, focused, maximized, f, area);
 }
 
 pub fn render_help(f: &mut Frame, area: Rect) {
@@ -1046,6 +1201,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Session browser — pick a session, Enter/e shows EXPLAIN plan"),
         Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
+        Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ list size · Ctrl+↑/↓ SQL size · drag splitter · wheel scrolls"),
         Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
