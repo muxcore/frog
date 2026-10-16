@@ -190,7 +190,7 @@ pub fn render_status_bar(
     };
 
     let hint = if session.mode == SessionMode::SessionView {
-        " | Tab: Focus | Alt+Up/Down: List | Ctrl+Up/Down: SQL | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
+        " | Tab: Focus | Alt+Up/Down: Size focused pane | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
     } else {
         " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"
     };
@@ -719,11 +719,12 @@ fn format_bytes(bytes: usize) -> String {
 /// `editor_height` / `sidebar_split_pct` in the query tab).
 #[derive(Debug, Clone, Copy)]
 pub struct SessionViewLayout {
-    /// Top list height as % of the view (15..85). Alt+Up grows the list,
-    /// Alt+Down shrinks it (growing SQL+plan).
+    /// Top list height as % of the view (15..85). Grown/shrunk with
+    /// Alt+Up/Down while the List pane is focused.
     pub list_pct: u16,
-    /// Middle SQL pane height in rows (3..30). Ctrl+Up grows it,
-    /// Ctrl+Down shrinks it (growing the explain plan).
+    /// Middle SQL pane height in rows (3..30). Grown/shrunk with
+    /// Alt+Up/Down while SQL (or Plan, inversely) is focused;
+    /// Ctrl+Up/Down always targets SQL directly.
     pub sql_height: u16,
     /// Which pane has focus (Tab cycles, click sets). Drives the
     /// highlighted border and the Ctrl+Z maximize target.
@@ -892,7 +893,7 @@ fn render_f2_list(
     let zoom_hint = if maximized {
         " [MAX] Ctrl+Z restore"
     } else {
-        " · Tab focus · Alt+↑/↓ size · Ctrl+Z zoom"
+        " · Tab focus · Alt+↑/↓ grow/shrink focused · Ctrl+Z zoom"
     };
     let title = format!(
         " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {}{} ",
@@ -1032,14 +1033,14 @@ fn render_f2_sql(session: &Session, focused: bool, maximized: bool, f: &mut Fram
             if maximized {
                 format!(" Current SQL [MAX] — session {} (r: reload · Ctrl+Z restore) ", who)
             } else {
-                format!(" Current SQL — session {} (r: reload · Ctrl+↑/↓ size · Tab focus · Ctrl+Z zoom) ", who)
+                format!(" Current SQL — session {} (r: reload · Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ", who)
             }
         }
         None => {
             if maximized {
                 " Current SQL [MAX] (Ctrl+Z restore) ".to_string()
             } else {
-                " Current SQL (Ctrl+↑/↓ size · Tab focus · Ctrl+Z zoom) ".to_string()
+                " Current SQL (Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ".to_string()
             }
         }
     };
@@ -1072,7 +1073,7 @@ fn render_plan_pane(session: &Session, focused: bool, maximized: bool, f: &mut F
     let title = if maximized {
         " Explain plan [MAX] — Ctrl+Z restore · PgUp/PgDn: scroll · ←/→: sideways "
     } else {
-        " Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways · Alt+↓ grow · Ctrl+Z zoom · Tab focus "
+        " Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways · Alt+↑/↓ grow/shrink · Ctrl+Z zoom · Tab focus "
     };
     let block = || {
         Block::default()
@@ -1201,7 +1202,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Session browser — pick a session, Enter/e shows EXPLAIN plan"),
         Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
-        Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ list size · Ctrl+↑/↓ SQL size · drag splitter · wheel scrolls"),
+        Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ grow/shrink focused pane · Ctrl+↑/↓ SQL size · drag splitter · wheel scrolls"),
         Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),

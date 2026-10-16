@@ -155,11 +155,12 @@ pub struct App {
     explorer_area: Rect,
     explorer_detail_area: Rect,
     /// F2 session viewer: top list height as % of the view (15..85).
-    /// Mirrors `editor_height` in the query tab — Alt+Up grows the list
-    /// (shrinking SQL+plan), Alt+Down shrinks it (growing SQL+plan).
+    /// Grown/shrunk with Alt+Up/Down while the List pane is focused
+    /// (Ctrl+Z zooms any pane like the query tab).
     session_list_pct: u16,
     /// F2 session viewer: middle SQL pane height in rows (3..30).
-    /// Ctrl+Up grows it (shrinking plan), Ctrl+Down shrinks it (growing plan).
+    /// Grown/shrunk with Alt+Up/Down while SQL (or Plan, inversely) is
+    /// focused; Ctrl+Up/Down always targets SQL directly as an alias.
     session_sql_height: u16,
     /// F2 session viewer: which pane has focus (Tab cycles, click sets).
     /// Controls the maximize target and the highlighted border.
@@ -1111,10 +1112,10 @@ impl App {
     /// SQL and run EXPLAIN on it.
     ///
     /// Pane layout mirrors the query tab: Tab cycles focus (List/SQL/Plan),
-    /// Ctrl+Z/F11 maximizes the focused pane, Alt+Up/Down resizes the
-    /// session list (Alt+Down grows SQL+plan), Ctrl+Up/Down resizes the
-    /// SQL pane (Ctrl+Down grows the explain plan), and dragging a
-    /// horizontal splitter resizes with the mouse.
+    /// Ctrl+Z/F11 maximizes the focused pane, Alt+Up grows the focused pane
+    /// and Alt+Down shrinks it (so every pane — List, Current SQL, Plan —
+    /// can be extended), Ctrl+Up/Down always sizes SQL directly, and
+    /// dragging a horizontal splitter resizes with the mouse.
     fn handle_session_view(&mut self, key: event::KeyEvent) {
         // Never trap the user: Ctrl+Q always quits.
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('q') {
@@ -1150,11 +1151,11 @@ impl App {
                 return;
             }
             (KeyModifiers::ALT, KeyCode::Up) => {
-                self.session_list_pct = (self.session_list_pct + 5).min(85);
+                self.grow_session_focused_pane();
                 return;
             }
             (KeyModifiers::ALT, KeyCode::Down) => {
-                self.session_list_pct = self.session_list_pct.saturating_sub(5).max(15);
+                self.shrink_session_focused_pane();
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Up) => {
@@ -1231,6 +1232,49 @@ impl App {
                 session.plan_hscroll = session.plan_hscroll.saturating_add(8);
             }
             _ => {}
+        }
+    }
+
+    /// Grow whichever F2 pane has focus (Alt+Up). List grows its % share,
+    /// SQL grows its row height, Plan grows by taking a row from SQL (then
+    /// from the list once SQL is at its minimum).
+    fn grow_session_focused_pane(&mut self) {
+        match self.session_view_focus {
+            SessionViewPane::List => {
+                self.session_list_pct = (self.session_list_pct + 5).min(85);
+            }
+            SessionViewPane::Sql => {
+                self.session_sql_height = (self.session_sql_height + 1).min(30);
+            }
+            SessionViewPane::Plan => {
+                if self.session_sql_height > 3 {
+                    self.session_sql_height -= 1;
+                } else if self.session_list_pct > 15 {
+                    self.session_list_pct = self.session_list_pct.saturating_sub(5).max(15);
+                }
+            }
+        }
+    }
+
+    /// Shrink whichever F2 pane has focus (Alt+Down). Inverse of
+    /// `grow_session_focused_pane`: List shrinks its % share, SQL shrinks
+    /// its row height (giving space to Plan), Plan shrinks by handing a
+    /// row back to SQL (then to the list once SQL is at its maximum).
+    fn shrink_session_focused_pane(&mut self) {
+        match self.session_view_focus {
+            SessionViewPane::List => {
+                self.session_list_pct = self.session_list_pct.saturating_sub(5).max(15);
+            }
+            SessionViewPane::Sql => {
+                self.session_sql_height = self.session_sql_height.saturating_sub(1).max(3);
+            }
+            SessionViewPane::Plan => {
+                if self.session_sql_height < 30 {
+                    self.session_sql_height += 1;
+                } else if self.session_list_pct < 85 {
+                    self.session_list_pct = (self.session_list_pct + 5).min(85);
+                }
+            }
         }
     }
 
@@ -1963,6 +2007,7 @@ mod tests {
     #[test]
     fn session_view_alt_up_down_resizes_list() {
         let mut app = test_app();
+        app.session_view_focus = SessionViewPane::List;
         assert_eq!(app.session_list_pct, 45);
         app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
         assert_eq!(app.session_list_pct, 50);
@@ -1975,6 +2020,49 @@ mod tests {
         app.session_list_pct = 15;
         app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
         assert_eq!(app.session_list_pct, 15);
+    }
+
+    #[test]
+    fn session_view_alt_up_down_resizes_focused_sql() {
+        let mut app = test_app();
+        app.session_view_focus = SessionViewPane::Sql;
+        assert_eq!(app.session_sql_height, 7);
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 8);
+        // List share is untouched when SQL is focused.
+        assert_eq!(app.session_list_pct, 45);
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 7);
+        app.session_sql_height = 30;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 30);
+        app.session_sql_height = 3;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 3);
+    }
+
+    #[test]
+    fn session_view_alt_up_down_grows_and_shrinks_plan() {
+        let mut app = test_app();
+        app.session_view_focus = SessionViewPane::Plan;
+        // Grow plan: takes a row from SQL first.
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 6);
+        assert_eq!(app.session_list_pct, 45);
+        // Shrink plan: hands the row back to SQL.
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 7);
+        // Once SQL is at minimum, growing the plan shrinks the list.
+        app.session_sql_height = 3;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.session_sql_height, 3);
+        assert_eq!(app.session_list_pct, 40);
+        // Once SQL is at maximum, shrinking the plan grows the list.
+        app.session_sql_height = 30;
+        app.session_list_pct = 45;
+        app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.session_sql_height, 30);
+        assert_eq!(app.session_list_pct, 50);
     }
 
     #[test]

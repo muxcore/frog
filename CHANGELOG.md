@@ -2,13 +2,27 @@
 
 All notable changes to frog are documented here.
 
+## [0.5.6] - 2026-10-16
+
+### Added
+- F2 session viewer: `Alt+Up`/`Down` now grows/shrinks the focused
+  pane, so `Current SQL` (and the explain plan) can be extended
+  directly with the same keys as the query tab — `Tab` to focus,
+  `Alt+Up` to grow, `Ctrl+Z`/`F11` to zoom. `Ctrl+Up`/`Down` still
+  sizes SQL directly; pane titles and the status bar show the hints.
+- `scripts/release.sh`: one-command old-glibc build + GitHub release
+  refresh — calls `scripts/build-old-glibc.sh`, gzips `dist/frog`
+  and creates (or refreshes) the version release with the gzipped
+  binary as asset.
+
 ## [0.5.5] - 2026-10-15
 
 ### Added
 - F2 session viewer pane layout matches the query tab: `Tab` cycles
   focus List/SQL/Plan, `Ctrl+Z`/`F11` maximizes the focused pane,
-  `Alt+Up`/`Down` resizes the session list, `Ctrl+Up`/`Down` resizes
-  the SQL pane, mouse click focuses, drag on a horizontal splitter
+  `Alt+Up`/`Down` grows/shrinks the focused pane (so List, Current
+  SQL and Plan can each be extended), `Ctrl+Up`/`Down` sizes SQL
+  directly, mouse click focuses, drag on a horizontal splitter
   resizes, wheel scrolls list/plan.
 
 ## [0.5.0] - 2026-10-10

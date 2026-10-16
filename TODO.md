@@ -40,7 +40,7 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = list size, `Ctrl+Up`/`Down` = SQL size) / History |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = grow/shrink focused pane, `Ctrl+Up`/`Down` = SQL size) / History |
 | `F12` | DB explorer |
 | `Ctrl+M` | Toggle mouse capture |
 | `Ctrl+Q` | Quit |
