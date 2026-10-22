@@ -683,13 +683,12 @@ pub(crate) fn verbose_pg_error(e: &postgres::Error) -> String {
     }
 }
 
-/// Build a 20-row preview query for the explorer detail pane.
-pub(crate) fn pg_preview_sql(schema: &str, table: &str, limit: usize) -> String {
+/// Unbounded `SELECT *` for a relation, used as the base for preview paging.
+pub(crate) fn pg_relation_select(schema: &str, table: &str) -> String {
     format!(
-        "SELECT * FROM {}.{} LIMIT {}",
+        "SELECT * FROM {}.{}",
         pg_quote_ident(schema),
-        pg_quote_ident(table),
-        limit
+        pg_quote_ident(table)
     )
 }
 
@@ -817,8 +816,8 @@ mod tests {
         assert_eq!(pg_quote_ident("public"), "\"public\"");
         assert_eq!(pg_quote_ident("we\"ird"), "\"we\"\"ird\"");
         assert_eq!(
-            pg_preview_sql("public", "emp", 20),
-            "SELECT * FROM \"public\".\"emp\" LIMIT 20"
+            pg_relation_select("public", "emp"),
+            "SELECT * FROM \"public\".\"emp\""
         );
     }
 

@@ -605,6 +605,10 @@ pub struct Session {
     pub editor: SqlEditor,
     pub mode: SessionMode,
     pub pending_query: bool,
+    /// True while a further page of the current result set is being fetched
+    /// (keeps the existing rows on screen instead of showing the query
+    /// placeholder, and prevents duplicate page requests).
+    pub paging: bool,
     pub conn_dialog: ConnectionDialog,
     /// The last SELECT SQL executed — used for fetching additional pages.
     pub last_sql: Option<String>,
@@ -641,6 +645,8 @@ pub struct Session {
     pub plan_scroll: usize,
     /// Horizontal (char) scroll offset of the F2 plan pane.
     pub plan_hscroll: usize,
+    /// Vertical scroll offset of the F2 current-SQL pane.
+    pub sql_scroll: usize,
     /// Last F2 list failure (e.g. missing V$SESSION privileges), shown in
     /// the browser instead of an unexplained empty table.
     pub session_view_error: Option<String>,
@@ -661,6 +667,8 @@ pub struct Session {
     pub explorer_scroll: usize,
     /// Scroll of the detail/columns pane.
     pub explorer_detail_scroll: usize,
+    /// Horizontal scroll of the detail preview table (first visible column).
+    pub explorer_detail_col_scroll: usize,
     /// Substring filter (case-insensitive); empty = no filter.
     pub explorer_filter: String,
     /// Whether the filter input line is capturing keystrokes.
@@ -756,6 +764,12 @@ pub struct ExplorerTable {
     /// Async 20-row preview for TABLE/VIEW (loaded on selection).
     pub preview: Option<QueryRow>,
     pub preview_loading: bool,
+    /// Monotonic id for the latest preview request (first page or page-N), so
+    /// a response from an older request can be dropped after a reload.
+    pub preview_req: u64,
+    /// Failure from loading a further preview page (kept separate from the
+    /// already loaded rows so the table stays visible).
+    pub preview_error: Option<String>,
     /// Async DDL/source for code objects (TABLE/VIEW synthesize on `d`).
     pub ddl: Option<String>,
     pub ddl_loading: bool,
@@ -772,6 +786,8 @@ impl ExplorerTable {
             load_error: None,
             preview: None,
             preview_loading: false,
+            preview_req: 0,
+            preview_error: None,
             ddl: None,
             ddl_loading: false,
             ddl_error: None,
@@ -810,6 +826,8 @@ pub enum ExplorerMsg {
         schema: String,
         table: String,
         kind: String,
+        /// Per-object request sequence; stale responses are dropped.
+        req: u64,
         result: QueryRow,
     },
     Ddl {
@@ -1146,6 +1164,7 @@ impl Session {
             editor: SqlEditor::new(),
             mode: SessionMode::Query,
             pending_query: false,
+            paging: false,
             conn_dialog: ConnectionDialog::default(),
             last_sql: None,
             page_size: 100,
@@ -1163,6 +1182,7 @@ impl Session {
             plan_result: None,
             plan_scroll: 0,
             plan_hscroll: 0,
+            sql_scroll: 0,
             session_view_error: None,
             session_list_cache: Vec::new(),
             session_list_since: None,
@@ -1171,6 +1191,7 @@ impl Session {
             explorer_cursor: 0,
             explorer_scroll: 0,
             explorer_detail_scroll: 0,
+            explorer_detail_col_scroll: 0,
             explorer_filter: String::new(),
             explorer_filtering: false,
             explorer_error: None,
@@ -1539,6 +1560,7 @@ impl SessionManager {
         let exec_lock = self.sessions[idx].exec_lock.clone();
 
         self.sessions[idx].pending_query = true;
+        self.sessions[idx].paging = false;
 
         // Persist every executed statement to disk history + session history
         // Also track last SELECT for pagination
@@ -1641,6 +1663,10 @@ impl SessionManager {
     /// New rows are appended to the last QueryRow in session.results.
     pub fn fetch_next_page(&mut self) {
         let idx = self.active_idx;
+        // Never overlap a page fetch with another page or a running query.
+        if self.sessions[idx].pending_query || self.sessions[idx].paging {
+            return;
+        }
         // Extract the data we need while the immutable borrow is alive, then
         // release it before taking mutable deps (job_seq, status_message).
         let (sql, current_offset, page_size, id) = {
@@ -1679,16 +1705,50 @@ impl SessionManager {
         let result_tx = self.result_tx.clone();
         let exec_lock = self.sessions[idx].exec_lock.clone();
 
-        self.sessions[idx].pending_query = true;
+        self.sessions[idx].paging = true;
 
         thread::spawn(move || {
             let _guard = exec_lock.lock().ok();
             let conn_opt = conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
-            if let Some(conn) = conn_opt {
-                let result = conn.execute_query_paged(&sql, current_offset, allowed);
-                let _ = result_tx.send((id, seq, result));
+            match conn_opt {
+                Some(conn) => {
+                    let result = conn.execute_query_paged(&sql, current_offset, allowed);
+                    let _ = result_tx.send((id, seq, result));
+                }
+                None => {
+                    let err = QueryRow::error(
+                        "Not connected. Use Ctrl+O to connect.".into(),
+                        0,
+                        current_offset,
+                        allowed,
+                    );
+                    let _ = result_tx.send((id, seq, err));
+                }
             }
         });
+    }
+
+    /// Auto-paging hook: when the user scrolls to the end of the loaded rows,
+    /// fetch the next page in the background. Keeps the current rows visible
+    /// (unlike a fresh query, which shows the execution placeholder).
+    pub fn maybe_fetch_next_page(&mut self) {
+        let idx = self.active_idx;
+        let sess = &self.sessions[idx];
+        if sess.pending_query || sess.paging {
+            return;
+        }
+        let Some(last) = sess.results.last() else {
+            return;
+        };
+        if last.is_error || !last.truncated {
+            return;
+        }
+        // Prefetch a few rows before the very end for a smooth scroll.
+        let trigger = last.rows.len().saturating_sub(10);
+        if sess.scroll_offset < trigger {
+            return;
+        }
+        self.fetch_next_page();
     }
 
     /// Whether a backend error message indicates a user-requested cancellation.
@@ -1704,7 +1764,9 @@ impl SessionManager {
     pub fn cancel_query(&mut self) {
         let id = self.sessions[self.active_idx].id;
 
-        if !self.sessions[self.active_idx].pending_query {
+        if !self.sessions[self.active_idx].pending_query
+            && !self.sessions[self.active_idx].paging
+        {
             return;
         }
 
@@ -1771,6 +1833,7 @@ impl SessionManager {
                     return;
                 }
                 sess.pending_query = false;
+                sess.paging = false;
 
                 // A cancellation is not an error — surface it as a status message
                 // and clear the stale "Cancelling…" notice, instead of pushing a
@@ -1793,8 +1856,10 @@ impl SessionManager {
                             last.rows.extend(qr.rows);
                             last.truncated = qr.truncated;
                             last.elapsed_ms += qr.elapsed_ms;
-                            // Scroll to the newly loaded rows
-                            sess.scroll_offset = last.rows.len().saturating_sub(1);
+                            // Keep the viewport where it is: the user is
+                            // usually at the bottom when auto-paging fires,
+                            // and jumping to the absolute last row would skip
+                            // the freshly loaded rows.
                         } else {
                             // A paged fetch failed: surface it as a status-line
                             // message instead of polluting the result list with a
@@ -2126,6 +2191,7 @@ impl SessionManager {
             s.plan_result = None;
             s.plan_scroll = 0;
             s.plan_hscroll = 0;
+            s.sql_scroll = 0;
             s.session_view_error = None;
         }
         self.refresh_session_list();
@@ -2183,6 +2249,7 @@ impl SessionManager {
         sess.plan_for = Some(label);
         sess.plan_scroll = 0;
         sess.plan_hscroll = 0;
+        sess.sql_scroll = 0;
         sess.plan_result = None;
         match conn {
             Some(c) => match c.session_sql(&info) {
@@ -2686,6 +2753,7 @@ impl SessionManager {
         }
         self.sessions[self.active_idx].explorer_cursor = next;
         self.sessions[self.active_idx].explorer_detail_scroll = 0;
+        self.sessions[self.active_idx].explorer_detail_col_scroll = 0;
         self.maybe_load_detail_for_cursor();
     }
 
@@ -2876,6 +2944,7 @@ impl SessionManager {
         }
         self.sessions[self.active_idx].explorer_cursor = visible_idx.min(len - 1);
         self.sessions[self.active_idx].explorer_detail_scroll = 0;
+        self.sessions[self.active_idx].explorer_detail_col_scroll = 0;
         self.maybe_load_detail_for_cursor();
     }
 
@@ -2916,24 +2985,19 @@ impl SessionManager {
         }
     }
 
-    /// Rows fetched for a row-bearing preview in the explorer detail pane.
+    /// Rows fetched per preview page in the explorer detail pane. Scrolling
+    /// to the end (or `Ctrl+F`) appends another page.
     pub const EXPLORER_PREVIEW_LIMIT: usize = 20;
 
-    /// Preview query for one object, or None when it has no row preview
+    /// Base preview query for one object (no LIMIT/OFFSET — paging is applied
+    /// by `execute_query_paged`), or None when it has no row preview
     /// (indexes; Oracle sequences use a properties query instead — see the
     /// SEQUENCE arm). Pure and unit-tested.
     fn explorer_preview_sql(db_type: DbType, schema: &str, name: &str, kind: &str) -> Option<String> {
         match kind {
             "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE" => Some(match db_type {
-                DbType::Oracle => format!(
-                    "SELECT * FROM {}.{} WHERE ROWNUM <= {}",
-                    schema,
-                    name,
-                    Self::EXPLORER_PREVIEW_LIMIT
-                ),
-                DbType::Postgres => {
-                    crate::db::postgres::pg_preview_sql(schema, name, Self::EXPLORER_PREVIEW_LIMIT)
-                }
+                DbType::Oracle => format!("SELECT * FROM {}.{}", schema, name),
+                DbType::Postgres => crate::db::postgres::pg_relation_select(schema, name),
             }),
             // Sequences have no table data: show live properties instead.
             // (NEXTVAL would advance the sequence — never preview that way.)
@@ -2945,9 +3009,7 @@ impl SessionManager {
                     schema.replace('\'', "''"),
                     name.replace('\'', "''")
                 ),
-                DbType::Postgres => {
-                    crate::db::postgres::pg_preview_sql(schema, name, Self::EXPLORER_PREVIEW_LIMIT)
-                }
+                DbType::Postgres => crate::db::postgres::pg_relation_select(schema, name),
             }),
             _ => None,
         }
@@ -2979,6 +3041,8 @@ impl SessionManager {
         };
         if let Some(t) = self.object_mut(sidx, gidx, tidx) {
             t.preview = None;
+            t.preview_loading = false;
+            t.preview_error = None;
             t.ddl = None;
             t.ddl_error = None;
         }
@@ -2986,6 +3050,94 @@ impl SessionManager {
     }
 
     fn request_preview(&mut self, sidx: usize, gidx: usize, tidx: usize) {
+        let obj = match self.object_ref(sidx, gidx, tidx) {
+            Some(o) => o,
+            None => return,
+        };
+        if obj.preview.is_some() || obj.preview_loading {
+            return;
+        }
+        self.start_preview_page(sidx, gidx, tidx, 0);
+    }
+
+    /// Fetch the next page for the preview under the cursor. Used by an
+    /// explicit `Ctrl+F`; scrolling uses [`Self::maybe_fetch_explorer_preview_page`].
+    pub fn fetch_explorer_preview_page(&mut self) {
+        let Some((sidx, gidx, tidx)) = self.cursor_object_idx() else {
+            return;
+        };
+        let offset = {
+            let obj = match self.object_ref(sidx, gidx, tidx) {
+                Some(o) => o,
+                None => return,
+            };
+            if obj.preview_loading {
+                return;
+            }
+            match obj.preview.as_ref() {
+                Some(p) if !p.is_error && p.truncated => p.page_offset + p.rows.len(),
+                Some(_) => {
+                    self.sessions[self.active_idx].set_status("No more rows to fetch");
+                    return;
+                }
+                None => 0,
+            }
+        };
+        self.start_preview_page(sidx, gidx, tidx, offset);
+    }
+
+    /// Auto-paging hook for the explorer detail pane: once the user scrolls
+    /// into the last few loaded rows, append the next page in the background.
+    pub fn maybe_fetch_explorer_preview_page(&mut self) {
+        let Some((sidx, gidx, tidx)) = self.cursor_object_idx() else {
+            return;
+        };
+        let (truncated, loading, loaded, failed) = {
+            let obj = match self.object_ref(sidx, gidx, tidx) {
+                Some(o) => o,
+                None => return,
+            };
+            let Some(p) = obj.preview.as_ref() else {
+                return;
+            };
+            (
+                !p.is_error && p.truncated,
+                obj.preview_loading,
+                p.rows.len(),
+                obj.preview_error.is_some(),
+            )
+        };
+        if loading || !truncated || failed {
+            return;
+        }
+        let scroll = self.sessions[self.active_idx].explorer_detail_scroll;
+        if scroll + 10 < loaded {
+            return;
+        }
+        if self.max_rows > 0 && loaded >= self.max_rows {
+            self.sessions[self.active_idx]
+                .set_status(format!("Reached max_rows limit ({})", self.max_rows));
+            if let Some(obj) = self.object_mut(sidx, gidx, tidx) {
+                if let Some(p) = obj.preview.as_mut() {
+                    p.truncated = false;
+                }
+            }
+            return;
+        }
+        let offset = {
+            let Some(obj) = self.object_ref(sidx, gidx, tidx) else {
+                return;
+            };
+            obj.preview
+                .as_ref()
+                .map(|p| p.page_offset + p.rows.len())
+                .unwrap_or(0)
+        };
+        self.start_preview_page(sidx, gidx, tidx, offset);
+    }
+
+    /// Shared loader for the first and subsequent preview pages.
+    fn start_preview_page(&mut self, sidx: usize, gidx: usize, tidx: usize, offset: usize) {
         let obj = match self.object_ref(sidx, gidx, tidx) {
             Some(o) => o.clone(),
             None => return,
@@ -3000,14 +3152,19 @@ impl SessionManager {
             Some(s) => s,
             None => return,
         };
-        let entry = match self.object_mut(sidx, gidx, tidx) {
-            Some(e) => e,
-            None => return,
+        let req = {
+            let entry = match self.object_mut(sidx, gidx, tidx) {
+                Some(e) => e,
+                None => return,
+            };
+            if entry.preview_loading {
+                return;
+            }
+            entry.preview_req = entry.preview_req.wrapping_add(1);
+            entry.preview_loading = true;
+            entry.preview_error = None;
+            entry.preview_req
         };
-        if entry.preview.is_some() || entry.preview_loading {
-            return;
-        }
-        entry.preview_loading = true;
         let sid = self.sessions[self.active_idx].id;
         let (name, kind) = (obj.name.clone(), obj.kind.clone());
         let conn = self.active_connection();
@@ -3018,7 +3175,7 @@ impl SessionManager {
                 Some(c) => {
                     // Serialize with editor queries on the same connection.
                     let _guard = exec_lock.lock().ok();
-                    c.execute_query(&sql, Self::EXPLORER_PREVIEW_LIMIT)
+                    c.execute_query_paged(&sql, offset, Self::EXPLORER_PREVIEW_LIMIT)
                 }
                 None => QueryRow {
                     columns: vec![],
@@ -3028,7 +3185,7 @@ impl SessionManager {
                     is_error: true,
                     error_msg: Some("Not connected. Use Ctrl+O to connect.".into()),
                     rows_affected: None,
-                    page_offset: 0,
+                    page_offset: offset,
                     page_size: Self::EXPLORER_PREVIEW_LIMIT,
                     byte_count: 0,
                     total_fetched: 0,
@@ -3039,6 +3196,7 @@ impl SessionManager {
                 schema,
                 table: name,
                 kind,
+                req,
                 result,
             });
         });
@@ -3132,13 +3290,47 @@ impl SessionManager {
                     schema,
                     table,
                     kind,
+                    req,
                     result,
                 } => {
                     if let Some(e) =
                         Self::find_cached_object(&mut self.sessions, sid, &schema, &table, &kind)
                     {
-                        e.preview = Some(result);
-                        e.preview_loading = false;
+                        if e.preview_req != req {
+                            // A newer request (reload/next page) superseded this
+                            // one; leave its loading flag alone.
+                            continue;
+                        }
+                        let expected = e
+                            .preview
+                            .as_ref()
+                            .map(|p| p.page_offset + p.rows.len());
+                        if result.page_offset == 0 {
+                            // First page (or a reload): replace the preview.
+                            e.preview_error = None;
+                            e.preview = Some(result);
+                            e.preview_loading = false;
+                        } else if expected != Some(result.page_offset) {
+                            // Stale continuation (object was reloaded while the
+                            // request was in flight). Leave the in-flight flags
+                            // alone so the newer load can finish.
+                        } else if result.is_error {
+                            let msg = result
+                                .error_msg
+                                .as_deref()
+                                .unwrap_or("Failed to load more rows");
+                            e.preview_error = Some(explorer_error_hint(msg));
+                            e.preview_loading = false;
+                        } else if let Some(p) = e.preview.as_mut() {
+                            p.rows.extend(result.rows);
+                            p.truncated = result.truncated;
+                            p.elapsed_ms = p.elapsed_ms.saturating_add(result.elapsed_ms);
+                            p.byte_count = p.byte_count.saturating_add(result.byte_count);
+                            p.total_fetched = p.rows.len();
+                            p.page_size = result.page_size;
+                            e.preview_error = None;
+                            e.preview_loading = false;
+                        }
                     }
                 }
                 ExplorerMsg::Ddl {
@@ -3347,22 +3539,19 @@ mod tests {
 
     #[test]
     fn explorer_preview_sql_per_kind() {
-        // Row-bearing relations preview with a capped SELECT.
+        // Row-bearing relations use a base SELECT; paging adds LIMIT/OFFSET.
         let ora_tbl = SessionManager::explorer_preview_sql(
             DbType::Oracle,
             "SCOTT",
             "EMP",
             "TABLE",
         );
-        assert_eq!(
-            ora_tbl.as_deref(),
-            Some("SELECT * FROM SCOTT.EMP WHERE ROWNUM <= 20")
-        );
+        assert_eq!(ora_tbl.as_deref(), Some("SELECT * FROM SCOTT.EMP"));
         let pg_tbl =
             SessionManager::explorer_preview_sql(DbType::Postgres, "public", "emp", "MVIEW");
         assert_eq!(
             pg_tbl.as_deref(),
-            Some("SELECT * FROM \"public\".\"emp\" LIMIT 20")
+            Some("SELECT * FROM \"public\".\"emp\"")
         );
         // Indexes have no row preview; code neither.
         assert_eq!(
@@ -3388,6 +3577,78 @@ mod tests {
         .unwrap();
         assert!(seq.contains("ALL_SEQUENCES"));
         assert!(!seq.contains("NEXTVAL"));
+    }
+
+    #[test]
+    fn explorer_preview_pages_append_in_place() {
+        fn page(offset: usize, vals: &[&str], truncated: bool) -> QueryRow {
+            let rows: Vec<Vec<String>> =
+                vals.iter().map(|v| vec![(*v).to_string()]).collect();
+            QueryRow {
+                columns: vec!["X".into()],
+                total_fetched: rows.len(),
+                rows,
+                truncated,
+                elapsed_ms: 1,
+                is_error: false,
+                error_msg: None,
+                rows_affected: None,
+                page_offset: offset,
+                page_size: SessionManager::EXPLORER_PREVIEW_LIMIT,
+                byte_count: 0,
+            }
+        }
+
+        let mut sm = fake_explorer();
+        let sid = sm.sessions[0].id;
+        sm.explorer_tx
+            .send(ExplorerMsg::Preview {
+                sid,
+                schema: "SCOTT".into(),
+                table: "EMP".into(),
+                kind: "TABLE".into(),
+                req: 0,
+                result: page(0, &["1", "2"], true),
+            })
+            .unwrap();
+        sm.poll_explorer();
+        {
+            let e = SessionManager::find_cached_object(
+                &mut sm.sessions,
+                sid,
+                "SCOTT",
+                "EMP",
+                "TABLE",
+            )
+            .unwrap();
+            assert_eq!(e.preview.as_ref().unwrap().rows.len(), 2);
+        }
+
+        sm.explorer_tx
+            .send(ExplorerMsg::Preview {
+                sid,
+                schema: "SCOTT".into(),
+                table: "EMP".into(),
+                kind: "TABLE".into(),
+                req: 0,
+                result: page(2, &["3"], false),
+            })
+            .unwrap();
+        sm.poll_explorer();
+        let e = SessionManager::find_cached_object(
+            &mut sm.sessions,
+            sid,
+            "SCOTT",
+            "EMP",
+            "TABLE",
+        )
+        .unwrap();
+        let p = e.preview.as_ref().unwrap();
+        assert_eq!(p.page_offset, 0);
+        assert_eq!(p.rows.len(), 3);
+        assert_eq!(p.rows[2], vec!["3".to_string()]);
+        assert!(!p.truncated);
+        assert!(!e.preview_loading);
     }
 
     #[test]

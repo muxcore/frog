@@ -2,6 +2,28 @@
 
 All notable changes to frog are documented here.
 
+## [0.5.7] - 2026-10-22
+
+### Added
+- F12 DB explorer pane controls: `Tab` switches focus between the
+  Objects tree and the Detail pane, `Ctrl+Z`/`F11` zooms the focused
+  pane, and `Alt+Up`/`Down` resizes the split (mouse click focuses too).
+- F12 detail pane scrolls like the result viewer/editor: `Up`/`Down`
+  (or `j`/`k`) and `PgUp`/`PgDn` scroll rows/text, `Left`/`Right`
+  (`h`/`l`) scroll preview columns, `Home` resets, wheel scrolls and
+  `Shift+wheel`/horizontal wheel scrolls preview columns.
+- Pagination for F12 previews: scrolling into the last few rows appends
+  the next 20-row page in place (`Ctrl+F` fetches one explicitly), on
+  both Oracle and Postgres. The main result viewer now also auto-fetches
+  its next page when scrolling near the end, keeping the existing rows
+  visible while the page loads.
+- F2 session browser: the Current SQL pane now scrolls (wrapped) instead
+  of clipping a long statement, and the Explain plan pane scrolls both
+  vertically and horizontally. Scrolling follows the focused pane
+  (`Tab` to switch): `↑`/`↓`/`PgUp`/`PgDn`, `Home`/`End` for top/bottom,
+  `←`/`→` for plan sideways, and the mouse wheel scrolls the pane under
+  the pointer (Shift+wheel scrolls the plan sideways).
+
 ## [0.5.6] - 2026-10-16
 
 ### Added

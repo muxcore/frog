@@ -3,9 +3,9 @@ use crate::db::session_manager::{
     ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode,
 };
 use crate::db::DbType;
-use crate::tui::app::{ActiveWindow, ResultFormat, SessionViewPane};
+use crate::tui::app::{ActiveWindow, ExplorerPane, ResultFormat, SessionViewPane};
 use ratatui::{prelude::*, widgets::*};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn render_tabs(sessions: &[Session], active_idx: usize, f: &mut Frame, area: Rect) {
     let titles: Vec<Line> = sessions
@@ -86,11 +86,14 @@ pub fn render_command_bar(
     f.render_widget(bar, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_status_bar(
     session: &Session,
     active_window: ActiveWindow,
     session_view_focus: SessionViewPane,
     session_view_maximized: Option<SessionViewPane>,
+    explorer_focus: ExplorerPane,
+    explorer_maximized: bool,
     mouse_capture: bool,
     f: &mut Frame,
     area: Rect,
@@ -111,6 +114,16 @@ pub fn render_status_bar(
             SessionViewPane::Plan => "Focus: PLAN",
         };
         if session_view_maximized.is_some() {
+            format!("{} [MAX]", base)
+        } else {
+            base.to_string()
+        }
+    } else if session.mode == SessionMode::DbExplorer {
+        let base = match explorer_focus {
+            ExplorerPane::Tree => "Focus: OBJECTS",
+            ExplorerPane::Detail => "Focus: DETAIL",
+        };
+        if explorer_maximized {
             format!("{} [MAX]", base)
         } else {
             base.to_string()
@@ -190,7 +203,9 @@ pub fn render_status_bar(
     };
 
     let hint = if session.mode == SessionMode::SessionView {
-        " | Tab: Focus | Alt+Up/Down: Size focused pane | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
+        " | Tab: Focus | ↑↓/PgUp/PgDn: Scroll focused | Home/End: Top/Bottom | Alt+Up/Down: Size | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
+    } else if session.mode == SessionMode::DbExplorer {
+        " | Tab: Pane | Ctrl+Z: Zoom | Alt+Up/Down: Resize | Arrows/PgUp/PgDn: Scroll | Ctrl+F: More | Esc: Back"
     } else {
         " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"
     };
@@ -527,7 +542,7 @@ pub fn render_table(
         // If result is truncated and we have space, show a "load more" footer row
         if qr.truncated && visible_rows.len() < avail_height {
             let hint = format!(
-                " ↓ {} rows loaded — press Ctrl+F to fetch next {} rows ",
+                " ↓ {} rows loaded — scroll or Ctrl+F for the next {} rows ",
                 total_rows, qr.page_size
             );
             let mut footer_cells = vec![hint];
@@ -739,6 +754,18 @@ fn f2_border(focused: bool) -> Color {
     } else {
         Color::DarkGray
     }
+}
+
+/// Layout state for the F12 DB explorer (owned by `App`, same idea as
+/// `SessionViewLayout`).
+#[derive(Debug, Clone, Copy)]
+pub struct ExplorerLayout {
+    /// Tree share of the split as a % (25..85).
+    pub split_pct: u16,
+    /// Which pane has focus (Tab toggles).
+    pub focus: ExplorerPane,
+    /// When true, only the focused pane fills the view (Ctrl+Z / F11).
+    pub maximized: bool,
 }
 
 pub fn render_session_overview(
@@ -1027,20 +1054,67 @@ fn render_f2_list(
     let _ = layout;
 }
 
+/// Wrap read-only SQL text to `width` display columns, preferring spaces.
+/// Used by both the renderer and F2 key handling so scroll bounds match.
+pub fn wrap_sql_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for logical in text.split('\n') {
+        let mut rest = logical;
+        if rest.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        while UnicodeWidthStr::width(rest) > width {
+            let mut w = 0usize;
+            let mut cut = 0usize;
+            let mut last_space = None;
+            for (idx, ch) in rest.char_indices() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if w + cw > width {
+                    // If the overflow is a space, break before it so the
+                    // current word still fits on this visual line.
+                    if ch == ' ' {
+                        last_space = Some(cut);
+                    }
+                    break;
+                }
+                w += cw;
+                cut = idx + ch.len_utf8();
+                if ch == ' ' {
+                    last_space = Some(idx);
+                }
+            }
+            // Always make progress (e.g. a wide char in a 1-column pane).
+            if cut == 0 {
+                cut = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            }
+            let split = last_space.filter(|&i| i > 0).unwrap_or(cut);
+            out.push(rest[..split].trim_end().to_string());
+            rest = rest[split..].trim_start_matches(' ');
+        }
+        out.push(rest.to_string());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 fn render_f2_sql(session: &Session, focused: bool, maximized: bool, f: &mut Frame, area: Rect) {
     let sql_title = match &session.plan_for {
         Some(who) => {
             if maximized {
-                format!(" Current SQL [MAX] — session {} (r: reload · Ctrl+Z restore) ", who)
+                format!(" Current SQL [MAX] — session {} (↑/↓/PgUp/PgDn: scroll · Home/End · r: reload · Ctrl+Z restore) ", who)
             } else {
-                format!(" Current SQL — session {} (r: reload · Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ", who)
+                format!(" Current SQL — session {} (↑/↓/PgUp/PgDn scroll · Home/End · Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ", who)
             }
         }
         None => {
             if maximized {
-                " Current SQL [MAX] (Ctrl+Z restore) ".to_string()
+                " Current SQL [MAX] (↑/↓/PgUp/PgDn scroll · Home/End · Ctrl+Z restore) ".to_string()
             } else {
-                " Current SQL (Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ".to_string()
+                " Current SQL (↑/↓/PgUp/PgDn scroll · Home/End · Alt+↑/↓ grow/shrink · Tab focus · Ctrl+Z zoom) ".to_string()
             }
         }
     };
@@ -1048,8 +1122,18 @@ fn render_f2_sql(session: &Session, focused: bool, maximized: bool, f: &mut Fram
         .plan_sql_text
         .as_deref()
         .unwrap_or("↑/↓ selects a session · its SQL loads here · Enter runs EXPLAIN");
-    let sql_para = Paragraph::new(sql_text)
-        .wrap(Wrap { trim: false })
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let view_h = area.height.saturating_sub(2) as usize;
+    let lines = wrap_sql_lines(sql_text, inner_w);
+    let max_scroll = lines.len().saturating_sub(view_h);
+    let skip = session.sql_scroll.min(max_scroll);
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(skip)
+        .take(view_h.max(1))
+        .map(Line::from)
+        .collect();
+    let sql_para = Paragraph::new(visible)
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
@@ -1071,9 +1155,9 @@ fn hslice(s: &str, skip: usize) -> String {
 /// Bottom F2 pane: the stored explain plan (or a hint when none ran yet).
 fn render_plan_pane(session: &Session, focused: bool, maximized: bool, f: &mut Frame, area: Rect) {
     let title = if maximized {
-        " Explain plan [MAX] — Ctrl+Z restore · PgUp/PgDn: scroll · ←/→: sideways "
+        " Explain plan [MAX] — ↑/↓/PgUp/PgDn: scroll · Home/End: top/bottom · ←/→: sideways · Ctrl+Z restore "
     } else {
-        " Explain plan — Enter: run · PgUp/PgDn: scroll · ←/→: sideways · Alt+↑/↓ grow/shrink · Ctrl+Z zoom · Tab focus "
+        " Explain plan — Enter: run · ↑/↓/PgUp/PgDn: scroll · Home/End · ←/→ sideways · Alt+↑/↓ grow/shrink · Ctrl+Z zoom · Tab focus "
     };
     let block = || {
         Block::default()
@@ -1118,10 +1202,10 @@ fn render_plan_pane(session: &Session, focused: bool, maximized: bool, f: &mut F
             session.plan_hscroll,
         ))));
     }
-    let skip = session
-        .plan_scroll
-        .min(lines.len().saturating_sub(1));
-    let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
+    let view_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(view_h);
+    let skip = session.plan_scroll.min(max_scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(skip).take(view_h.max(1)).collect();
     let p = Paragraph::new(visible)
         .style(Style::default().fg(Color::White))
         .block(block());
@@ -1176,7 +1260,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             " ─ Results ─ ",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+F              Fetch next page of results (100 rows)"),
+        Line::from("  Ctrl+F              Fetch next page of results (auto-loads when scrolling)"),
         Line::from("  Ctrl+Y              Copy results to clipboard (OS + OSC52 for SSH)"),
         Line::from("  Alt+Y               Copy SQL statement to clipboard (no line numbers)"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
@@ -1202,8 +1286,10 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Session browser — pick a session, Enter/e shows EXPLAIN plan"),
         Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
-        Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ grow/shrink focused pane · Ctrl+↑/↓ SQL size · drag splitter · wheel scrolls"),
+        Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ grow/shrink focused pane · Ctrl+↑/↓ SQL size"),
+        Line::from("    scroll: focus SQL/Plan then ↑↓/PgUp/PgDn · Home/End top/bottom · ←→ plan sideways · wheel scrolls pane under mouse"),
         Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
+        Line::from("    panes: Tab focus (Objects/Detail) · Ctrl+Z/F11 zoom · Alt+↑/↓ resize · ↑↓/PgUp/PgDn + ←→ scroll detail · Ctrl+F more rows · wheel scrolls"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
     ];
@@ -1388,6 +1474,7 @@ pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
 pub fn render_db_explorer(
     sm: &mut SessionManager,
     result_format: ResultFormat,
+    layout: ExplorerLayout,
     f: &mut Frame,
     area: Rect,
 ) -> (Rect, Rect) {
@@ -1405,25 +1492,41 @@ pub fn render_db_explorer(
         return (Rect::default(), Rect::default());
     }
 
+    // Zoomed detail: the preview/DDL fills the whole view.
+    if layout.maximized && layout.focus == ExplorerPane::Detail {
+        render_explorer_detail(sm, result_format, true, true, f, area);
+        return (Rect::default(), area);
+    }
+
+    let split_pct = layout.split_pct.clamp(25, 85);
     // Wide screens: tree | detail. Narrow: tree over detail.
     let wide = area.width >= 80;
-    let (tree_area, detail_area, stacked) = if wide {
+    let (tree_area, detail_area, stacked) = if layout.maximized {
+        // Zoomed tree: it gets the full view, detail hit-testing is disabled.
+        (area, Rect::default(), false)
+    } else if wide {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([
+                Constraint::Percentage(split_pct),
+                Constraint::Percentage(100 - split_pct),
+            ])
             .split(area);
         (cols[0], cols[1], false)
     } else if area.height >= 14 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(55), Constraint::Min(5)])
+            .constraints([
+                Constraint::Percentage(split_pct),
+                Constraint::Min(5),
+            ])
             .split(area);
         (rows[0], rows[1], true)
     } else {
         // Short window: the tree gets everything, preview hint in the title.
         (area, Rect::default(), false)
     };
-    let show_detail = detail_area.height >= 4 && detail_area.width >= 20;
+    let show_detail = !layout.maximized && detail_area.height >= 4 && detail_area.width >= 20;
 
     let total_rows = sm.explorer_visible_rows().len();
     let scroll = {
@@ -1450,14 +1553,31 @@ pub fn render_db_explorer(
     };
     let tree_view_h = tree_area.height.saturating_sub(2) as usize;
 
-    render_explorer_tree(sm, f, tree_area, scroll, tree_view_h, show_detail || stacked);
+    render_explorer_tree(
+        sm,
+        f,
+        tree_area,
+        scroll,
+        tree_view_h,
+        show_detail || stacked,
+        layout.focus == ExplorerPane::Tree,
+        layout.maximized,
+    );
     if show_detail {
-        render_explorer_detail(sm, result_format, f, detail_area);
+        render_explorer_detail(
+            sm,
+            result_format,
+            layout.focus == ExplorerPane::Detail,
+            false,
+            f,
+            detail_area,
+        );
     }
     (tree_area, detail_area)
 }
 
 /// Left pane of the explorer: the object tree itself.
+#[allow(clippy::too_many_arguments)]
 fn render_explorer_tree(
     sm: &SessionManager,
     f: &mut Frame,
@@ -1465,6 +1585,8 @@ fn render_explorer_tree(
     scroll: usize,
     view_h: usize,
     detail_hidden: bool,
+    focused: bool,
+    maximized: bool,
 ) {
     let sess = sm.active_session();
     let rows = sm.explorer_visible_rows();
@@ -1478,14 +1600,22 @@ fn render_explorer_tree(
     } else {
         format!("  [Filter: {}]", sess.explorer_filter)
     };
-    let title = if detail_hidden {
-        format!(
-            " DB Explorer — ↑↓ move · →/Enter expand · s SELECT→editor · d reload · / filter · r refresh · Esc back{} ",
-            filter_note
-        )
+    let title = if detail_hidden || maximized {
+        if maximized {
+            format!(
+                " Objects [MAX] — Ctrl+Z restore · Tab focus · ↑↓ move · →/Enter expand · / filter{} ",
+                filter_note
+            )
+        } else {
+            format!(
+                " DB Explorer — ↑↓ move · →/Enter expand · s SELECT→editor · d reload · / filter · r refresh · Tab pane · Ctrl+Z zoom · Alt+↑↓ resize · Esc back{} ",
+                filter_note
+            )
+        }
     } else {
         format!(
-            " Objects ({} shown{}){} ",
+            " {}Objects ({} shown{}) · Tab pane · Ctrl+Z zoom{} ",
+            if focused { "▸ " } else { "" },
             rows.len(),
             if sess.explorer_filter.is_empty() {
                 String::new()
@@ -1503,7 +1633,7 @@ fn render_explorer_tree(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(f2_border(focused))),
             );
         f.render_widget(p, area);
         return;
@@ -1520,7 +1650,7 @@ fn render_explorer_tree(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(f2_border(focused))),
             );
         f.render_widget(p, area);
         return;
@@ -1537,7 +1667,7 @@ fn render_explorer_tree(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(f2_border(focused))),
     );
     f.render_widget(p, area);
 
@@ -1648,6 +1778,8 @@ fn explorer_tree_line(sess: &Session, row: &ExplorerRow, selected: bool, inner_w
 fn render_explorer_detail(
     sm: &SessionManager,
     result_format: ResultFormat,
+    focused: bool,
+    maximized: bool,
     f: &mut Frame,
     area: Rect,
 ) {
@@ -1796,12 +1928,13 @@ fn render_explorer_detail(
             let p = Paragraph::new(visible).block(
                 Block::default()
                     .title(format!(
-                        " {} · PgUp/PgDn scroll ({} lines) · s SELECT→editor · d reload ",
+                        " {}{} · ↑↓/PgUp/PgDn scroll ({} lines) · s SELECT→editor · d reload ",
                         title.trim(),
+                        if maximized { " [MAX]" } else { "" },
                         total
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(f2_border(focused))),
             );
             f.render_widget(p, area);
         }
@@ -1821,9 +1954,13 @@ fn render_explorer_detail(
                     top.into_iter().take(shown).map(|l| fit_line(&l)).collect();
                 let p = Paragraph::new(visible).block(
                     Block::default()
-                        .title(format!(" {} ", title.trim()))
+                        .title(format!(
+                            " {}{} · ↑↓/PgUp/PgDn scroll · ←→ cols ",
+                            title.trim(),
+                            if maximized { " [MAX]" } else { "" }
+                        ))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray)),
+                        .border_style(Style::default().fg(f2_border(focused))),
                 );
                 f.render_widget(p, chunks[0]);
                 render_table(
@@ -1831,9 +1968,9 @@ fn render_explorer_detail(
                     &Some(preview),
                     TableViewState {
                         scroll_offset: sess.explorer_detail_scroll,
-                        col_scroll_offset: 0,
+                        col_scroll_offset: sess.explorer_detail_col_scroll,
                         result_format,
-                        focused: false,
+                        focused,
                     },
                     f,
                     chunks[1],
@@ -1856,9 +1993,9 @@ fn render_explorer_detail(
                     .collect();
                 let p = Paragraph::new(visible).block(
                     Block::default()
-                        .title(format!(" {} ", title.trim()))
+                        .title(format!(" {}{} ", title.trim(), if maximized { "[MAX]" } else { "" }))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray)),
+                        .border_style(Style::default().fg(f2_border(focused))),
                 );
                 f.render_widget(p, area);
             }
@@ -1896,7 +2033,17 @@ fn explorer_object_detail(
         Some(v) => v,
         None => return D::Text(" Detail ".into(), vec![]),
     };
-    let title = format!(" Detail — {}.{} [{}] ", schema_name, t.name, t.kind);
+    let title = {
+        let more = if t.preview.as_ref().is_some_and(|p| p.truncated) {
+            " · Ctrl+F more"
+        } else {
+            ""
+        };
+        format!(
+            " Detail — {}.{} [{}]{} ",
+            schema_name, t.name, t.kind, more
+        )
+    };
     let header = Line::from(Span::styled(
         format!("{}.{} — {}", schema_name, t.name, t.kind),
         Style::default()
@@ -1906,6 +2053,17 @@ fn explorer_object_detail(
 
     // Column section for expandable objects.
     let mut top = vec![header];
+    if let Some(err) = t.preview_error.as_ref() {
+        top.push(Line::from(Span::styled(
+            format!("⚠ Preview paging failed: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    } else if t.preview_loading && t.preview.is_some() {
+        top.push(Line::from(Span::styled(
+            "⟳ Loading more rows…",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     if t.is_expandable() {
         match t.columns.as_ref() {
             Some(cols) if !cols.is_empty() => {
@@ -1976,7 +2134,8 @@ fn explorer_object_detail(
         }
     }
 
-    // Live 20-row preview in result-viewer style (same as executed SQL).
+    // Live preview in result-viewer style (same as executed SQL). Further
+    // pages append in place.
     if let Some(qr) = t.preview.as_ref() {
         return D::Split(title, top, qr);
     }

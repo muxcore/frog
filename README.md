@@ -16,7 +16,7 @@ Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
 - **SQL history** — persisted to `frog_history.txt` next to the binary and browsable in-app.
 - **Oracle + Postgres** — pick the backend with `--db-type` or the `Type:` row in the connection dialog (`Ctrl+O`). Postgres needs no client libraries.
-- **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style). `a` filters ACTIVE sessions only, `s`/`S` sorts columns.
+- **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style). Scroll/zoom the full SQL and plan panes, `a` filters ACTIVE sessions only, `s`/`S` sorts columns.
 - **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
 
 ![Demo GIF](multimedia/demo.gif)
@@ -186,11 +186,11 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
 | `Ctrl+C` / `Esc` | Cancel running query |
-| `Ctrl+F` | Fetch next page of results |
+| `Ctrl+F` | Fetch next page of results (next page also auto-loads when scrolling near the end) |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction) / History |
-| `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), 20-row preview in result style (`Ctrl+D` switches format), DDL/source |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+↑`/`↓` = grow/shrink focused pane, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL/plan) / History |
+| `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), paged preview in result style (`Ctrl+D` switches format; scroll to the end or `Ctrl+F` for the next 20 rows), DDL/source. `Tab` switches focus Objects/Detail, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, `↑`/`↓`/`PgUp`/`PgDn` and `←`/`→` scroll the detail pane, wheel scrolls (Shift+wheel or horizontal wheel scrolls columns) |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` / `Alt+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |
@@ -243,8 +243,8 @@ ui:
 
 ## Backend notes
 
-- **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET` — `Ctrl+F` fetches more on both.
-- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `a` toggles the ACTIVE-only filter, `s` cycles the sort column, `S` toggles sort direction, `PgUp`/`PgDn` scroll the plan. Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
+- **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET`. The result viewer and F12 previews append the next page automatically when you scroll near the end; `Ctrl+F` fetches one explicitly (20 rows per preview page, `page_size` for query results).
+- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `a` toggles the ACTIVE-only filter, `s` cycles the sort column, `S` toggles sort direction. `Tab` focuses List/SQL/Plan; `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` grows/shrinks it, and `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL or plan pane (`←`/`→` scroll the plan sideways; the wheel scrolls the pane under the mouse). Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
 - **F2 privileges (Oracle)**: the browser needs dictionary access. If F2 shows an error about it, ask your DBA for e.g.:
   ```sql
   GRANT SELECT_CATALOG_ROLE TO scott;
@@ -277,5 +277,5 @@ cargo test
 ## Known Issues
 
 - No horizontal scrolling for long editor lines.
-- Result pagination is capped at an initial page (use `Ctrl+F` to fetch more).
+- Result pages load automatically near the end; `Ctrl+F` is still available for an explicit next page.
 - `connections[]` config entries are not yet wired into the connection-dialog picker.

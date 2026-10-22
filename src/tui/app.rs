@@ -29,6 +29,16 @@ enum CopyOutcome {
 /// Max bytes offered via OSC52 (terminals cap it, often ~700KB).
 const MAX_OSC52_BYTES: usize = 500_000;
 
+/// Apply a signed scroll delta, clamped to `max` (inclusive).
+fn scroll_by(current: usize, delta: isize, max: usize) -> usize {
+    let next = if delta >= 0 {
+        current.saturating_add(delta as usize)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    };
+    next.min(max)
+}
+
 /// Normalize pasted text: `CRLF` -> single `LF`, lone `CR` (git-bash sends
 /// CR-only line breaks) -> `LF`. Caller expands tabs / maps newlines per
 /// target (editor newline vs single-line field).
@@ -154,6 +164,13 @@ pub struct App {
     sidebar_area: Rect,
     explorer_area: Rect,
     explorer_detail_area: Rect,
+    /// F12 DB explorer: which pane has focus (Tab toggles Tree/Detail).
+    explorer_focus: ExplorerPane,
+    /// F12 DB explorer: only the focused pane fills the view
+    /// (Ctrl+Z / F11 toggles, same as the query tab and F2).
+    explorer_maximized: bool,
+    /// F12 DB explorer: tree share of the split as a % (25..85).
+    explorer_split_pct: u16,
     /// F2 session viewer: top list height as % of the view (15..85).
     /// Grown/shrunk with Alt+Up/Down while the List pane is focused
     /// (Ctrl+Z zooms any pane like the query tab).
@@ -219,6 +236,27 @@ impl SessionViewPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplorerPane {
+    #[default]
+    Tree,
+    Detail,
+}
+
+impl ExplorerPane {
+    pub fn next(self) -> Self {
+        match self {
+            ExplorerPane::Tree => ExplorerPane::Detail,
+            ExplorerPane::Detail => ExplorerPane::Tree,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        // Two panes: previous is the same as next.
+        self.next()
+    }
+}
+
 /// Which F2 horizontal splitter is being mouse-dragged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionResize {
@@ -261,6 +299,9 @@ impl App {
             sidebar_area: Rect::default(),
             explorer_area: Rect::default(),
             explorer_detail_area: Rect::default(),
+            explorer_focus: ExplorerPane::Tree,
+            explorer_maximized: false,
+            explorer_split_pct: 55,
             session_list_pct: 45,
             session_sql_height: 7,
             session_view_focus: SessionViewPane::List,
@@ -667,6 +708,7 @@ impl App {
                 {
                     let session = self.session_manager.active_session_mut();
                     session.scroll_offset = session.scroll_offset.saturating_add(3);
+                    self.session_manager.maybe_fetch_next_page();
                 }
             }
             MouseEventKind::ScrollUp
@@ -963,26 +1005,35 @@ impl App {
                     }
                     _ => {}
                 },
-                ActiveWindow::Results => match key.code {
-                    KeyCode::Down => {
-                        session.scroll_offset = session.scroll_offset.saturating_add(1)
+                ActiveWindow::Results => {
+                    match key.code {
+                        KeyCode::Down => {
+                            session.scroll_offset = session.scroll_offset.saturating_add(1)
+                        }
+                        KeyCode::Up => {
+                            session.scroll_offset = session.scroll_offset.saturating_sub(1)
+                        }
+                        KeyCode::Right => {
+                            session.col_scroll_offset =
+                                session.col_scroll_offset.saturating_add(1)
+                        }
+                        KeyCode::Left => {
+                            session.col_scroll_offset =
+                                session.col_scroll_offset.saturating_sub(1)
+                        }
+                        KeyCode::PageDown => {
+                            session.scroll_offset = session.scroll_offset.saturating_add(20)
+                        }
+                        KeyCode::PageUp => {
+                            session.scroll_offset = session.scroll_offset.saturating_sub(20)
+                        }
+                        KeyCode::Esc => self.active_window = ActiveWindow::Editor,
+                        _ => {}
                     }
-                    KeyCode::Up => session.scroll_offset = session.scroll_offset.saturating_sub(1),
-                    KeyCode::Right => {
-                        session.col_scroll_offset = session.col_scroll_offset.saturating_add(1)
+                    if matches!(key.code, KeyCode::Down | KeyCode::PageDown) {
+                        self.session_manager.maybe_fetch_next_page();
                     }
-                    KeyCode::Left => {
-                        session.col_scroll_offset = session.col_scroll_offset.saturating_sub(1)
-                    }
-                    KeyCode::PageDown => {
-                        session.scroll_offset = session.scroll_offset.saturating_add(20)
-                    }
-                    KeyCode::PageUp => {
-                        session.scroll_offset = session.scroll_offset.saturating_sub(20)
-                    }
-                    KeyCode::Esc => self.active_window = ActiveWindow::Editor,
-                    _ => {}
-                },
+                }
                 ActiveWindow::Sidebar => {
                     if key.code == KeyCode::Esc {
                         self.active_window = ActiveWindow::Editor;
@@ -1176,10 +1227,18 @@ impl App {
                 self.session_resizing = None;
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
-                self.session_manager.move_session_cursor(-1);
+                match self.session_view_focus {
+                    SessionViewPane::List => self.session_manager.move_session_cursor(-1),
+                    SessionViewPane::Sql => self.scroll_session_sql(-1),
+                    SessionViewPane::Plan => self.scroll_session_plan(-1),
+                }
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
-                self.session_manager.move_session_cursor(1);
+                match self.session_view_focus {
+                    SessionViewPane::List => self.session_manager.move_session_cursor(1),
+                    SessionViewPane::Sql => self.scroll_session_sql(1),
+                    SessionViewPane::Plan => self.scroll_session_plan(1),
+                }
             }
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
                 self.session_manager.explain_selected();
@@ -1210,29 +1269,97 @@ impl App {
                 self.session_manager.refresh_session_list();
                 self.session_manager.load_selected_sql();
             }
-            KeyCode::PageUp => {
-                let session = self.session_manager.active_session_mut();
-                session.plan_scroll = session.plan_scroll.saturating_sub(10);
+            KeyCode::PageUp => match self.session_view_focus {
+                SessionViewPane::List => self.session_manager.move_session_cursor(-10),
+                SessionViewPane::Sql => self.scroll_session_sql(-10),
+                SessionViewPane::Plan => self.scroll_session_plan(-10),
+            },
+            KeyCode::PageDown => match self.session_view_focus {
+                SessionViewPane::List => self.session_manager.move_session_cursor(10),
+                SessionViewPane::Sql => self.scroll_session_sql(10),
+                SessionViewPane::Plan => self.scroll_session_plan(10),
+            },
+            KeyCode::Home => match self.session_view_focus {
+                SessionViewPane::List => self.session_view_set_cursor(0),
+                SessionViewPane::Sql => {
+                    self.session_manager.active_session_mut().sql_scroll = 0;
+                }
+                SessionViewPane::Plan => {
+                    let s = self.session_manager.active_session_mut();
+                    s.plan_scroll = 0;
+                    s.plan_hscroll = 0;
+                }
+            },
+            KeyCode::End => match self.session_view_focus {
+                SessionViewPane::List => {
+                    let len = self.session_manager.visible_session_list().len();
+                    self.session_view_set_cursor(len.saturating_sub(1));
+                }
+                SessionViewPane::Sql => {
+                    let max = self.session_sql_max_scroll();
+                    self.session_manager.active_session_mut().sql_scroll = max;
+                }
+                SessionViewPane::Plan => {
+                    let max = self.session_plan_max_scroll();
+                    self.session_manager.active_session_mut().plan_scroll = max;
+                }
+            },
+            KeyCode::Left if self.session_view_focus == SessionViewPane::Plan => {
+                self.scroll_session_plan_horizontal(-8);
             }
-            KeyCode::PageDown => {
-                let session = self.session_manager.active_session_mut();
-                session.plan_scroll = session.plan_scroll.saturating_add(10);
-            }
-            KeyCode::Home => {
-                let session = self.session_manager.active_session_mut();
-                session.plan_scroll = 0;
-                session.plan_hscroll = 0;
-            }
-            KeyCode::Left => {
-                let session = self.session_manager.active_session_mut();
-                session.plan_hscroll = session.plan_hscroll.saturating_sub(8);
-            }
-            KeyCode::Right => {
-                let session = self.session_manager.active_session_mut();
-                session.plan_hscroll = session.plan_hscroll.saturating_add(8);
+            KeyCode::Right if self.session_view_focus == SessionViewPane::Plan => {
+                self.scroll_session_plan_horizontal(8);
             }
             _ => {}
         }
+    }
+
+    fn session_view_set_cursor(&mut self, idx: usize) {
+        let len = self.session_manager.visible_session_list().len();
+        if len == 0 {
+            return;
+        }
+        let idx = idx.min(len - 1);
+        if self.session_manager.active_session().session_view_cursor == idx {
+            return;
+        }
+        self.session_manager.active_session_mut().session_view_cursor = idx;
+        self.session_manager.load_selected_sql();
+    }
+
+    fn session_sql_max_scroll(&self) -> usize {
+        let sess = self.session_manager.active_session();
+        let text = sess.plan_sql_text.as_deref().unwrap_or("");
+        let width = self.session_sql_area.width.saturating_sub(2) as usize;
+        let height = self.session_sql_area.height.saturating_sub(2) as usize;
+        wrap_sql_lines(text, width).len().saturating_sub(height)
+    }
+
+    fn session_plan_max_scroll(&self) -> usize {
+        let sess = self.session_manager.active_session();
+        let lines = match sess.plan_result.as_ref() {
+            Some(qr) if !qr.is_error && !qr.columns.is_empty() => qr.rows.len() + 1,
+            _ => 0,
+        };
+        let height = self.session_plan_area.height.saturating_sub(2) as usize;
+        lines.saturating_sub(height)
+    }
+
+    fn scroll_session_sql(&mut self, delta: isize) {
+        let max = self.session_sql_max_scroll();
+        let s = self.session_manager.active_session_mut();
+        s.sql_scroll = scroll_by(s.sql_scroll, delta, max);
+    }
+
+    fn scroll_session_plan(&mut self, delta: isize) {
+        let max = self.session_plan_max_scroll();
+        let s = self.session_manager.active_session_mut();
+        s.plan_scroll = scroll_by(s.plan_scroll, delta, max);
+    }
+
+    fn scroll_session_plan_horizontal(&mut self, delta: isize) {
+        let s = self.session_manager.active_session_mut();
+        s.plan_hscroll = scroll_by(s.plan_hscroll, delta, usize::MAX);
     }
 
     /// Grow whichever F2 pane has focus (Alt+Up). List grows its % share,
@@ -1291,6 +1418,12 @@ impl App {
             self.result_format = self.result_format.cycle();
             return;
         }
+        // Explicit next page for the detailed preview (auto-paging also
+        // triggers when scrolling near the end of the loaded rows).
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+            self.session_manager.fetch_explorer_preview_page();
+            return;
+        }
         // Filter input captures most keystrokes until Enter/Esc.
         if self.session_manager.active_session().explorer_filtering {
             let session = self.session_manager.active_session_mut();
@@ -1320,6 +1453,34 @@ impl App {
             }
             return;
         }
+        // Focus / zoom / resize — same as the query tab and the F2 viewer.
+        // Checked before plain navigation because Alt+Up shares KeyCode::Up.
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                self.explorer_focus = self.explorer_focus.next();
+                return;
+            }
+            (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::NONE, KeyCode::BackTab) => {
+                self.explorer_focus = self.explorer_focus.prev();
+                return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('z'))
+            | (KeyModifiers::CONTROL, KeyCode::Char('Z'))
+            | (KeyModifiers::NONE, KeyCode::F(11)) => {
+                self.explorer_maximized = !self.explorer_maximized;
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Up) => {
+                self.explorer_split_pct = (self.explorer_split_pct + 5).min(85);
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Down) => {
+                self.explorer_split_pct = self.explorer_split_pct.saturating_sub(5).max(25);
+                return;
+            }
+            _ => {}
+        }
+        let detail_focused = self.explorer_focus == ExplorerPane::Detail;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 let session = self.session_manager.active_session_mut();
@@ -1328,47 +1489,99 @@ impl App {
                 self.active_window = ActiveWindow::Editor;
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
-                self.session_manager.move_explorer_cursor(-1);
+                if detail_focused {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_sub(1);
+                } else {
+                    self.session_manager.move_explorer_cursor(-1);
+                }
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
-                self.session_manager.move_explorer_cursor(1);
-            }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Enter => {
-                self.session_manager.toggle_explorer_cursor();
-            }
-            KeyCode::Char(' ') => {
-                self.session_manager.toggle_explorer_cursor();
-            }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
-                self.session_manager.collapse_explorer_cursor();
+                if detail_focused {
+                    {
+                        let s = self.session_manager.active_session_mut();
+                        s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_add(1);
+                    }
+                    self.session_manager.maybe_fetch_explorer_preview_page();
+                } else {
+                    self.session_manager.move_explorer_cursor(1);
+                }
             }
             KeyCode::PageUp => {
-                let session = self.session_manager.active_session_mut();
-                session.explorer_detail_scroll =
-                    session.explorer_detail_scroll.saturating_sub(10);
+                if detail_focused {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_sub(10);
+                } else {
+                    self.session_manager.move_explorer_cursor(-10);
+                }
             }
             KeyCode::PageDown => {
-                let session = self.session_manager.active_session_mut();
-                session.explorer_detail_scroll =
-                    session.explorer_detail_scroll.saturating_add(10);
+                if detail_focused {
+                    {
+                        let s = self.session_manager.active_session_mut();
+                        s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_add(10);
+                    }
+                    self.session_manager.maybe_fetch_explorer_preview_page();
+                } else {
+                    self.session_manager.move_explorer_cursor(10);
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                if detail_focused {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_col_scroll =
+                        s.explorer_detail_col_scroll.saturating_sub(1);
+                } else {
+                    self.session_manager.collapse_explorer_cursor();
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                if detail_focused {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_col_scroll =
+                        s.explorer_detail_col_scroll.saturating_add(1);
+                } else {
+                    self.session_manager.toggle_explorer_cursor();
+                }
+            }
+            KeyCode::Enter => {
+                if !detail_focused {
+                    self.session_manager.toggle_explorer_cursor();
+                }
+            }
+            KeyCode::Char(' ') => {
+                if !detail_focused {
+                    self.session_manager.toggle_explorer_cursor();
+                }
             }
             KeyCode::Home => {
-                let session = self.session_manager.active_session_mut();
-                session.explorer_cursor = 0;
-                session.explorer_scroll = 0;
-                session.explorer_detail_scroll = 0;
-                self.session_manager.maybe_load_detail_for_cursor();
+                if detail_focused {
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_scroll = 0;
+                    s.explorer_detail_col_scroll = 0;
+                } else {
+                    let session = self.session_manager.active_session_mut();
+                    session.explorer_cursor = 0;
+                    session.explorer_scroll = 0;
+                    session.explorer_detail_scroll = 0;
+                    session.explorer_detail_col_scroll = 0;
+                    self.session_manager.maybe_load_detail_for_cursor();
+                }
             }
             KeyCode::End => {
-                let len = self.session_manager.explorer_visible_rows().len();
-                {
-                    let session = self.session_manager.active_session_mut();
-                    session.explorer_cursor = len.saturating_sub(1);
-                    session.explorer_detail_scroll = 0;
+                if !detail_focused {
+                    let len = self.session_manager.explorer_visible_rows().len();
+                    {
+                        let session = self.session_manager.active_session_mut();
+                        session.explorer_cursor = len.saturating_sub(1);
+                        session.explorer_detail_scroll = 0;
+                        session.explorer_detail_col_scroll = 0;
+                    }
+                    self.session_manager.maybe_load_detail_for_cursor();
                 }
-                self.session_manager.maybe_load_detail_for_cursor();
             }
             KeyCode::Char('/') => {
+                self.explorer_focus = ExplorerPane::Tree;
                 let session = self.session_manager.active_session_mut();
                 session.explorer_filtering = true;
             }
@@ -1401,35 +1614,81 @@ impl App {
     fn handle_explorer_mouse(&mut self, mouse: MouseEvent) -> bool {
         let tree = self.explorer_area;
         let detail = self.explorer_detail_area;
-        if tree.width == 0 || tree.height == 0 {
+        if tree.width == 0 && tree.height == 0 && detail.width == 0 && detail.height == 0 {
             return false;
         }
         let pos = Position::new(mouse.column, mouse.row);
+        let in_tree = tree.width > 0 && tree.height > 0 && tree.contains(pos);
+        let in_detail = detail.width > 0 && detail.height > 0 && detail.contains(pos);
         match mouse.kind {
             MouseEventKind::ScrollDown => {
-                if detail.width > 0 && detail.contains(pos) {
-                    let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_add(3);
-                } else if tree.contains(pos) {
+                if in_detail {
+                    self.explorer_focus = ExplorerPane::Detail;
+                    let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                    {
+                        let s = self.session_manager.active_session_mut();
+                        if shift {
+                            s.explorer_detail_col_scroll =
+                                s.explorer_detail_col_scroll.saturating_add(3);
+                        } else {
+                            s.explorer_detail_scroll =
+                                s.explorer_detail_scroll.saturating_add(3);
+                        }
+                    }
+                    if !shift {
+                        self.session_manager.maybe_fetch_explorer_preview_page();
+                    }
+                } else if in_tree {
+                    self.explorer_focus = ExplorerPane::Tree;
                     let s = self.session_manager.active_session_mut();
                     s.explorer_scroll = s.explorer_scroll.saturating_add(3);
                 }
                 return true;
             }
             MouseEventKind::ScrollUp => {
-                if detail.width > 0 && detail.contains(pos) {
+                if in_detail {
+                    self.explorer_focus = ExplorerPane::Detail;
                     let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_sub(3);
-                } else if tree.contains(pos) {
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        s.explorer_detail_col_scroll =
+                            s.explorer_detail_col_scroll.saturating_sub(3);
+                    } else {
+                        s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_sub(3);
+                    }
+                } else if in_tree {
+                    self.explorer_focus = ExplorerPane::Tree;
                     let s = self.session_manager.active_session_mut();
                     s.explorer_scroll = s.explorer_scroll.saturating_sub(3);
                 }
                 return true;
             }
-            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                if !tree.contains(pos) {
-                    return false;
+            MouseEventKind::ScrollLeft => {
+                if in_detail {
+                    self.explorer_focus = ExplorerPane::Detail;
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_col_scroll =
+                        s.explorer_detail_col_scroll.saturating_sub(3);
                 }
+                return true;
+            }
+            MouseEventKind::ScrollRight => {
+                if in_detail {
+                    self.explorer_focus = ExplorerPane::Detail;
+                    let s = self.session_manager.active_session_mut();
+                    s.explorer_detail_col_scroll =
+                        s.explorer_detail_col_scroll.saturating_add(3);
+                }
+                return true;
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if in_detail {
+                    self.explorer_focus = ExplorerPane::Detail;
+                    return true;
+                }
+                if !in_tree {
+                    return true;
+                }
+                self.explorer_focus = ExplorerPane::Tree;
                 // Content starts one row below the block border.
                 let rel = mouse.row.saturating_sub(tree.y + 1) as usize;
                 let sess = self.session_manager.active_session();
@@ -1449,6 +1708,7 @@ impl App {
                         let s = self.session_manager.active_session_mut();
                         s.explorer_cursor = idx;
                         s.explorer_detail_scroll = 0;
+                        s.explorer_detail_col_scroll = 0;
                     }
                     self.session_manager.toggle_explorer_cursor();
                 } else {
@@ -1480,11 +1740,14 @@ impl App {
                         SessionViewPane::List => {
                             self.session_manager.move_session_cursor(1);
                         }
+                        SessionViewPane::Sql => self.scroll_session_sql(3),
                         SessionViewPane::Plan => {
-                            let s = self.session_manager.active_session_mut();
-                            s.plan_scroll = s.plan_scroll.saturating_add(3);
+                            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                self.scroll_session_plan_horizontal(3);
+                            } else {
+                                self.scroll_session_plan(3);
+                            }
                         }
-                        SessionViewPane::Sql => {}
                     }
                     return true;
                 }
@@ -1493,11 +1756,26 @@ impl App {
                         SessionViewPane::List => {
                             self.session_manager.move_session_cursor(-1);
                         }
+                        SessionViewPane::Sql => self.scroll_session_sql(-3),
                         SessionViewPane::Plan => {
-                            let s = self.session_manager.active_session_mut();
-                            s.plan_scroll = s.plan_scroll.saturating_sub(3);
+                            if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                self.scroll_session_plan_horizontal(-3);
+                            } else {
+                                self.scroll_session_plan(-3);
+                            }
                         }
-                        SessionViewPane::Sql => {}
+                    }
+                    return true;
+                }
+                MouseEventKind::ScrollLeft => {
+                    if self.session_view_focus == SessionViewPane::Plan {
+                        self.scroll_session_plan_horizontal(-3);
+                    }
+                    return true;
+                }
+                MouseEventKind::ScrollRight => {
+                    if self.session_view_focus == SessionViewPane::Plan {
+                        self.scroll_session_plan_horizontal(3);
                     }
                     return true;
                 }
@@ -1521,19 +1799,49 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
                 if self.session_plan_area.contains(pos) {
-                    let s = self.session_manager.active_session_mut();
-                    s.plan_scroll = s.plan_scroll.saturating_add(3);
+                    self.session_view_focus = SessionViewPane::Plan;
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.scroll_session_plan_horizontal(3);
+                    } else {
+                        self.scroll_session_plan(3);
+                    }
+                } else if self.session_sql_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Sql;
+                    self.scroll_session_sql(3);
                 } else if self.session_list_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::List;
                     self.session_manager.move_session_cursor(1);
                 }
                 return true;
             }
             MouseEventKind::ScrollUp => {
                 if self.session_plan_area.contains(pos) {
-                    let s = self.session_manager.active_session_mut();
-                    s.plan_scroll = s.plan_scroll.saturating_sub(3);
+                    self.session_view_focus = SessionViewPane::Plan;
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.scroll_session_plan_horizontal(-3);
+                    } else {
+                        self.scroll_session_plan(-3);
+                    }
+                } else if self.session_sql_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Sql;
+                    self.scroll_session_sql(-3);
                 } else if self.session_list_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::List;
                     self.session_manager.move_session_cursor(-1);
+                }
+                return true;
+            }
+            MouseEventKind::ScrollLeft => {
+                if self.session_plan_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Plan;
+                    self.scroll_session_plan_horizontal(-3);
+                }
+                return true;
+            }
+            MouseEventKind::ScrollRight => {
+                if self.session_plan_area.contains(pos) {
+                    self.session_view_focus = SessionViewPane::Plan;
+                    self.scroll_session_plan_horizontal(3);
                 }
                 return true;
             }
@@ -1727,9 +2035,15 @@ impl App {
                 self.session_plan_area = plan_a;
             }
             SessionMode::DbExplorer => {
+                let layout = ExplorerLayout {
+                    split_pct: self.explorer_split_pct,
+                    focus: self.explorer_focus,
+                    maximized: self.explorer_maximized,
+                };
                 let (tree, detail) = render_db_explorer(
                     &mut self.session_manager,
                     self.result_format,
+                    layout,
                     f,
                     chunks[1],
                 );
@@ -1895,6 +2209,8 @@ impl App {
                 self.active_window,
                 self.session_view_focus,
                 self.session_view_maximized,
+                self.explorer_focus,
+                self.explorer_maximized,
                 self.mouse_capture,
                 f,
                 chunks[2],
@@ -1992,6 +2308,22 @@ mod tests {
             saved_connections: Vec::new(),
         };
         App::new(config, SessionManager::new()).expect("app")
+    }
+
+    fn test_plan(rows: usize) -> crate::db::connection::QueryRow {
+        crate::db::connection::QueryRow {
+            columns: vec!["PLAN".into()],
+            rows: (0..rows).map(|i| vec![format!("row {}", i)]).collect(),
+            truncated: false,
+            elapsed_ms: 0,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset: 0,
+            page_size: 100,
+            byte_count: 0,
+            total_fetched: rows,
+        }
     }
 
     #[test]
@@ -2113,5 +2445,141 @@ mod tests {
         assert_eq!(app.session_list_pct, before);
         app.handle_session_view(key(KeyModifiers::ALT, KeyCode::Up));
         assert_eq!(app.session_list_pct, before + 5);
+    }
+
+    #[test]
+    fn wrap_sql_lines_prefers_spaces_and_fits_width() {
+        assert_eq!(
+            wrap_sql_lines("aaaa bbbb cccc", 9),
+            vec!["aaaa bbbb".to_string(), "cccc".to_string()]
+        );
+        assert_eq!(
+            wrap_sql_lines("", 8),
+            vec![String::new()]
+        );
+        let long = "x".repeat(25);
+        let lines = wrap_sql_lines(&long, 10);
+        assert_eq!(lines, vec!["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+    }
+
+    #[test]
+    fn session_view_scrolls_focused_sql_and_plan() {
+        let mut app = test_app();
+        app.session_sql_area = Rect::new(0, 0, 20, 6); // inner: 18 cols, 4 rows
+        app.session_plan_area = Rect::new(0, 0, 40, 6); // inner: 4 rows
+
+        let sql = format!(
+            "SELECT {} FROM dual",
+            (0..40)
+                .map(|i| format!("column_{}", i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        app.session_manager.active_session_mut().plan_sql_text = Some(sql);
+        app.session_view_focus = SessionViewPane::Sql;
+        let sql_max = app.session_sql_max_scroll();
+        assert!(sql_max > 0);
+
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Down));
+        assert_eq!(app.session_manager.active_session().sql_scroll, 1);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::PageDown));
+        assert_eq!(app.session_manager.active_session().sql_scroll, 11);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::End));
+        assert_eq!(app.session_manager.active_session().sql_scroll, sql_max);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::PageUp));
+        assert_eq!(
+            app.session_manager.active_session().sql_scroll,
+            sql_max.saturating_sub(10)
+        );
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Home));
+        assert_eq!(app.session_manager.active_session().sql_scroll, 0);
+
+        app.session_manager.active_session_mut().plan_result = Some(test_plan(20));
+        app.session_view_focus = SessionViewPane::Plan;
+        assert_eq!(app.session_plan_max_scroll(), 17);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Down));
+        assert_eq!(app.session_manager.active_session().plan_scroll, 1);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::PageDown));
+        assert_eq!(app.session_manager.active_session().plan_scroll, 11);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::End));
+        assert_eq!(app.session_manager.active_session().plan_scroll, 17);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Right));
+        assert_eq!(app.session_manager.active_session().plan_hscroll, 8);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Left));
+        assert_eq!(app.session_manager.active_session().plan_hscroll, 0);
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::Home));
+        assert_eq!(app.session_manager.active_session().plan_scroll, 0);
+
+        // List focus keeps the SQL/plan scroll offsets untouched.
+        app.session_view_focus = SessionViewPane::List;
+        app.handle_session_view(key(KeyModifiers::NONE, KeyCode::PageDown));
+        assert_eq!(app.session_manager.active_session().plan_scroll, 0);
+        assert_eq!(app.session_manager.active_session().sql_scroll, 0);
+    }
+
+    #[test]
+    fn explorer_tab_cycles_focus_and_ctrl_z_zooms() {
+        let mut app = test_app();
+        assert_eq!(app.explorer_focus, ExplorerPane::Tree);
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.explorer_focus, ExplorerPane::Detail);
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.explorer_focus, ExplorerPane::Tree);
+        app.handle_db_explorer(key(KeyModifiers::SHIFT, KeyCode::BackTab));
+        assert_eq!(app.explorer_focus, ExplorerPane::Detail);
+
+        assert!(!app.explorer_maximized);
+        app.handle_db_explorer(key(KeyModifiers::CONTROL, KeyCode::Char('z')));
+        assert!(app.explorer_maximized);
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::F(11)));
+        assert!(!app.explorer_maximized);
+    }
+
+    #[test]
+    fn explorer_detail_focus_scrolls_preview_rows_and_columns() {
+        let mut app = test_app();
+        app.explorer_focus = ExplorerPane::Detail;
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Down));
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::PageDown));
+        assert_eq!(
+            app.session_manager.active_session().explorer_detail_scroll,
+            11
+        );
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Right));
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Right));
+        assert_eq!(
+            app.session_manager
+                .active_session()
+                .explorer_detail_col_scroll,
+            2
+        );
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Home));
+        let sess = app.session_manager.active_session();
+        assert_eq!(sess.explorer_detail_scroll, 0);
+        assert_eq!(sess.explorer_detail_col_scroll, 0);
+
+        // Tree focus: arrows navigate the tree, never the detail scroll.
+        app.explorer_focus = ExplorerPane::Tree;
+        app.handle_db_explorer(key(KeyModifiers::NONE, KeyCode::Down));
+        assert_eq!(
+            app.session_manager.active_session().explorer_detail_scroll,
+            0
+        );
+    }
+
+    #[test]
+    fn explorer_alt_up_down_resizes_split() {
+        let mut app = test_app();
+        assert_eq!(app.explorer_split_pct, 55);
+        app.handle_db_explorer(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.explorer_split_pct, 60);
+        app.handle_db_explorer(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.explorer_split_pct, 55);
+        app.explorer_split_pct = 85;
+        app.handle_db_explorer(key(KeyModifiers::ALT, KeyCode::Up));
+        assert_eq!(app.explorer_split_pct, 85);
+        app.explorer_split_pct = 25;
+        app.handle_db_explorer(key(KeyModifiers::ALT, KeyCode::Down));
+        assert_eq!(app.explorer_split_pct, 25);
     }
 }

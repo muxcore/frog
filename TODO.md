@@ -35,16 +35,16 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 | `Alt+Up` / `Alt+Down` | Grow / shrink SQL editor height |
 | `Ctrl+Y` | Copy results to clipboard |
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
-| `Ctrl+F` | Fetch next page of results |
+| `Ctrl+F` | Fetch next page of results (also auto-loads when scrolling near the end) |
 | `Ctrl+O` | Connection dialog |
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |
-| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = grow/shrink focused pane, `Ctrl+Up`/`Down` = SQL size) / History |
-| `F12` | DB explorer |
+| `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = grow/shrink focused pane, `Ctrl+Up`/`Down` = SQL size, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` = scroll focused SQL/plan) / History |
+| `F12` | DB explorer (schema → type folders → objects, paged preview/DDL). `Tab` switches Objects/Detail focus, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, arrows/PgUp/PgDn scroll the detail (next page auto-loads near the end, or `Ctrl+F`); wheel scrolls, Shift+wheel/horizontal wheel scrolls columns |
 | `Ctrl+M` | Toggle mouse capture |
 | `Ctrl+Q` | Quit |
-| Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results; in F2: click focuses List/SQL/Plan, drag horizontal splitter resizes, wheel scrolls list/plan |
+| Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results; in F2: click focuses List/SQL/Plan, drag horizontal splitter resizes, wheel scrolls the pane under the mouse (including SQL/plan), Shift+wheel or horizontal wheel scrolls the plan sideways; in F12: click focuses Objects/Detail, wheel scrolls, Shift+wheel scrolls preview columns |
 
 ## Project Structure
 

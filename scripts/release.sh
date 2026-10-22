@@ -12,7 +12,7 @@
 #      or gh release upload --clobber when the release already exists
 #      ("refresh" with the newly built binary).
 #
-# The tag defaults to v<VERSION> from Cargo.toml (e.g. v0.5.6).
+# The tag defaults to v<VERSION> from Cargo.toml (e.g. v0.5.7).
 # Release notes default to the matching CHANGELOG.md section.
 #
 # Requires: docker (via build-old-glibc.sh) and an authenticated gh
