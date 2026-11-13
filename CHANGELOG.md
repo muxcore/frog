@@ -2,7 +2,7 @@
 
 All notable changes to frog are documented here.
 
-## [Unreleased]
+## [0.5.8] - 2026-11-13
 
 ### Added
 - Toad-style SQL completion popup in the editor (`Ctrl+Space`, `Ctrl+.`
