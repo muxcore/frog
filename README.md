@@ -11,6 +11,7 @@ Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust
 
 - **Multi-session tabs** — tmux-style windows with hover-to-focus and per-tab connections.
 - **Embedded SQL editor** — real cursor movement, line numbers, statement-at-cursor highlighting, vertical scroll.
+- **Toad-style completion** — `Ctrl+Space` popup resolves aliases (`e.` → columns), schemas (`sc.` → tables/views), and tables; catalog metadata is cached and loaded in the background so typing never waits on the database.
 - **Result viewer** — pretty-printed tables (Table / Markdown / ASCII), 2D scrolling, clipboard copy, pagination.
 - **(experimental)sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
@@ -185,6 +186,7 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Alt+Y` | Copy SQL statement at cursor to clipboard (never includes line numbers) |
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
+| `Ctrl+Space` | SQL completion popup (`Ctrl+.` also accepted). `↑`/`↓`/`PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` close |
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+F` | Fetch next page of results (next page also auto-loads when scrolling near the end) |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |

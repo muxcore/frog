@@ -37,6 +37,7 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+F` | Fetch next page of results (also auto-loads when scrolling near the end) |
 | `Ctrl+O` | Connection dialog |
+| `Ctrl+Space` | SQL completion popup (`Ctrl+.` fallback): alias → columns, schema → objects, table → columns. `↑`/`↓`/`PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` close |
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |

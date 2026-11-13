@@ -1,8 +1,10 @@
 use crate::cli::ConnectionParams;
+use crate::db::completion::{self, Clause, CompletionContext, CompletionPopup};
 use crate::db::connection::{
-    ColumnInfo, DbConnection, DbSessionInfo, DbType, OracleConnection, QueryRow,
+    ColumnInfo, DbConnection, DbSessionInfo, DbType, OracleConnection, QueryRow, TableRef,
 };
-use crate::db::postgres::{PgConnection, pg_quote_ident};
+use crate::db::metadata::{self, MetaKind, MetaMsg, MetaRequest, MetadataStore};
+use crate::db::postgres::{pg_quote_ident, PgConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,38 +165,6 @@ fn expand_statements(statements: Vec<String>, cwd: &Path) -> Result<Vec<String>,
     Ok(out)
 }
 
-/// Detect whether an (uppercased, trimmed) partial statement starts a PL/SQL
-/// block (anonymous or named), in which case interior `;` are not terminators.
-/// Note: `CREATE TABLE|VIEW|SEQUENCE|SYNONYM` are *not* PL/SQL — their `;` is a
-/// normal terminator.
-fn is_plsql_block_start(upper: &str) -> bool {
-    if upper.starts_with("DECLARE") || upper.starts_with("BEGIN") {
-        return true;
-    }
-    // CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] PROCEDURE|FUNCTION|PACKAGE|...
-    let mut words = upper.split_whitespace();
-    if words.next() != Some("CREATE") {
-        return false;
-    }
-    loop {
-        match words.next() {
-            None => return false,
-            // Skip OR REPLACE / EDITIONABLE modifiers after CREATE.
-            Some("OR") => continue,
-            Some("REPLACE") | Some("EDITIONABLE") | Some("NONEDITIONABLE") => continue,
-            Some("PROCEDURE" | "FUNCTION" | "PACKAGE" | "TRIGGER" | "TYPE" | "JAVA"
-            | "LIBRARY") => return true,
-            _ => return false,
-        }
-    }
-}
-
-/// Detect whether an (uppercased, trimmed) partial statement ends a PL/SQL
-/// block, i.e. its final word is `END` (not merely a suffix like `'LEGEND'`).
-fn ends_with_end_block(upper: &str) -> bool {
-    upper.split_whitespace().next_back() == Some("END")
-}
-
 #[derive(Debug, Clone)]
 pub struct SqlEditor {
     pub lines: Vec<String>,
@@ -270,12 +240,7 @@ impl SqlEditor {
         if self.cursor_col < self.lines[self.cursor_row].len() {
             let line = &mut self.lines[self.cursor_row];
             let rest = &line[self.cursor_col..];
-            let next = self.cursor_col
-                + rest
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(0);
+            let next = self.cursor_col + rest.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
             line.replace_range(self.cursor_col..next, "");
         } else if self.cursor_row + 1 < self.lines.len() {
             let next_line = self.lines.remove(self.cursor_row + 1);
@@ -347,7 +312,8 @@ impl SqlEditor {
     pub fn snap_cursor_to_char_boundary(&mut self) {
         let len = self.lines[self.cursor_row].len();
         self.cursor_col = self.cursor_col.min(len);
-        while self.cursor_col < len && !self.lines[self.cursor_row].is_char_boundary(self.cursor_col)
+        while self.cursor_col < len
+            && !self.lines[self.cursor_row].is_char_boundary(self.cursor_col)
         {
             self.cursor_col += 1;
         }
@@ -384,7 +350,7 @@ impl SqlEditor {
         }
     }
 
-    fn cursor_char_offset(&self) -> usize {
+    pub fn cursor_char_offset(&self) -> usize {
         let mut off = 0;
         for (i, line) in self.lines.iter().enumerate() {
             if i == self.cursor_row {
@@ -404,117 +370,7 @@ impl SqlEditor {
     /// are kept as a single statement; the block terminates only at `END;`.
     /// Lines containing only `/` still act as a sqlplus-style terminator.
     pub fn statements_with_ranges(text: &str) -> Vec<(usize, usize, String)> {
-        let mut out = Vec::new();
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut start = 0usize;
-        let mut i = 0usize;
-        let mut line_start = 0usize;
-
-        // Scanner state.
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-
-        while i < len {
-            let c = bytes[i];
-
-            if in_line_comment {
-                if c == b'\n' {
-                    in_line_comment = false;
-                    line_start = i + 1;
-                }
-                i += 1;
-                continue;
-            }
-            if in_block_comment {
-                if c == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
-                    in_block_comment = false;
-                    i += 2;
-                } else {
-                    if c == b'\n' {
-                        line_start = i + 1;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            if in_single {
-                if c == b'\'' {
-                    in_single = false;
-                } else if c == b'\n' {
-                    line_start = i + 1;
-                }
-                i += 1;
-                continue;
-            }
-            if in_double {
-                if c == b'"' {
-                    in_double = false;
-                } else if c == b'\n' {
-                    line_start = i + 1;
-                }
-                i += 1;
-                continue;
-            }
-
-            // Top-level state.
-            match c {
-                b'\n' => {
-                    let line = text[line_start..i].trim();
-                    if line == "/" {
-                        let stmt = text[start..line_start]
-                            .trim()
-                            .trim_end_matches(';')
-                            .trim()
-                            .to_string();
-                        if !stmt.is_empty() {
-                            out.push((start, i + 1, stmt));
-                        }
-                        start = i + 1;
-                    }
-                    line_start = i + 1;
-                }
-                b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                    in_line_comment = true;
-                    i += 1;
-                }
-                b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                    in_block_comment = true;
-                    i += 1;
-                }
-                b'\'' => in_single = true,
-                b'"' => in_double = true,
-                b';' => {
-                    let acc = text[start..i].trim();
-                    let upper = acc.to_uppercase();
-                    let is_block = is_plsql_block_start(&upper);
-                    if is_block && !ends_with_end_block(&upper) {
-                        // Internal `;` inside a PL/SQL block — keep collecting.
-                    } else {
-                        let stmt = acc.trim_end_matches(';').trim().to_string();
-                        if !stmt.is_empty() {
-                            out.push((start, i + 1, stmt));
-                        }
-                        start = i + 1;
-                        line_start = i + 1;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-
-        let tail = text[start..]
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        if !tail.is_empty() && tail != "/" {
-            out.push((start, text.len(), tail));
-        }
-        out
+        crate::db::sql_scan::statement_ranges(text)
     }
 
     /// The statement the cursor currently points at.
@@ -675,6 +531,11 @@ pub struct Session {
     pub explorer_filtering: bool,
     /// Last explorer load failure (shown in the browser).
     pub explorer_error: Option<String>,
+    /// Cached catalog metadata for SQL completion (never queried on the
+    /// keystroke path; filled by background workers).
+    pub metadata: MetadataStore,
+    /// Open completion popup, if any.
+    pub completion: Option<CompletionPopup>,
 }
 
 /// One schema/user node in the F12 explorer tree.
@@ -805,7 +666,10 @@ impl ExplorerTable {
 
     /// Definition-bearing objects show DDL/source (code, indexes, sequences).
     pub fn has_ddl(&self) -> bool {
-        !matches!(self.kind.as_str(), "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE")
+        !matches!(
+            self.kind.as_str(),
+            "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE"
+        )
     }
 
     /// Expandable in the tree (column list underneath).
@@ -842,9 +706,18 @@ pub enum ExplorerMsg {
 /// One flattened, visible row of the explorer tree (tree order).
 #[derive(Debug, Clone)]
 pub enum ExplorerRow {
-    Schema { idx: usize },
-    Group { sidx: usize, gidx: usize },
-    Table { sidx: usize, gidx: usize, tidx: usize },
+    Schema {
+        idx: usize,
+    },
+    Group {
+        sidx: usize,
+        gidx: usize,
+    },
+    Table {
+        sidx: usize,
+        gidx: usize,
+        tidx: usize,
+    },
     Column {
         sidx: usize,
         gidx: usize,
@@ -1080,7 +953,10 @@ impl ConnectionDialog {
 
     /// Build connection parameters from the dialog contents.
     pub fn to_params(&self) -> ConnectionParams {
-        let port = self.port.parse::<u16>().unwrap_or_else(|_| self.db_type.default_port());
+        let port = self
+            .port
+            .parse::<u16>()
+            .unwrap_or_else(|_| self.db_type.default_port());
         let (service, database) = match self.db_type {
             DbType::Oracle => {
                 let service = if self.service.is_empty() {
@@ -1088,7 +964,11 @@ impl ConnectionDialog {
                 } else {
                     self.service.clone()
                 };
-                let service = if service.is_empty() { "ORCL".into() } else { service };
+                let service = if service.is_empty() {
+                    "ORCL".into()
+                } else {
+                    service
+                };
                 let database = service.clone();
                 (service, database)
             }
@@ -1195,6 +1075,8 @@ impl Session {
             explorer_filter: String::new(),
             explorer_filtering: false,
             explorer_error: None,
+            metadata: MetadataStore::default(),
+            completion: None,
         }
     }
 }
@@ -1209,6 +1091,8 @@ pub struct SessionManager {
     conn_result_tx: Sender<(usize, bool, String, String)>,
     explorer_rx: Receiver<ExplorerMsg>,
     explorer_tx: Sender<ExplorerMsg>,
+    meta_rx: Receiver<MetaMsg>,
+    meta_tx: Sender<MetaMsg>,
     conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
     /// Maximum number of query-history entries kept per session.
     pub max_history: usize,
@@ -1292,6 +1176,7 @@ impl SessionManager {
         let (tx, rx) = mpsc::channel();
         let (ctx, crx) = mpsc::channel();
         let (etx, erx) = mpsc::channel();
+        let (mtx, mrx) = mpsc::channel();
         let sessions = vec![Session::new(1)];
         Self {
             sessions,
@@ -1303,6 +1188,8 @@ impl SessionManager {
             conn_result_tx: ctx,
             explorer_rx: erx,
             explorer_tx: etx,
+            meta_rx: mrx,
+            meta_tx: mtx,
             conn_map: Arc::new(Mutex::new(HashMap::new())),
             max_history: 1000,
             max_results_per_session: 200,
@@ -1467,12 +1354,14 @@ impl SessionManager {
 
     pub fn switch_next(&mut self) {
         if self.sessions.len() > 1 {
+            self.close_completion();
             self.active_idx = (self.active_idx + 1) % self.sessions.len();
         }
     }
 
     pub fn switch_prev(&mut self) {
         if self.sessions.len() > 1 {
+            self.close_completion();
             self.active_idx = if self.active_idx == 0 {
                 self.sessions.len() - 1
             } else {
@@ -1483,6 +1372,7 @@ impl SessionManager {
 
     pub fn switch_to(&mut self, idx: usize) {
         if idx < self.sessions.len() {
+            self.close_completion();
             self.active_idx = idx;
         }
     }
@@ -1552,6 +1442,13 @@ impl SessionManager {
             return;
         }
         let idx = self.active_idx;
+        // Schema-changing statements invalidate the completion cache. Bump the
+        // generation now so in-flight metadata results cannot repopulate it.
+        if statements.iter().any(|s| metadata::is_ddl(s)) {
+            let sess = &mut self.sessions[idx];
+            sess.metadata.invalidate();
+            sess.completion = None;
+        }
         let seq = self.next_job_seq(idx);
         let id = self.sessions[idx].id;
         let conn_map = self.conn_map.clone();
@@ -1572,10 +1469,7 @@ impl SessionManager {
                 if !trimmed.is_empty() {
                     append_history(&trimmed);
                     sess.query_history.push(trimmed.clone());
-                    if crate::db::connection::is_query_sql_for(
-                        sess.conn_dialog.db_type,
-                        &trimmed,
-                    ) {
+                    if crate::db::connection::is_query_sql_for(sess.conn_dialog.db_type, &trimmed) {
                         sess.last_sql = Some(trimmed);
                     }
                 }
@@ -1764,9 +1658,7 @@ impl SessionManager {
     pub fn cancel_query(&mut self) {
         let id = self.sessions[self.active_idx].id;
 
-        if !self.sessions[self.active_idx].pending_query
-            && !self.sessions[self.active_idx].paging
-        {
+        if !self.sessions[self.active_idx].pending_query && !self.sessions[self.active_idx].paging {
             return;
         }
 
@@ -1809,15 +1701,26 @@ impl SessionManager {
 
     pub fn poll_conn_result(&mut self) {
         if let Ok((id, success, err, name)) = self.conn_result_rx.try_recv() {
-            if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == id) {
+            let mut connected_idx = None;
+            if let Some(idx) = self.sessions.iter().position(|s| s.id == id) {
+                let sess = &mut self.sessions[idx];
                 sess.connecting = false;
                 if success {
                     sess.is_connected = true;
                     sess.connect_error = None;
                     sess.name = name;
+                    // Fresh connection: drop any metadata from a previous one.
+                    sess.metadata = MetadataStore::default();
+                    sess.completion = None;
+                    connected_idx = Some(idx);
                 } else {
                     sess.connect_error = Some(err);
                 }
+            }
+            if let Some(idx) = connected_idx {
+                let dialect = self.sessions[idx].conn_dialog.db_type;
+                self.sessions[idx].metadata.set_dialect(dialect);
+                self.request_bootstrap(idx);
             }
         }
     }
@@ -1886,16 +1789,407 @@ impl SessionManager {
         }
     }
 
+    // -------------------------------------------------------------------
+    // SQL completion (see docs/sql-completion.md)
+    // -------------------------------------------------------------------
+
+    /// Build a completion context for a session's editor at its cursor.
+    fn completion_context(&self, idx: usize) -> (CompletionContext, usize, usize) {
+        let ed = &self.sessions[idx].editor;
+        let dialect = self.sessions[idx].conn_dialog.db_type;
+        let text = ed.text();
+        let ctx = completion::analyze(&text, ed.cursor_char_offset(), dialect);
+        (ctx, ed.cursor_row, ed.cursor_col)
+    }
+
+    /// Ctrl+Space: analyze the statement and open the popup with whatever is
+    /// already cached. Missing metadata is requested in the background; the
+    /// keystroke path never touches the database.
+    pub fn open_completion(&mut self) {
+        let idx = self.active_idx;
+        if !self.sessions[idx].is_connected {
+            self.sessions[idx].set_status("Completion needs a connection (Ctrl+O)");
+            return;
+        }
+        let (ctx, row, col) = self.completion_context(idx);
+        if ctx.in_literal {
+            self.sessions[idx].set_status("No completion inside a string or comment");
+            return;
+        }
+        self.sessions[idx].metadata.set_dialect(ctx.dialect);
+        let items = completion::build_items(&ctx, &self.sessions[idx].metadata);
+        let loading =
+            !self.sessions[idx].metadata.bootstrapped() || self.sessions[idx].metadata.loading();
+        let mut popup = CompletionPopup::new(items, ctx.word_start, row, col, loading);
+        popup.prefix = ctx.prefix.clone();
+        if popup.items.is_empty() && !loading {
+            popup.note = Some("No suggestions".into());
+        }
+        self.sessions[idx].completion = Some(popup);
+        self.ensure_completion_metadata(idx, &ctx);
+    }
+
+    /// Recompute the open popup after an edit or after metadata arrives.
+    pub fn refresh_completion(&mut self) {
+        let idx = self.active_idx;
+        if self.sessions[idx].completion.is_none() {
+            return;
+        }
+        let (ctx, row, col) = self.completion_context(idx);
+        if ctx.in_literal {
+            self.sessions[idx].completion = None;
+            return;
+        }
+        let items = completion::build_items(&ctx, &self.sessions[idx].metadata);
+        let loading =
+            !self.sessions[idx].metadata.bootstrapped() || self.sessions[idx].metadata.loading();
+        let popup = self.sessions[idx]
+            .completion
+            .as_mut()
+            .expect("completion checked above");
+        if popup.prefix != ctx.prefix {
+            popup.selected = 0;
+            popup.prefix = ctx.prefix.clone();
+        }
+        popup.items = items;
+        popup.word_start = ctx.word_start;
+        popup.cursor_row = row;
+        popup.cursor_col = col;
+        popup.loading = loading;
+        popup.note = if popup.items.is_empty() && !loading {
+            Some("No suggestions".into())
+        } else {
+            None
+        };
+        popup.selected = popup.selected.min(popup.items.len().saturating_sub(1));
+        self.ensure_completion_metadata(idx, &ctx);
+    }
+
+    pub fn close_completion(&mut self) {
+        self.sessions[self.active_idx].completion = None;
+    }
+
+    /// Move the popup highlight (Up/Down/Page*).
+    pub fn move_completion(&mut self, delta: isize) {
+        if let Some(p) = self.sessions[self.active_idx].completion.as_mut() {
+            p.move_selection(delta);
+        }
+    }
+
+    /// Insert the highlighted suggestion, replacing the word being typed.
+    pub fn accept_completion(&mut self) {
+        let idx = self.active_idx;
+        let Some(popup) = self.sessions[idx].completion.take() else {
+            return;
+        };
+        let Some(item) = popup.items.get(popup.selected) else {
+            return;
+        };
+        let insert = item.insert_text.clone();
+        let ed = &mut self.sessions[idx].editor;
+        // The popup is closed on any cursor movement, but check the row anyway
+        // so a stale popup can never edit the wrong line.
+        if ed.cursor_row != popup.cursor_row {
+            return;
+        }
+        let col = ed.cursor_col.min(ed.lines[ed.cursor_row].len());
+        let start = popup.word_start.min(col);
+        let line = &mut ed.lines[ed.cursor_row];
+        if !line.is_char_boundary(start) || !line.is_char_boundary(col) {
+            return;
+        }
+        line.replace_range(start..col, &insert);
+        ed.cursor_col = start + insert.len();
+    }
+
+    /// Connection for a session index (metadata workers share it with user
+    /// queries and serialize through the session's `exec_lock`).
+    fn connection_for(&self, idx: usize) -> Option<Arc<dyn DbConnection>> {
+        let id = self.sessions.get(idx)?.id;
+        self.conn_map.lock().ok()?.get(&id).cloned()
+    }
+
+    fn request_bootstrap(&mut self, idx: usize) {
+        let Some(conn) = self.connection_for(idx) else {
+            return;
+        };
+        let sess = &mut self.sessions[idx];
+        if !sess.metadata.pending.insert("*".into()) {
+            return;
+        }
+        let (id, generation, exec_lock) =
+            (sess.id, sess.metadata.generation, sess.exec_lock.clone());
+        metadata::spawn_meta_job(
+            conn,
+            exec_lock,
+            self.meta_tx.clone(),
+            id,
+            generation,
+            MetaRequest::Bootstrap,
+        );
+    }
+
+    fn request_objects(&mut self, idx: usize, schemas: Vec<String>) {
+        let Some(conn) = self.connection_for(idx) else {
+            return;
+        };
+        let dialect = self.sessions[idx].metadata.dialect;
+        let id = self.sessions[idx].id;
+        let generation = self.sessions[idx].metadata.generation;
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+        for schema in schemas {
+            let key = format!("o:{}", metadata::norm_ident(dialect, &schema, false));
+            if !self.sessions[idx].metadata.pending.insert(key) {
+                continue;
+            }
+            metadata::spawn_meta_job(
+                conn.clone(),
+                exec_lock.clone(),
+                self.meta_tx.clone(),
+                id,
+                generation,
+                MetaRequest::Objects {
+                    schema: schema.clone(),
+                },
+            );
+        }
+    }
+
+    fn request_columns(&mut self, idx: usize, refs: Vec<TableRef>) {
+        if refs.is_empty() {
+            return;
+        }
+        let Some(conn) = self.connection_for(idx) else {
+            return;
+        };
+        let dialect = self.sessions[idx].metadata.dialect;
+        let current_schema = self.sessions[idx].metadata.current_schema.clone();
+        let id = self.sessions[idx].id;
+        let generation = self.sessions[idx].metadata.generation;
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+
+        let mut fresh: Vec<TableRef> = Vec::new();
+        for r in refs {
+            let schema = r.schema.as_deref().unwrap_or(&current_schema);
+            let key = format!(
+                "c:{}:{}",
+                metadata::norm_ident(dialect, schema, false),
+                metadata::norm_ident(dialect, &r.name, false)
+            );
+            if self.sessions[idx].metadata.pending.insert(key) {
+                fresh.push(r);
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        metadata::spawn_meta_job(
+            conn,
+            exec_lock,
+            self.meta_tx.clone(),
+            id,
+            generation,
+            MetaRequest::Columns {
+                refs: fresh,
+                current_schema,
+            },
+        );
+    }
+
+    /// Request whatever the current context needs, at most once per key while
+    /// a request is in flight and never synchronously.
+    fn ensure_completion_metadata(&mut self, idx: usize, ctx: &CompletionContext) {
+        if !self.sessions[idx].is_connected {
+            return;
+        }
+        if !self.sessions[idx].metadata.can_request() {
+            return;
+        }
+
+        let mut want_bootstrap = false;
+        let mut object_schemas: Vec<String> = Vec::new();
+        let mut column_refs: Vec<TableRef> = Vec::new();
+
+        {
+            let store = &self.sessions[idx].metadata;
+            let current = store.current_schema.clone();
+
+            if !store.bootstrapped() {
+                want_bootstrap = true;
+            }
+
+            let need_objects = match ctx.parts.len() {
+                0 => matches!(ctx.clause, Clause::From | Clause::Join | Clause::Dml),
+                1 => {
+                    let q = &ctx.parts[0];
+                    completion::find_ref(ctx, &q.text, q.quoted).is_none()
+                        && store.find_schema(&q.text, q.quoted).is_some()
+                }
+                _ => false,
+            };
+
+            if need_objects {
+                let schema = match ctx.parts.first() {
+                    Some(q) => store.find_schema(&q.text, q.quoted).map(|s| s.to_string()),
+                    None => (!current.is_empty()).then(|| current.clone()),
+                };
+                if let Some(schema) = schema {
+                    if store.objects_need_load(&schema) {
+                        object_schemas.push(schema);
+                    }
+                }
+            }
+
+            // Columns of every table in the statement (one batched query).
+            for r in ctx.refs.iter().take(20) {
+                if ctx
+                    .ctes
+                    .iter()
+                    .any(|c| store.ident_eq(c, &r.name, r.quoted))
+                {
+                    continue;
+                }
+                let schema = match r.schema.as_deref() {
+                    Some(s) => Some(s),
+                    None if !current.is_empty() => Some(current.as_str()),
+                    None => None,
+                };
+                let Some(schema) = schema else {
+                    continue;
+                };
+                if store.columns_need_load(schema, &r.name) {
+                    column_refs.push(r.clone());
+                }
+            }
+
+            // `schema.table.` in a statement with no FROM clause yet.
+            if ctx.parts.len() >= 2 {
+                let schema_part = &ctx.parts[ctx.parts.len() - 2];
+                let table_part = &ctx.parts[ctx.parts.len() - 1];
+                if completion::find_ref(ctx, &schema_part.text, schema_part.quoted).is_none() {
+                    if let Some(schema) = store.find_schema(&schema_part.text, schema_part.quoted) {
+                        if store.columns_need_load(schema, &table_part.text) {
+                            column_refs.push(TableRef {
+                                schema: Some(schema.to_string()),
+                                schema_quoted: schema_part.quoted,
+                                name: table_part.text.clone(),
+                                quoted: table_part.quoted,
+                                alias: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if want_bootstrap {
+            self.request_bootstrap(idx);
+        }
+        if !object_schemas.is_empty() {
+            self.request_objects(idx, object_schemas);
+        }
+        if !column_refs.is_empty() {
+            self.request_columns(idx, column_refs);
+        }
+    }
+
+    /// Apply background metadata results. Stale generations are discarded so
+    /// a DDL invalidation can never be overwritten by an older response.
+    pub fn poll_metadata(&mut self) {
+        let mut touched_active = false;
+        while let Ok(msg) = self.meta_rx.try_recv() {
+            let Some(idx) = self.sessions.iter().position(|s| s.id == msg.session_id) else {
+                continue;
+            };
+            let sess = &mut self.sessions[idx];
+            if msg.generation != sess.metadata.generation {
+                continue;
+            }
+            match msg.kind {
+                MetaKind::Bootstrap {
+                    current_schema,
+                    schemas,
+                    objects,
+                } => {
+                    sess.metadata.pending.remove("*");
+                    let mut ok = true;
+                    match current_schema {
+                        Ok(cs) => sess.metadata.current_schema = cs,
+                        Err(e) => {
+                            sess.metadata.mark_error(e);
+                            ok = false;
+                        }
+                    }
+                    match schemas {
+                        Ok(v) => sess.metadata.put_schemas(v),
+                        Err(e) => {
+                            sess.metadata.mark_error(e);
+                            ok = false;
+                        }
+                    }
+                    match objects {
+                        Ok((schema, objs)) => sess.metadata.put_objects(&schema, objs),
+                        Err(e) => {
+                            sess.metadata.mark_error(e);
+                            ok = false;
+                        }
+                    }
+                    if ok {
+                        sess.metadata.mark_ok();
+                    }
+                }
+                MetaKind::Objects { schema, objects } => {
+                    let key = format!("o:{}", sess.metadata.schema_key(&schema));
+                    sess.metadata.pending.remove(&key);
+                    match objects {
+                        Ok(objs) => {
+                            sess.metadata.put_objects(&schema, objs);
+                            sess.metadata.mark_ok();
+                        }
+                        Err(e) => sess.metadata.mark_error(e),
+                    }
+                }
+                MetaKind::Columns {
+                    requested,
+                    found,
+                    error,
+                } => {
+                    for key in &requested {
+                        sess.metadata
+                            .pending
+                            .remove(&format!("c:{}:{}", key.0, key.1));
+                    }
+                    match error {
+                        Some(e) => sess.metadata.mark_error(e),
+                        None => {
+                            for tc in found {
+                                sess.metadata.put_columns(&tc.schema, &tc.table, tc.columns);
+                            }
+                            // Cache misses as empty so a nonexistent/unauthorized
+                            // table is not queried on every keystroke.
+                            for key in requested {
+                                sess.metadata.mark_columns_loaded(key);
+                            }
+                            sess.metadata.mark_ok();
+                        }
+                    }
+                }
+            }
+            if idx == self.active_idx {
+                touched_active = true;
+            }
+        }
+        if touched_active {
+            self.refresh_completion();
+        }
+    }
+
     /// Query the backend for its session list. Failures (notably missing
     /// `V$SESSION` privileges on Oracle) are returned as a displayable
     /// message instead of being swallowed.
     pub fn get_session_info(&self) -> Result<Vec<DbSessionInfo>, String> {
         let id = self.sessions[self.active_idx].id;
-        let conn = self
-            .conn_map
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&id).cloned());
+        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
         match conn {
             Some(c) => c.query_sessions().map_err(|e| {
                 if c.db_type() == DbType::Oracle {
@@ -1934,7 +2228,11 @@ impl SessionManager {
         }
     }
 
-    fn compare_session_info(a: &DbSessionInfo, b: &DbSessionInfo, col: usize) -> std::cmp::Ordering {
+    fn compare_session_info(
+        a: &DbSessionInfo,
+        b: &DbSessionInfo,
+        col: usize,
+    ) -> std::cmp::Ordering {
         match col {
             0 => a.sid.cmp(&b.sid),
             1 => a.serial.cmp(&b.serial),
@@ -1978,7 +2276,11 @@ impl SessionManager {
             let desc = sess.session_view_sort_desc;
             list.sort_by(|a, b| {
                 let ord = Self::compare_session_info(a, b, col);
-                if desc { ord.reverse() } else { ord }
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
             });
         }
         list
@@ -2146,8 +2448,7 @@ impl SessionManager {
                 if self.session_refresh_secs == 0 {
                     false
                 } else {
-                    since.elapsed()
-                        >= std::time::Duration::from_secs(self.session_refresh_secs)
+                    since.elapsed() >= std::time::Duration::from_secs(self.session_refresh_secs)
                 }
             }
         }
@@ -2240,11 +2541,7 @@ impl SessionManager {
         let label = format!("{} {}", info.sid, info.username);
         let idx = self.active_idx;
         let id = self.sessions[idx].id;
-        let conn = self
-            .conn_map
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&id).cloned());
+        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
         let sess = &mut self.sessions[idx];
         sess.plan_for = Some(label);
         sess.plan_scroll = 0;
@@ -2280,11 +2577,7 @@ impl SessionManager {
             }
         };
         let id = self.sessions[idx].id;
-        let conn = self
-            .conn_map
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&id).cloned());
+        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
         match conn {
             Some(c) => {
                 let result = c.explain_plan(&sql, max_rows);
@@ -2327,16 +2620,13 @@ impl SessionManager {
                         .into_iter()
                         .map(|n| {
                             // Preserve expansion of schemas that are still there.
-                            let prev = sess
-                                .explorer_schemas
-                                .iter()
-                                .find(|p| p.name == n);
-                        ExplorerSchema {
-                            name: n,
-                            expanded: prev.map(|p| p.expanded).unwrap_or(false),
-                            groups: prev.and_then(|p| p.groups.clone()),
-                            load_error: None,
-                        }
+                            let prev = sess.explorer_schemas.iter().find(|p| p.name == n);
+                            ExplorerSchema {
+                                name: n,
+                                expanded: prev.map(|p| p.expanded).unwrap_or(false),
+                                groups: prev.and_then(|p| p.groups.clone()),
+                                load_error: None,
+                            }
                         })
                         .collect();
                     sess.explorer_loaded = true;
@@ -2376,7 +2666,8 @@ impl SessionManager {
                 self.load_schema_groups(idx);
             }
             ExplorerRow::Group { sidx, gidx } => {
-                if let Some(g) = self.sessions[self.active_idx].explorer_schemas
+                if let Some(g) = self.sessions[self.active_idx]
+                    .explorer_schemas
                     .get_mut(sidx)
                     .and_then(|s| s.groups.as_mut())
                     .and_then(|g| g.get_mut(gidx))
@@ -2390,7 +2681,9 @@ impl SessionManager {
             ExplorerRow::Table { sidx, gidx, tidx } => {
                 self.reload_object_detail(sidx, gidx, tidx, true);
             }
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => {
+            ExplorerRow::Column {
+                sidx, gidx, tidx, ..
+            } => {
                 if let Some(t) = self.object_mut(sidx, gidx, tidx) {
                     t.columns = None;
                     t.load_error = None;
@@ -2454,10 +2747,7 @@ impl SessionManager {
 
     /// Load the type-group folders of one schema (only types it has).
     fn load_schema_groups(&mut self, sidx: usize) {
-        let schema = match self.sessions[self.active_idx]
-            .explorer_schemas
-            .get(sidx)
-        {
+        let schema = match self.sessions[self.active_idx].explorer_schemas.get(sidx) {
             Some(s) => s.name.clone(),
             None => return,
         };
@@ -2498,8 +2788,7 @@ impl SessionManager {
                 );
                 entry.load_error = None;
                 if entry.groups.as_ref().map(|g| g.is_empty()).unwrap_or(true) {
-                    entry.load_error =
-                        Some(format!("Schema '{}' has no visible objects.", schema));
+                    entry.load_error = Some(format!("Schema '{}' has no visible objects.", schema));
                 }
             }
             Err(e) => {
@@ -2518,7 +2807,9 @@ impl SessionManager {
             .and_then(|g| g.get(gidx))
         {
             Some(g) => (
-                self.sessions[self.active_idx].explorer_schemas[sidx].name.clone(),
+                self.sessions[self.active_idx].explorer_schemas[sidx]
+                    .name
+                    .clone(),
                 g.key.clone(),
             ),
             None => return,
@@ -2584,7 +2875,9 @@ impl SessionManager {
             .and_then(|o| o.get(tidx))
         {
             Some(t) => (
-                self.sessions[self.active_idx].explorer_schemas[sidx].name.clone(),
+                self.sessions[self.active_idx].explorer_schemas[sidx]
+                    .name
+                    .clone(),
                 t.name.clone(),
                 t.kind.clone(),
             ),
@@ -2664,7 +2957,10 @@ impl SessionManager {
         // Keep matching rows plus the parents needed for tree context.
         let mut keep = vec![false; rows.len()];
         for (i, row) in rows.iter().enumerate() {
-            if explorer_row_label(sess, row).to_lowercase().contains(&filter) {
+            if explorer_row_label(sess, row)
+                .to_lowercase()
+                .contains(&filter)
+            {
                 keep[i] = true;
                 // Walk up to the root, keeping every ancestor.
                 let mut j = i;
@@ -2689,31 +2985,21 @@ impl SessionManager {
                         (
                             ExplorerRow::Group { sidx: ps, gidx: pg },
                             ExplorerRow::Table { sidx, gidx, .. },
-                        )
-                            if ps == sidx && pg == gidx =>
-                        {
-                            true
-                        }
+                        ) if ps == sidx && pg == gidx => true,
                         (
                             ExplorerRow::Group { sidx: ps, gidx: pg },
                             ExplorerRow::Column { sidx, gidx, .. },
-                        )
-                            if ps == sidx && pg == gidx =>
-                        {
-                            true
-                        }
+                        ) if ps == sidx && pg == gidx => true,
                         (
                             ExplorerRow::Table {
                                 sidx: ps,
                                 gidx: pg,
                                 tidx: pt,
                             },
-                            ExplorerRow::Column { sidx, gidx, tidx, .. },
-                        )
-                            if ps == sidx && pg == gidx && pt == tidx =>
-                        {
-                            true
-                        }
+                            ExplorerRow::Column {
+                                sidx, gidx, tidx, ..
+                            },
+                        ) if ps == sidx && pg == gidx && pt == tidx => true,
                         _ => false,
                     };
                     if parent {
@@ -2901,9 +3187,10 @@ impl SessionManager {
                     {
                         g.expanded = false;
                     }
-                } else if let Some(pos) = rows[..cur].iter().rposition(|r| {
-                    matches!(r, ExplorerRow::Schema { idx } if *idx == sidx)
-                }) {
+                } else if let Some(pos) = rows[..cur]
+                    .iter()
+                    .rposition(|r| matches!(r, ExplorerRow::Schema { idx } if *idx == sidx))
+                {
                     self.sessions[self.active_idx].explorer_cursor = pos;
                 }
             }
@@ -2923,7 +3210,9 @@ impl SessionManager {
                     self.sessions[self.active_idx].explorer_cursor = pos;
                 }
             }
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => {
+            ExplorerRow::Column {
+                sidx, gidx, tidx, ..
+            } => {
                 if let Some(pos) = rows[..cur].iter().rposition(|r| {
                     matches!(r, ExplorerRow::Table { sidx: ps, gidx: pg, tidx: pt }
                         if *ps == sidx && *pg == gidx && *pt == tidx)
@@ -2952,9 +3241,14 @@ impl SessionManager {
     /// a column's parent table). None on folders, schemas and empty trees.
     fn cursor_object_idx(&self) -> Option<(usize, usize, usize)> {
         let rows = self.explorer_visible_rows();
-        match rows.get(self.sessions[self.active_idx].explorer_cursor)?.clone() {
+        match rows
+            .get(self.sessions[self.active_idx].explorer_cursor)?
+            .clone()
+        {
             ExplorerRow::Table { sidx, gidx, tidx } => Some((sidx, gidx, tidx)),
-            ExplorerRow::Column { sidx, gidx, tidx, .. } => Some((sidx, gidx, tidx)),
+            ExplorerRow::Column {
+                sidx, gidx, tidx, ..
+            } => Some((sidx, gidx, tidx)),
             _ => None,
         }
     }
@@ -2993,7 +3287,12 @@ impl SessionManager {
     /// by `execute_query_paged`), or None when it has no row preview
     /// (indexes; Oracle sequences use a properties query instead — see the
     /// SEQUENCE arm). Pure and unit-tested.
-    fn explorer_preview_sql(db_type: DbType, schema: &str, name: &str, kind: &str) -> Option<String> {
+    fn explorer_preview_sql(
+        db_type: DbType,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> Option<String> {
         match kind {
             "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE" => Some(match db_type {
                 DbType::Oracle => format!("SELECT * FROM {}.{}", schema, name),
@@ -3260,7 +3559,11 @@ impl SessionManager {
         kind: &str,
     ) -> Option<&'a mut ExplorerTable> {
         let sess = sessions.iter_mut().find(|s| s.id == sid)?;
-        for s in sess.explorer_schemas.iter_mut().filter(|s| s.name == schema) {
+        for s in sess
+            .explorer_schemas
+            .iter_mut()
+            .filter(|s| s.name == schema)
+        {
             let Some(groups) = s.groups.as_mut() else {
                 continue;
             };
@@ -3301,10 +3604,7 @@ impl SessionManager {
                             // one; leave its loading flag alone.
                             continue;
                         }
-                        let expected = e
-                            .preview
-                            .as_ref()
-                            .map(|p| p.page_offset + p.rows.len());
+                        let expected = e.preview.as_ref().map(|p| p.page_offset + p.rows.len());
                         if result.page_offset == 0 {
                             // First page (or a reload): replace the preview.
                             e.preview_error = None;
@@ -3379,6 +3679,8 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::completion::{CompletionItem, CompletionPopup, ItemKind};
+    use crate::db::connection::{MetaObject, MetaObjectKind};
 
     fn fake_group(key: &str, objects: Vec<ExplorerTable>) -> ExplorerGroup {
         ExplorerGroup {
@@ -3432,6 +3734,99 @@ mod tests {
     }
 
     #[test]
+    fn open_completion_uses_cached_metadata() {
+        let mut sm = SessionManager::new();
+        {
+            let sess = &mut sm.sessions[0];
+            sess.is_connected = true;
+            sess.conn_dialog.db_type = DbType::Oracle;
+            sess.metadata.current_schema = "SCOTT".into();
+            sess.metadata.put_schemas(vec!["SCOTT".into()]);
+            sess.metadata.put_objects(
+                "SCOTT",
+                vec![MetaObject {
+                    schema: "SCOTT".into(),
+                    name: "EMP".into(),
+                    kind: MetaObjectKind::Table,
+                }],
+            );
+            sess.metadata.put_columns(
+                "SCOTT",
+                "EMP",
+                vec![ColumnInfo {
+                    name: "EMPNO".into(),
+                    data_type: "NUMBER".into(),
+                    nullable: false,
+                }],
+            );
+            sess.editor.set_text("SELECT * FROM emp e WHERE e.");
+            sess.editor.cursor_col = sess.editor.lines[0].len();
+        }
+        sm.open_completion();
+        let popup = sm.sessions[0].completion.as_ref().expect("popup opened");
+        assert!(!popup.loading);
+        assert!(popup.items.iter().any(|i| i.label == "EMPNO"));
+        sm.move_completion(1);
+        sm.close_completion();
+        assert!(sm.sessions[0].completion.is_none());
+    }
+
+    #[test]
+    fn completion_accept_replaces_typed_word() {
+        let mut sm = SessionManager::new();
+        {
+            let sess = &mut sm.sessions[0];
+            sess.editor.set_text("SELECT * FROM emp e WHERE e.em");
+            sess.editor.cursor_row = 0;
+            sess.editor.cursor_col = sess.editor.lines[0].len();
+            sess.completion = Some(CompletionPopup::new(
+                vec![CompletionItem {
+                    label: "EMPNO".into(),
+                    insert_text: "EMPNO".into(),
+                    kind: ItemKind::Column,
+                    detail: "NUMBER".into(),
+                }],
+                28,
+                0,
+                30,
+                false,
+            ));
+        }
+        sm.accept_completion();
+        assert_eq!(
+            sm.sessions[0].editor.text(),
+            "SELECT * FROM emp e WHERE e.EMPNO"
+        );
+        assert_eq!(sm.sessions[0].editor.cursor_col, 33);
+        assert!(sm.sessions[0].completion.is_none());
+    }
+
+    #[test]
+    fn completion_accept_ignores_stale_row() {
+        let mut sm = SessionManager::new();
+        {
+            let sess = &mut sm.sessions[0];
+            sess.editor.set_text("SELECT *\nFROM emp");
+            sess.editor.cursor_row = 1;
+            sess.editor.cursor_col = 3;
+            sess.completion = Some(CompletionPopup::new(
+                vec![CompletionItem {
+                    label: "EMPNO".into(),
+                    insert_text: "EMPNO".into(),
+                    kind: ItemKind::Column,
+                    detail: String::new(),
+                }],
+                0,
+                0,
+                0,
+                false,
+            ));
+        }
+        sm.accept_completion();
+        assert_eq!(sm.sessions[0].editor.text(), "SELECT *\nFROM emp");
+    }
+
+    #[test]
     fn explorer_tree_flattens_in_order() {
         let sm = fake_explorer();
         let rows = sm.explorer_visible_rows();
@@ -3439,10 +3834,7 @@ mod tests {
         //   + Procedures + CALC_BONUS + HR = 11 rows.
         assert_eq!(rows.len(), 11);
         assert!(matches!(rows[0], ExplorerRow::Schema { idx: 0 }));
-        assert!(matches!(
-            rows[1],
-            ExplorerRow::Group { sidx: 0, gidx: 0 }
-        ));
+        assert!(matches!(rows[1], ExplorerRow::Group { sidx: 0, gidx: 0 }));
         assert!(matches!(
             rows[2],
             ExplorerRow::Table {
@@ -3468,14 +3860,8 @@ mod tests {
                 tidx: 1
             }
         ));
-        assert!(matches!(
-            rows[6],
-            ExplorerRow::Group { sidx: 0, gidx: 1 }
-        ));
-        assert!(matches!(
-            rows[8],
-            ExplorerRow::Group { sidx: 0, gidx: 2 }
-        ));
+        assert!(matches!(rows[6], ExplorerRow::Group { sidx: 0, gidx: 1 }));
+        assert!(matches!(rows[8], ExplorerRow::Group { sidx: 0, gidx: 2 }));
         assert!(matches!(rows[10], ExplorerRow::Schema { idx: 1 }));
     }
 
@@ -3487,10 +3873,7 @@ mod tests {
         // DEPT matches + Tables folder + SCOTT for context; nothing else.
         assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], ExplorerRow::Schema { idx: 0 }));
-        assert!(matches!(
-            rows[1],
-            ExplorerRow::Group { sidx: 0, gidx: 0 }
-        ));
+        assert!(matches!(rows[1], ExplorerRow::Group { sidx: 0, gidx: 0 }));
         assert!(matches!(
             rows[2],
             ExplorerRow::Table {
@@ -3508,10 +3891,7 @@ mod tests {
         let rows = sm.explorer_visible_rows();
         // Procedures folder + CALC_BONUS + SCOTT for context.
         assert_eq!(rows.len(), 3);
-        assert!(matches!(
-            rows[1],
-            ExplorerRow::Group { sidx: 0, gidx: 2 }
-        ));
+        assert!(matches!(rows[1], ExplorerRow::Group { sidx: 0, gidx: 2 }));
     }
 
     #[test]
@@ -3540,41 +3920,23 @@ mod tests {
     #[test]
     fn explorer_preview_sql_per_kind() {
         // Row-bearing relations use a base SELECT; paging adds LIMIT/OFFSET.
-        let ora_tbl = SessionManager::explorer_preview_sql(
-            DbType::Oracle,
-            "SCOTT",
-            "EMP",
-            "TABLE",
-        );
+        let ora_tbl = SessionManager::explorer_preview_sql(DbType::Oracle, "SCOTT", "EMP", "TABLE");
         assert_eq!(ora_tbl.as_deref(), Some("SELECT * FROM SCOTT.EMP"));
         let pg_tbl =
             SessionManager::explorer_preview_sql(DbType::Postgres, "public", "emp", "MVIEW");
-        assert_eq!(
-            pg_tbl.as_deref(),
-            Some("SELECT * FROM \"public\".\"emp\"")
-        );
+        assert_eq!(pg_tbl.as_deref(), Some("SELECT * FROM \"public\".\"emp\""));
         // Indexes have no row preview; code neither.
         assert_eq!(
             SessionManager::explorer_preview_sql(DbType::Postgres, "public", "i", "INDEX"),
             None
         );
         assert_eq!(
-            SessionManager::explorer_preview_sql(
-                DbType::Oracle,
-                "SCOTT",
-                "P",
-                "PROCEDURE"
-            ),
+            SessionManager::explorer_preview_sql(DbType::Oracle, "SCOTT", "P", "PROCEDURE"),
             None
         );
         // Sequences preview properties (never NEXTVAL).
-        let seq = SessionManager::explorer_preview_sql(
-            DbType::Oracle,
-            "SCOTT",
-            "SEQ",
-            "SEQUENCE",
-        )
-        .unwrap();
+        let seq = SessionManager::explorer_preview_sql(DbType::Oracle, "SCOTT", "SEQ", "SEQUENCE")
+            .unwrap();
         assert!(seq.contains("ALL_SEQUENCES"));
         assert!(!seq.contains("NEXTVAL"));
     }
@@ -3582,8 +3944,7 @@ mod tests {
     #[test]
     fn explorer_preview_pages_append_in_place() {
         fn page(offset: usize, vals: &[&str], truncated: bool) -> QueryRow {
-            let rows: Vec<Vec<String>> =
-                vals.iter().map(|v| vec![(*v).to_string()]).collect();
+            let rows: Vec<Vec<String>> = vals.iter().map(|v| vec![(*v).to_string()]).collect();
             QueryRow {
                 columns: vec!["X".into()],
                 total_fetched: rows.len(),
@@ -3613,14 +3974,9 @@ mod tests {
             .unwrap();
         sm.poll_explorer();
         {
-            let e = SessionManager::find_cached_object(
-                &mut sm.sessions,
-                sid,
-                "SCOTT",
-                "EMP",
-                "TABLE",
-            )
-            .unwrap();
+            let e =
+                SessionManager::find_cached_object(&mut sm.sessions, sid, "SCOTT", "EMP", "TABLE")
+                    .unwrap();
             assert_eq!(e.preview.as_ref().unwrap().rows.len(), 2);
         }
 
@@ -3635,14 +3991,8 @@ mod tests {
             })
             .unwrap();
         sm.poll_explorer();
-        let e = SessionManager::find_cached_object(
-            &mut sm.sessions,
-            sid,
-            "SCOTT",
-            "EMP",
-            "TABLE",
-        )
-        .unwrap();
+        let e = SessionManager::find_cached_object(&mut sm.sessions, sid, "SCOTT", "EMP", "TABLE")
+            .unwrap();
         let p = e.preview.as_ref().unwrap();
         assert_eq!(p.page_offset, 0);
         assert_eq!(p.rows.len(), 3);
@@ -3655,7 +4005,7 @@ mod tests {
     fn explorer_sql_quotes_postgres_idents() {
         let mut sm = fake_explorer();
         sm.sessions[0].explorer_cursor = 2; // EMP table row.
-        // Oracle: bare identifiers.
+                                            // Oracle: bare identifiers.
         sm.sessions[0].conn_dialog.db_type = DbType::Oracle;
         assert_eq!(
             sm.explorer_sql_for_cursor().as_deref(),

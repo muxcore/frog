@@ -42,15 +42,118 @@ impl DbType {
             DbType::Postgres => 5432,
         }
     }
-
 }
 
-/// Column metadata for the F12 DB explorer tree.
-#[derive(Debug, Clone, Default)]
+/// Column metadata for the F12 DB explorer tree and completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+}
+
+/// Kind of a dictionary object, kept small on purpose: this is what the
+/// completion popup shows as a tag and uses for ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaObjectKind {
+    Table,
+    View,
+    MView,
+    Synonym,
+    Sequence,
+    Procedure,
+    Function,
+    Package,
+    Type,
+    Other,
+}
+
+impl MetaObjectKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Table => "T",
+            Self::View => "V",
+            Self::MView => "M",
+            Self::Synonym => "S",
+            Self::Sequence => "Q",
+            Self::Procedure => "P",
+            Self::Function => "F",
+            Self::Package => "K",
+            Self::Type => "Y",
+            Self::Other => "?",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::View => "view",
+            Self::MView => "materialized view",
+            Self::Synonym => "synonym",
+            Self::Sequence => "sequence",
+            Self::Procedure => "procedure",
+            Self::Function => "function",
+            Self::Package => "package",
+            Self::Type => "type",
+            Self::Other => "object",
+        }
+    }
+
+    pub fn from_oracle(object_type: &str) -> Self {
+        match object_type.to_ascii_uppercase().as_str() {
+            "TABLE" | "FOREIGN TABLE" => Self::Table,
+            "VIEW" => Self::View,
+            "MATERIALIZED VIEW" => Self::MView,
+            "SYNONYM" => Self::Synonym,
+            "SEQUENCE" => Self::Sequence,
+            "PROCEDURE" => Self::Procedure,
+            "FUNCTION" => Self::Function,
+            "PACKAGE" | "PACKAGE BODY" => Self::Package,
+            "TYPE" => Self::Type,
+            _ => Self::Other,
+        }
+    }
+
+    /// True for objects that can appear in a FROM clause.
+    pub fn is_relation(self) -> bool {
+        matches!(self, Self::Table | Self::View | Self::MView | Self::Synonym)
+    }
+}
+
+/// One dictionary object, ready for completion. `schema` is the resolved owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaObject {
+    pub schema: String,
+    pub name: String,
+    pub kind: MetaObjectKind,
+}
+
+/// A table/view reference parsed out of the current SQL statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub schema_quoted: bool,
+    pub name: String,
+    pub quoted: bool,
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    pub fn qualified_name(&self) -> String {
+        match &self.schema {
+            Some(s) => format!("{}.{}", s, self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Columns resolved for one table reference. `schema`/`table` are the
+/// dictionary spellings, which may differ from the query spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumns {
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<ColumnInfo>,
 }
 
 /// Backend-agnostic database connection. Implemented by Oracle and Postgres
@@ -79,10 +182,32 @@ pub trait DbConnection: Send + Sync {
     /// where kind is e.g. "TABLE", "VIEW", "MVIEW", "INDEX", "PROCEDURE".
     fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>>;
     /// F12 DB explorer: columns of a table-like object or index, in order.
-    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>>;
+    fn list_columns(&self, schema: &str, name: &str, kind: &str)
+        -> anyhow::Result<Vec<ColumnInfo>>;
     /// F12 DB explorer: DDL/source text for any object (tables synthesize
     /// CREATE TABLE from columns; views/procedures read the dictionary).
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String>;
+
+    // -- Completion metadata (cached by MetadataStore; never called on the
+    // -- keystroke path) ----------------------------------------------------
+
+    /// The schema unqualified names resolve in. Oracle: `CURRENT_SCHEMA`
+    /// (which `ALTER SESSION` can change, unlike `USER`). Postgres: the first
+    /// entry of `search_path`.
+    fn current_schema(&self) -> anyhow::Result<String>;
+
+    /// All completion-relevant objects of one schema in a single query.
+    /// (Calling `list_objects` once per type folder would be ~10 round trips.)
+    fn list_schema_objects(&self, schema: &str) -> anyhow::Result<Vec<MetaObject>>;
+
+    /// Columns for a small set of table references, batched into as few
+    /// round trips as possible. Returns an entry (possibly empty columns) for
+    /// every requested reference that could be resolved.
+    fn table_columns_batch(
+        &self,
+        refs: &[TableRef],
+        current_schema: &str,
+    ) -> anyhow::Result<Vec<TableColumns>>;
 }
 
 pub struct OracleConnection {
@@ -111,7 +236,12 @@ pub struct QueryRow {
 }
 
 impl QueryRow {
-    pub(crate) fn error(msg: String, elapsed_ms: u64, page_offset: usize, page_size: usize) -> Self {
+    pub(crate) fn error(
+        msg: String,
+        elapsed_ms: u64,
+        page_offset: usize,
+        page_size: usize,
+    ) -> Self {
         Self {
             columns: vec![],
             rows: vec![],
@@ -348,12 +478,7 @@ impl OracleConnection {
         }
     }
 
-    pub fn execute_query_paged(
-        &self,
-        sql: &str,
-        page_offset: usize,
-        page_size: usize,
-    ) -> QueryRow {
+    pub fn execute_query_paged(&self, sql: &str, page_offset: usize, page_size: usize) -> QueryRow {
         let start = std::time::Instant::now();
         let inner_sql = sql.trim().trim_end_matches(';').trim();
         // Fetch one extra row so we can tell whether more data follows.
@@ -590,8 +715,7 @@ impl OracleConnection {
             .query(&[&owned])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         // Several dictionary types fold into one explorer folder.
-        let mut counts: std::collections::HashMap<&str, u64> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
         for row_result in rows {
             let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
             let otype: String = row.get(0).unwrap_or_default();
@@ -611,7 +735,10 @@ impl OracleConnection {
             };
             *counts.entry(key).or_insert(0) += n.max(0) as u64;
         }
-        Ok(counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        Ok(counts
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect())
     }
 
     /// F12 explorer: objects of one type-group folder, ordered by name.
@@ -741,8 +868,7 @@ impl OracleConnection {
                 ))
             }
             "VIEW" => {
-                let sql =
-                    "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2";
+                let sql = "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2";
                 let mut stmt = self
                     .conn
                     .statement(sql)
@@ -772,8 +898,7 @@ impl OracleConnection {
             "INDEX" => self.index_ddl(schema, name),
             "SEQUENCE" => self.sequence_ddl(schema, name),
             "MVIEW" => {
-                let sql =
-                    "SELECT QUERY FROM ALL_MVIEWS WHERE OWNER = :1 AND MVIEW_NAME = :2";
+                let sql = "SELECT QUERY FROM ALL_MVIEWS WHERE OWNER = :1 AND MVIEW_NAME = :2";
                 let mut stmt = self
                     .conn
                     .statement(sql)
@@ -879,15 +1004,172 @@ impl OracleConnection {
             }
             out.push(ColumnInfo {
                 name,
-                data_type: if dtype.is_empty() {
-                    "?".into()
-                } else {
-                    dtype
-                },
+                data_type: if dtype.is_empty() { "?".into() } else { dtype },
                 nullable: nullable.trim().eq_ignore_ascii_case("Y"),
             });
             if out.len() >= 1000 {
                 break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Completion: schema that unqualified names resolve in.
+    pub fn current_schema(&self) -> anyhow::Result<String> {
+        let mut stmt = self
+            .conn
+            .statement("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM dual")
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt.query(&[]).map_err(|e| anyhow::anyhow!("{}", e))?;
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            if !name.trim().is_empty() {
+                return Ok(name);
+            }
+        }
+        Err(anyhow::anyhow!("CURRENT_SCHEMA is not visible"))
+    }
+
+    /// Completion: all object names of one schema in one query.
+    pub fn list_schema_objects(&self, schema: &str) -> anyhow::Result<Vec<MetaObject>> {
+        let sql = "SELECT * FROM (SELECT OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS \
+                   WHERE OWNER = :1 \
+                   AND OBJECT_TYPE IN ('TABLE','VIEW','MATERIALIZED VIEW','SYNONYM', \
+                   'SEQUENCE','PROCEDURE','FUNCTION','PACKAGE','TYPE') \
+                   AND OBJECT_NAME NOT LIKE 'BIN$%' \
+                   ORDER BY OBJECT_NAME) WHERE ROWNUM <= 20000";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owner = schema.to_uppercase();
+        let rows = stmt
+            .query(&[&owner])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let name: String = row.get(0).unwrap_or_default();
+            let otype: String = row.get(1).unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            out.push(MetaObject {
+                schema: schema.to_string(),
+                name,
+                kind: MetaObjectKind::from_oracle(&otype),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Completion: columns for the tables referenced by the current statement,
+    /// in as few queries as possible. Own-schema tables use `USER_TAB_COLUMNS`
+    /// (no privilege filter); other schemas use `ALL_TAB_COLUMNS` with an
+    /// owner predicate. Both are capped.
+    pub fn table_columns_batch(
+        &self,
+        refs: &[TableRef],
+        current_schema: &str,
+    ) -> anyhow::Result<Vec<TableColumns>> {
+        use oracle::sql_type::ToSql;
+        use std::collections::BTreeMap;
+
+        // owner (dictionary spelling) -> requested table names (dictionary spelling)
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for r in refs {
+            let owner = r
+                .schema
+                .clone()
+                .unwrap_or_else(|| current_schema.to_string());
+            let owner = if r.schema.is_some() && r.schema_quoted {
+                owner
+            } else {
+                owner.to_uppercase()
+            };
+            let table = if r.quoted {
+                r.name.clone()
+            } else {
+                r.name.to_uppercase()
+            };
+            let entry = groups.entry(owner).or_default();
+            if !entry.iter().any(|t| t == &table) {
+                entry.push(table);
+            }
+        }
+
+        let mut out = Vec::new();
+        for (owner, tables) in groups {
+            if tables.is_empty() {
+                continue;
+            }
+            let is_current = owner.eq_ignore_ascii_case(current_schema);
+            let (sql, binds_owner) = if is_current {
+                let placeholders: Vec<String> =
+                    (1..=tables.len()).map(|i| format!(":{}", i)).collect();
+                (
+                    format!(
+                        "SELECT * FROM (SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE, \
+                         COLUMN_ID FROM USER_TAB_COLUMNS WHERE TABLE_NAME IN ({}) \
+                         ORDER BY TABLE_NAME, COLUMN_ID) WHERE ROWNUM <= 20000",
+                        placeholders.join(",")
+                    ),
+                    false,
+                )
+            } else {
+                let placeholders: Vec<String> =
+                    (2..=tables.len() + 1).map(|i| format!(":{}", i)).collect();
+                (
+                    format!(
+                        "SELECT * FROM (SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, NULLABLE, \
+                         COLUMN_ID FROM ALL_TAB_COLUMNS WHERE OWNER = :1 AND TABLE_NAME IN ({}) \
+                         ORDER BY TABLE_NAME, COLUMN_ID) WHERE ROWNUM <= 20000",
+                        placeholders.join(",")
+                    ),
+                    true,
+                )
+            };
+
+            let mut owned: Vec<String> = Vec::new();
+            if binds_owner {
+                owned.push(owner.clone());
+            }
+            owned.extend(tables.iter().cloned());
+            let params: Vec<&dyn ToSql> = owned.iter().map(|s| s as &dyn ToSql).collect();
+
+            let mut stmt = self
+                .conn
+                .statement(&sql)
+                .build()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let rows = stmt.query(&params).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let mut found: BTreeMap<String, Vec<ColumnInfo>> = BTreeMap::new();
+            for row_result in rows {
+                let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+                let table: String = row.get(0).unwrap_or_default();
+                let name: String = row.get(1).unwrap_or_default();
+                let dtype: String = row.get(2).unwrap_or_default();
+                let nullable: String = row.get(3).unwrap_or_default();
+                if table.trim().is_empty() || name.trim().is_empty() {
+                    continue;
+                }
+                found.entry(table).or_default().push(ColumnInfo {
+                    name,
+                    data_type: if dtype.is_empty() { "?".into() } else { dtype },
+                    nullable: nullable.trim().eq_ignore_ascii_case("Y"),
+                });
+            }
+            for table in tables {
+                let cols = found.remove(&table).unwrap_or_default();
+                out.push(TableColumns {
+                    schema: owner.clone(),
+                    table,
+                    columns: cols,
+                });
             }
         }
         Ok(out)
@@ -1025,10 +1307,7 @@ impl OracleConnection {
         };
         // Best-effort cleanup so PLAN_TABLE doesn't fill up.
         let _ = self.conn.execute(
-            &format!(
-                "DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = '{}'",
-                stmt_id
-            ),
+            &format!("DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = '{}'", stmt_id),
             &[],
         );
         result
@@ -1081,11 +1360,29 @@ impl DbConnection for OracleConnection {
     fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
         self.list_objects(schema, group)
     }
-    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>> {
+    fn list_columns(
+        &self,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> anyhow::Result<Vec<ColumnInfo>> {
         self.list_columns(schema, name, kind)
     }
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
         self.object_ddl(schema, name, kind)
+    }
+    fn current_schema(&self) -> anyhow::Result<String> {
+        OracleConnection::current_schema(self)
+    }
+    fn list_schema_objects(&self, schema: &str) -> anyhow::Result<Vec<MetaObject>> {
+        OracleConnection::list_schema_objects(self, schema)
+    }
+    fn table_columns_batch(
+        &self,
+        refs: &[TableRef],
+        current_schema: &str,
+    ) -> anyhow::Result<Vec<TableColumns>> {
+        OracleConnection::table_columns_batch(self, refs, current_schema)
     }
     fn db_type(&self) -> DbType {
         DbType::Oracle
@@ -1111,17 +1408,16 @@ mod tests {
     #[test]
     fn strips_leading_comments_for_query_detection() {
         assert!(is_query_sql("-- note\nselect 1 from dual"));
-        assert!(is_query_sql("/* hi */ with x as (select 1 from dual) select * from x"));
+        assert!(is_query_sql(
+            "/* hi */ with x as (select 1 from dual) select * from x"
+        ));
         assert!(is_query_sql(
             "-- a\n-- b\n/* c; */\nselect * from all_tables;"
         ));
         assert!(!is_query_sql("-- note\nupdate t set x = 1"));
         assert!(strip_leading_comments("-- only comment").is_empty());
         assert!(strip_leading_comments("/* unterminated").is_empty());
-        assert_eq!(
-            strip_leading_comments("-- ; --\nselect 1"),
-            "select 1"
-        );
+        assert_eq!(strip_leading_comments("-- ; --\nselect 1"), "select 1");
     }
 
     #[test]
@@ -1141,7 +1437,8 @@ mod tests {
 
     #[test]
     fn session_error_maps_missing_privileges() {
-        let msg = OracleConnection::friendly_session_error("ORA-00942: table or view does not exist");
+        let msg =
+            OracleConnection::friendly_session_error("ORA-00942: table or view does not exist");
         assert!(msg.contains("ORA-00942"));
         assert!(msg.contains("GRANT SELECT_CATALOG_ROLE"));
         assert!(msg.contains("V_$SESSION"));

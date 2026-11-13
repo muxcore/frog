@@ -1,5 +1,6 @@
 use super::connection::{
-    ColumnInfo, DbConnection, DbSessionInfo, DbType, QueryData, QueryRow, format_create_table,
+    format_create_table, ColumnInfo, DbConnection, DbSessionInfo, DbType, MetaObject,
+    MetaObjectKind, QueryData, QueryRow, TableColumns, TableRef,
 };
 use std::sync::{Arc, Mutex};
 
@@ -70,10 +71,7 @@ pub fn friendly_connect_error(
     out
 }
 
-
-
 impl PgConnection {
-
     /// Run one statement through the simple query protocol. Every value arrives
     /// as server-formatted text, so ALL Postgres types (numeric, money,
     /// intervals, uuids, json, arrays, …) display correctly with no per-type
@@ -113,9 +111,9 @@ impl PgConnection {
                     }
                     rows.push(vals);
                 }
-            postgres::SimpleQueryMessage::CommandComplete(n) => completed = n,
-            _ => {}
-        }
+                postgres::SimpleQueryMessage::CommandComplete(n) => completed = n,
+                _ => {}
+            }
         }
         if rows.len() > max_rows {
             truncated = true;
@@ -148,7 +146,10 @@ impl PgConnection {
         }
         cfg.connect_timeout(std::time::Duration::from_secs(10));
         let client = cfg.connect(postgres::NoTls).map_err(|e| {
-            anyhow::anyhow!("{}", friendly_connect_error(host, port, database, user, &e.to_string()))
+            anyhow::anyhow!(
+                "{}",
+                friendly_connect_error(host, port, database, user, &e.to_string())
+            )
         })?;
         let cancel_token = client.cancel_token();
         Ok(Arc::new(Self {
@@ -651,9 +652,158 @@ impl PgConnection {
         }
         Ok(out)
     }
+
+    /// Completion: first schema on `search_path`.
+    pub fn current_schema(&self) -> anyhow::Result<String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        let row = client
+            .query_one("SELECT current_schema()", &[])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let name: Option<String> = row.try_get(0).unwrap_or(None);
+        name.filter(|n| !n.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("search_path is empty: no current schema"))
+    }
+
+    /// Completion: all object names of one schema in one query.
+    pub fn list_schema_objects(&self, schema: &str) -> anyhow::Result<Vec<MetaObject>> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        let stmt = client
+            .prepare(
+                "SELECT * FROM ( \
+                   SELECT c.relname AS name, \
+                          CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE' \
+                               WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MVIEW' \
+                               WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'S' THEN 'SEQUENCE' \
+                               ELSE 'OTHER' END AS kind \
+                   FROM pg_catalog.pg_class c \
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f','S') \
+                   UNION ALL \
+                   SELECT p.proname, \
+                          CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END \
+                   FROM pg_catalog.pg_proc p \
+                   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                   WHERE n.nspname = $1 \
+                 ) q ORDER BY 1 LIMIT 20000",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let rows = client
+            .query(&stmt, &[&schema])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let name: String = row.try_get(0).unwrap_or_default();
+            let kind: String = row.try_get(1).unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            out.push(MetaObject {
+                schema: schema.to_string(),
+                name,
+                kind: MetaObjectKind::from_oracle(&kind),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Completion: columns for the tables referenced by the current statement
+    /// in one round trip. `WITH ORDINALITY` maps rows back to the exact ref
+    /// (so search_path / quoted names resolve exactly like SQL would).
+    pub fn table_columns_batch(
+        &self,
+        refs: &[TableRef],
+        current_schema: &str,
+    ) -> anyhow::Result<Vec<TableColumns>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+        let stmt = client
+            .prepare(
+                "SELECT t.ord, n.nspname, c.relname, a.attname, \
+                        pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull \
+                 FROM unnest($1::text[]) WITH ORDINALITY AS t(rel, ord) \
+                 JOIN pg_catalog.pg_class c ON c.oid = to_regclass(t.rel) \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+                 WHERE a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY t.ord, a.attnum LIMIT 20000",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        let keys: Vec<String> = refs.iter().map(pg_regclass_arg).collect();
+        let rows = client
+            .query(&stmt, &[&keys])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+
+        let mut out: Vec<TableColumns> = refs
+            .iter()
+            .map(|r| TableColumns {
+                schema: r
+                    .schema
+                    .clone()
+                    .unwrap_or_else(|| current_schema.to_string()),
+                table: r.name.clone(),
+                columns: Vec::new(),
+            })
+            .collect();
+        for row in rows {
+            let ord: i64 = row.try_get(0).unwrap_or(0);
+            let idx = ord.saturating_sub(1) as usize;
+            if idx >= out.len() {
+                continue;
+            }
+            let nspname: String = row.try_get(1).unwrap_or_default();
+            let relname: String = row.try_get(2).unwrap_or_default();
+            let name: String = row.try_get(3).unwrap_or_default();
+            let dtype: String = row.try_get(4).unwrap_or_default();
+            let not_null: bool = row.try_get(5).unwrap_or(false);
+            if name.trim().is_empty() {
+                continue;
+            }
+            if out[idx].columns.is_empty() {
+                out[idx].schema = nspname;
+                out[idx].table = relname;
+            }
+            out[idx].columns.push(ColumnInfo {
+                name,
+                data_type: if dtype.is_empty() { "?".into() } else { dtype },
+                nullable: !not_null,
+            });
+        }
+        Ok(out)
+    }
 }
 
-/// Quote a Postgres identifier (schema/table/column) with double quotes.
+/// Argument for `to_regclass`: bare names fold like SQL (lowercase), quoted
+/// names keep their case. Schema is optional.
+fn pg_regclass_arg(r: &TableRef) -> String {
+    let table = if r.quoted {
+        pg_quote_ident(&r.name)
+    } else {
+        r.name.clone()
+    };
+    match &r.schema {
+        Some(schema) => {
+            let schema = if r.schema_quoted {
+                pg_quote_ident(schema)
+            } else {
+                schema.clone()
+            };
+            format!("{}.{}", schema, table)
+        }
+        None => table,
+    }
+}
+
 pub(crate) fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -694,10 +844,7 @@ pub(crate) fn pg_relation_select(schema: &str, table: &str) -> String {
 
 /// Build the `EXPLAIN <sql>` statement (pure, testable).
 pub(crate) fn pg_explain_sql(inner_sql: &str) -> String {
-    format!(
-        "EXPLAIN {}",
-        inner_sql.trim().trim_end_matches(';').trim()
-    )
+    format!("EXPLAIN {}", inner_sql.trim().trim_end_matches(';').trim())
 }
 
 impl DbConnection for PgConnection {
@@ -728,9 +875,7 @@ impl DbConnection for PgConnection {
             .client
             .lock()
             .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
-        let stmt = client
-            .prepare(sql)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let stmt = client.prepare(sql).map_err(|e| anyhow::anyhow!("{}", e))?;
         let rows = client
             .query(&stmt, &[])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -766,7 +911,12 @@ impl DbConnection for PgConnection {
     fn list_schemas(&self) -> anyhow::Result<Vec<String>> {
         self.explorer_schemas()
     }
-    fn list_columns(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<Vec<ColumnInfo>> {
+    fn list_columns(
+        &self,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> anyhow::Result<Vec<ColumnInfo>> {
         self.explorer_columns(schema, name, kind)
     }
     fn list_object_groups(&self, schema: &str) -> anyhow::Result<Vec<(String, u64)>> {
@@ -777,6 +927,19 @@ impl DbConnection for PgConnection {
     }
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
         self.explorer_ddl(schema, name, kind)
+    }
+    fn current_schema(&self) -> anyhow::Result<String> {
+        PgConnection::current_schema(self)
+    }
+    fn list_schema_objects(&self, schema: &str) -> anyhow::Result<Vec<MetaObject>> {
+        PgConnection::list_schema_objects(self, schema)
+    }
+    fn table_columns_batch(
+        &self,
+        refs: &[TableRef],
+        current_schema: &str,
+    ) -> anyhow::Result<Vec<TableColumns>> {
+        PgConnection::table_columns_batch(self, refs, current_schema)
     }
     fn db_type(&self) -> DbType {
         DbType::Postgres
@@ -791,7 +954,10 @@ mod tests {
     #[test]
     fn pg_statement_detection() {
         assert!(is_query_sql_for(DbType::Postgres, "select 1"));
-        assert!(is_query_sql_for(DbType::Postgres, "with x as (select 1) select * from x"));
+        assert!(is_query_sql_for(
+            DbType::Postgres,
+            "with x as (select 1) select * from x"
+        ));
         assert!(is_query_sql_for(DbType::Postgres, "values (1), (2)"));
         assert!(is_query_sql_for(DbType::Postgres, "table my_table"));
         assert!(is_query_sql_for(DbType::Postgres, "show server_version"));

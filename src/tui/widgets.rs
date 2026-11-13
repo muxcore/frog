@@ -1,3 +1,4 @@
+use crate::db::completion::CompletionPopup;
 use crate::db::connection::QueryRow;
 use crate::db::session_manager::{
     ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode,
@@ -250,7 +251,7 @@ pub fn render_editor(
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else if show_line_numbers {
-        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Alt+Up/Down: resize) "
+        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Ctrl+Space: complete | Alt+Up/Down: resize) "
     } else {
         " SQL Editor — Mouse:OFF, gutter hidden for clean copy (Alt+M restores | Alt+Y copies SQL) "
     };
@@ -317,6 +318,134 @@ pub fn render_editor(
 
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
+}
+
+/// Draw the completion popup just below (or above) the cursor. This overlays
+/// the editor area only, so it never disturbs the results pane.
+pub fn render_completion_popup(
+    session: &Session,
+    popup: &CompletionPopup,
+    show_gutter: bool,
+    f: &mut Frame,
+    editor_area: Rect,
+) {
+    if editor_area.width < 12 || editor_area.height < 4 {
+        return;
+    }
+    let ed = &session.editor;
+    let gutter = if show_gutter { 4 } else { 0 };
+    let visible_row = ed.cursor_row.saturating_sub(ed.scroll_offset);
+    let line = &ed.lines[ed.cursor_row];
+    let col = ed.cursor_col.min(line.len());
+    let x_off = UnicodeWidthStr::width(&line[..col]) as u16;
+
+    let max_rows = 10usize;
+    let rows = popup.items.len().min(max_rows);
+    let height = (rows as u16 + if rows == 0 { 3 } else { 2 })
+        .min(editor_area.height.saturating_sub(2))
+        .max(3);
+
+    // Width: tag + label + detail, clamped to the editor and the screen.
+    let mut width = 22u16;
+    for item in popup.items.iter().take(max_rows.max(1) * 2) {
+        let w = 2
+            + 1
+            + 1
+            + item.label.len() as u16
+            + if item.detail.is_empty() {
+                0
+            } else {
+                item.detail.len() as u16 + 2
+            };
+        width = width.max(w);
+    }
+    let max_width = f.area().right().saturating_sub(editor_area.x + 1);
+    let width = width.min(64).min(max_width).max(12.min(max_width));
+
+    let below_y = editor_area.y + 1 + visible_row as u16 + 1;
+    let below_room = editor_area.bottom().saturating_sub(below_y);
+    let y = if below_room >= height || below_y <= editor_area.y + 1 + height {
+        below_y.min(editor_area.bottom().saturating_sub(height))
+    } else {
+        (below_y.saturating_sub(height)).max(editor_area.y + 1)
+    };
+    let x = (editor_area.x + 1 + gutter + x_off)
+        .min(f.area().right().saturating_sub(width))
+        .max(editor_area.x + 1);
+    let area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, area);
+
+    let title = if popup.loading {
+        " Completion — loading catalog… "
+    } else {
+        " Completion (↑↓ select, Enter insert, Esc close) "
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if popup.items.is_empty() {
+        let msg = popup.note.as_deref().unwrap_or(if popup.loading {
+            "Loading catalog metadata…"
+        } else {
+            "No suggestions"
+        });
+        let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+        return;
+    }
+
+    let visible_rows = inner.height as usize;
+    let start = popup.scroll_offset(visible_rows);
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
+    for (i, item) in popup
+        .items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+    {
+        let selected = i == popup.selected;
+        let tag_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let label_style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let detail_style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("{} ", if selected { "▸" } else { " " }),
+                if selected {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(format!("{} ", item.kind.tag()), tag_style),
+            Span::styled(item.label.clone(), label_style),
+        ];
+        if !item.detail.is_empty() {
+            spans.push(Span::styled(format!("  {}", item.detail), detail_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
@@ -799,10 +928,7 @@ pub fn render_session_overview(
     let sql_h = layout.sql_height.clamp(3, 30);
     let panes = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(list_pct),
-            Constraint::Min(8),
-        ])
+        .constraints([Constraint::Percentage(list_pct), Constraint::Min(8)])
         .split(area);
 
     let list_area = panes[0];
@@ -905,7 +1031,11 @@ fn render_f2_list(
         ),
     };
     let filter_label = if active_only {
-        format!("ACTIVE only [{}/{}] (a: all)", db_sessions.len(), total_cached)
+        format!(
+            "ACTIVE only [{}/{}] (a: all)",
+            db_sessions.len(),
+            total_cached
+        )
     } else {
         "all (a: ACTIVE)".to_string()
     };
@@ -937,8 +1067,7 @@ fn render_f2_list(
             }
         })
         .collect();
-    let header = Row::new(header_cells)
-    .style(
+    let header = Row::new(header_cells).style(
         Style::default()
             .bg(Color::Rgb(40, 40, 60))
             .fg(Color::White)
@@ -950,7 +1079,10 @@ fn render_f2_list(
     if db_sessions.is_empty() {
         let (err_title, body, style) = match &session_view_error {
             Some(err) => (
-                format!(" Sessions — error ({} · press R to retry, Esc to go back) ", refresh_label),
+                format!(
+                    " Sessions — error ({} · press R to retry, Esc to go back) ",
+                    refresh_label
+                ),
                 err.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
@@ -1277,6 +1409,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+U              Delete to start of line"),
         Line::from("  Delete / Backspace  Delete character"),
         Line::from("  F3                  Open SQL history"),
+        Line::from("  Ctrl+Space          SQL completion popup (Ctrl+. fallback) — ↑/↓ select, Enter/Tab insert, Esc close"),
         Line::from(""),
         Line::from(Span::styled(
             " ─ Connection & Views ─ ",
@@ -1441,10 +1574,7 @@ pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            backend,
-            Style::default().fg(Color::Cyan),
-        )),
+        Line::from(Span::styled(backend, Style::default().fg(Color::Cyan))),
         Line::from(if session.is_connected {
             Span::styled(" ✔ Connected ", Style::default().fg(Color::Green))
         } else if session.connecting {
@@ -1516,10 +1646,7 @@ pub fn render_db_explorer(
     } else if area.height >= 14 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(split_pct),
-                Constraint::Min(5),
-            ])
+            .constraints([Constraint::Percentage(split_pct), Constraint::Min(5)])
             .split(area);
         (rows[0], rows[1], true)
     } else {
@@ -1545,9 +1672,7 @@ pub fn render_db_explorer(
             } else if cursor >= sess.explorer_scroll + tree_view_h {
                 sess.explorer_scroll = cursor + 1 - tree_view_h;
             }
-            sess.explorer_scroll = sess
-                .explorer_scroll
-                .min(total_rows.saturating_sub(1));
+            sess.explorer_scroll = sess.explorer_scroll.min(total_rows.saturating_sub(1));
         }
         sess.explorer_scroll
     };
@@ -1685,7 +1810,12 @@ fn render_explorer_tree(
 }
 
 /// One tree line: indent + expand glyph + name + kind badge / column detail.
-fn explorer_tree_line(sess: &Session, row: &ExplorerRow, selected: bool, inner_w: usize) -> Line<'static> {
+fn explorer_tree_line(
+    sess: &Session,
+    row: &ExplorerRow,
+    selected: bool,
+    inner_w: usize,
+) -> Line<'static> {
     let base = if selected {
         Style::default()
             .bg(Color::Rgb(60, 60, 100))
@@ -1822,8 +1952,9 @@ fn render_explorer_detail(
                 Style::default().fg(Color::DarkGray),
             ))],
         ),
-        Some(ExplorerRow::Schema { idx }) => {
-            ExplorerDetail::Text(format!(" Detail — {} ", sess.explorer_schemas[*idx].name), {
+        Some(ExplorerRow::Schema { idx }) => ExplorerDetail::Text(
+            format!(" Detail — {} ", sess.explorer_schemas[*idx].name),
+            {
                 let s = &sess.explorer_schemas[*idx];
                 let mut lines = vec![Line::from(Span::styled(
                     format!("Schema {}", s.name),
@@ -1849,63 +1980,57 @@ fn render_explorer_detail(
                     )));
                 }
                 lines
-            })
-        }
-        Some(ExplorerRow::Group { sidx, gidx }) => {
-            ExplorerDetail::Text(
-                format!(
-                    " Detail — {}.{} ",
-                    sess.explorer_schemas[*sidx].name,
-                    sess.explorer_schemas[*sidx]
-                        .groups
-                        .as_ref()
-                        .and_then(|g| g.get(*gidx))
-                        .map(|g| g.label())
-                        .unwrap_or("?")
-                ),
-                {
-                    let s = &sess.explorer_schemas[*sidx];
-                    let g = s.groups.as_ref().and_then(|g| g.get(*gidx));
-                    let mut lines = vec![Line::from(Span::styled(
-                        format!(
-                            "{} in {}",
-                            g.map(|g| g.label()).unwrap_or("?"),
-                            s.name
-                        ),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ))];
-                    match g.and_then(|g| g.objects.as_ref()) {
-                        Some(objs) if !objs.is_empty() => {
-                            lines.push(Line::from(format!("{} object(s), first few:", objs.len())));
-                            for o in objs.iter().take(30) {
-                                lines.push(Line::from(format!("  {} [{}]", o.name, o.kind)));
-                            }
-                            if objs.len() > 30 {
-                                lines.push(Line::from(Span::styled(
-                                    format!("… and {} more (filter with /)", objs.len() - 30),
-                                    Style::default().fg(Color::DarkGray),
-                                )));
-                            }
+            },
+        ),
+        Some(ExplorerRow::Group { sidx, gidx }) => ExplorerDetail::Text(
+            format!(
+                " Detail — {}.{} ",
+                sess.explorer_schemas[*sidx].name,
+                sess.explorer_schemas[*sidx]
+                    .groups
+                    .as_ref()
+                    .and_then(|g| g.get(*gidx))
+                    .map(|g| g.label())
+                    .unwrap_or("?")
+            ),
+            {
+                let s = &sess.explorer_schemas[*sidx];
+                let g = s.groups.as_ref().and_then(|g| g.get(*gidx));
+                let mut lines = vec![Line::from(Span::styled(
+                    format!("{} in {}", g.map(|g| g.label()).unwrap_or("?"), s.name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))];
+                match g.and_then(|g| g.objects.as_ref()) {
+                    Some(objs) if !objs.is_empty() => {
+                        lines.push(Line::from(format!("{} object(s), first few:", objs.len())));
+                        for o in objs.iter().take(30) {
+                            lines.push(Line::from(format!("  {} [{}]", o.name, o.kind)));
                         }
-                        _ => {}
+                        if objs.len() > 30 {
+                            lines.push(Line::from(Span::styled(
+                                format!("… and {} more (filter with /)", objs.len() - 30),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
                     }
-                    if let Some(err) = g.and_then(|g| g.load_error.as_ref()) {
-                        lines.push(Line::from(Span::styled(
-                            err.clone(),
-                            Style::default().fg(Color::Red),
-                        )));
-                    } else if g.map(|g| g.objects.is_none()).unwrap_or(true) {
-                        lines.push(Line::from(Span::styled(
-                            "Press → or Enter to list its objects.",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    lines
-                },
-            )
-        }
+                    _ => {}
+                }
+                if let Some(err) = g.and_then(|g| g.load_error.as_ref()) {
+                    lines.push(Line::from(Span::styled(
+                        err.clone(),
+                        Style::default().fg(Color::Red),
+                    )));
+                } else if g.map(|g| g.objects.is_none()).unwrap_or(true) {
+                    lines.push(Line::from(Span::styled(
+                        "Press → or Enter to list its objects.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines
+            },
+        ),
         Some(ExplorerRow::Table { sidx, gidx, tidx })
         | Some(ExplorerRow::Column {
             sidx, gidx, tidx, ..
@@ -1916,9 +2041,7 @@ fn render_explorer_detail(
         ExplorerDetail::Text(title, content) => {
             let view_h = area.height.saturating_sub(2) as usize;
             let total = content.len();
-            let skip = sess
-                .explorer_detail_scroll
-                .min(total.saturating_sub(1));
+            let skip = sess.explorer_detail_scroll.min(total.saturating_sub(1));
             let visible: Vec<Line> = content
                 .into_iter()
                 .skip(skip)
@@ -1993,7 +2116,11 @@ fn render_explorer_detail(
                     .collect();
                 let p = Paragraph::new(visible).block(
                     Block::default()
-                        .title(format!(" {}{} ", title.trim(), if maximized { "[MAX]" } else { "" }))
+                        .title(format!(
+                            " {}{} ",
+                            title.trim(),
+                            if maximized { "[MAX]" } else { "" }
+                        ))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(f2_border(focused))),
                 );
@@ -2019,17 +2146,14 @@ fn explorer_object_detail(
     tidx: usize,
 ) -> ExplorerDetail<'_> {
     use ExplorerDetail as D;
-    let (schema_name, t) = match sess
-        .explorer_schemas
-        .get(sidx)
-        .and_then(|s| {
-            s.groups
-                .as_ref()
-                .and_then(|g| g.get(gidx))
-                .and_then(|g| g.objects.as_ref())
-                .and_then(|o| o.get(tidx))
-                .map(|t| (s.name.clone(), t))
-        }) {
+    let (schema_name, t) = match sess.explorer_schemas.get(sidx).and_then(|s| {
+        s.groups
+            .as_ref()
+            .and_then(|g| g.get(gidx))
+            .and_then(|g| g.objects.as_ref())
+            .and_then(|o| o.get(tidx))
+            .map(|t| (s.name.clone(), t))
+    }) {
         Some(v) => v,
         None => return D::Text(" Detail ".into(), vec![]),
     };
@@ -2039,10 +2163,7 @@ fn explorer_object_detail(
         } else {
             ""
         };
-        format!(
-            " Detail — {}.{} [{}]{} ",
-            schema_name, t.name, t.kind, more
-        )
+        format!(" Detail — {}.{} [{}]{} ", schema_name, t.name, t.kind, more)
     };
     let header = Line::from(Span::styled(
         format!("{}.{} — {}", schema_name, t.name, t.kind),
@@ -2142,16 +2263,59 @@ fn explorer_object_detail(
     if t.has_preview() {
         top.push(Line::from(""));
         top.push(Line::from(if t.preview_loading {
-            Span::styled(
-                "⟳ Loading preview…",
-                Style::default().fg(Color::Yellow),
-            )
+            Span::styled("⟳ Loading preview…", Style::default().fg(Color::Yellow))
         } else {
-            Span::styled(
-                "Preview pending…",
-                Style::default().fg(Color::DarkGray),
-            )
+            Span::styled("Preview pending…", Style::default().fg(Color::DarkGray))
         }));
     }
     D::Text(title, top)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::completion::{CompletionItem, CompletionPopup, ItemKind};
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn completion_popup_renders_inside_editor() {
+        let mut sm = SessionManager::new();
+        let mut session = sm.sessions.remove(0);
+        session.editor.set_text("SELECT * FROM emp e WHERE e.");
+        session.editor.cursor_col = session.editor.lines[0].len();
+        session.completion = Some(CompletionPopup::new(
+            vec![CompletionItem {
+                label: "EMPNO".into(),
+                insert_text: "EMPNO".into(),
+                kind: ItemKind::Column,
+                detail: "NUMBER".into(),
+            }],
+            28,
+            0,
+            30,
+            false,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_completion_popup(
+                    &session,
+                    session.completion.as_ref().unwrap(),
+                    true,
+                    f,
+                    area,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("EMPNO"));
+        assert!(text.contains("Completion"));
+    }
 }

@@ -52,10 +52,8 @@ fn build_osc52_sequence(text: &str, in_tmux: bool) -> Option<String> {
     if text.is_empty() || text.len() > MAX_OSC52_BYTES {
         return None;
     }
-    let encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        text.as_bytes(),
-    );
+    let encoded =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes());
     let osc52 = format!("\x1b]52;c;{}\x07", encoded);
     if in_tmux {
         Some(format!("\x1bPtmux;\x1b{}\x1b\\", osc52))
@@ -76,18 +74,21 @@ fn build_osc52_sequence(text: &str, in_tmux: bool) -> Option<String> {
 /// does *not* guarantee the terminal honored them).
 fn write_osc52(text: &str) -> bool {
     use std::io::Write;
-    let in_tmux =
-        std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some();
+    let in_tmux = std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some();
     let Some(sequence) = build_osc52_sequence(text, in_tmux) else {
         return false;
     };
     // Prefer /dev/tty (direct handle to the controlling terminal, bypasses
     // any stdout redirection by the TUI layer); fall back to stdout.
     if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        tty.write_all(sequence.as_bytes()).and_then(|_| tty.flush()).is_ok()
+        tty.write_all(sequence.as_bytes())
+            .and_then(|_| tty.flush())
+            .is_ok()
     } else {
         let mut out = io::stdout();
-        out.write_all(sequence.as_bytes()).and_then(|_| out.flush()).is_ok()
+        out.write_all(sequence.as_bytes())
+            .and_then(|_| out.flush())
+            .is_ok()
     }
 }
 
@@ -327,8 +328,10 @@ impl App {
         // support — mintty/git-bash and proxies don't, and pushing
         // unconditionally leaves Ctrl+M / Ctrl+Enter ambiguous anyway.
         // (crossterm docs: only kitty/foot/WezTerm/Alacritty et al. support it.)
-        self.keyboard_enhanced =
-            matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
+        self.keyboard_enhanced = matches!(
+            crossterm::terminal::supports_keyboard_enhancement(),
+            Ok(true)
+        );
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
@@ -398,6 +401,7 @@ impl App {
             self.session_manager.poll_result();
             self.session_manager.poll_explorer();
             self.session_manager.poll_conn_result();
+            self.session_manager.poll_metadata();
             self.session_manager.check_connections();
             self.session_manager.tick_statuses();
             self.session_manager.tick_session_view();
@@ -433,23 +437,27 @@ impl App {
     /// spaces (a literal Tab can't be typed — it cycles focus — and
     /// `insert_char` drops control chars, so pasted indentation would vanish).
     fn paste_text(&mut self, text: &str) {
+        // Pasted text changes the word under the popup; close it rather than
+        // accept into a range computed before the paste.
+        self.session_manager.close_completion();
         // Normalize once so `\r\n` becomes a single newline (not two) and a
         // lone `\r` still breaks the line instead of joining two lines.
         let normalized = normalize_paste(text);
         if self.command_mode {
-            self.command_input.extend(
-                normalized
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .flat_map(|c| {
-                        if c == '\n' {
-                            // Single-line bar: join lines with a space.
-                            vec![' ']
-                        } else {
-                            vec![c]
-                        }
-                    }),
-            );
+            self.command_input
+                .extend(
+                    normalized
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .flat_map(|c| {
+                            if c == '\n' {
+                                // Single-line bar: join lines with a space.
+                                vec![' ']
+                            } else {
+                                vec![c]
+                            }
+                        }),
+                );
             return;
         }
         let session = self.session_manager.active_session_mut();
@@ -485,7 +493,11 @@ impl App {
     /// OFF: the gutter is hidden then so a terminal-native selection copies
     /// clean SQL without `  12 ` prefixes.
     fn editor_gutter_width(&self) -> u16 {
-        if self.mouse_capture { 4 } else { 0 }
+        if self.mouse_capture {
+            4
+        } else {
+            0
+        }
     }
 
     /// Toggle mouse capture (tmux-style). While OFF the terminal handles text
@@ -542,8 +554,7 @@ impl App {
             let mut text = String::new();
             match self.result_format {
                 ResultFormat::Markdown => {
-                    let refs: Vec<&[String]> =
-                        last_res.rows.iter().map(|r| r.as_slice()).collect();
+                    let refs: Vec<&[String]> = last_res.rows.iter().map(|r| r.as_slice()).collect();
                     text.push_str(&markdown_table(&last_res.columns, &refs));
                 }
                 ResultFormat::Ascii => {
@@ -627,11 +638,17 @@ impl App {
         if !matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) {
             return false;
         }
-        key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.modifiers.contains(KeyModifiers::ALT)
+        key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Clicking anywhere relocates focus/cursor; a completion popup anchored
+        // to the old position must not accept into the wrong range.
+        if self.session_manager.active_session().completion.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(_))
+        {
+            self.session_manager.close_completion();
+        }
         // F12 explorer owns its area fullscreen: clicks select, gutter /
         // double-click toggles, wheel scrolls the pane under the cursor.
         if self.session_manager.active_session().mode == SessionMode::DbExplorer
@@ -674,7 +691,10 @@ impl App {
                 // user clicked in the editor, then insert the primary selection.
                 // Over SSH (no X display) arboard fails — tell the user what
                 // to press instead of failing silently.
-                if self.editor_area.contains(Position::new(mouse.column, mouse.row)) {
+                if self
+                    .editor_area
+                    .contains(Position::new(mouse.column, mouse.row))
+                {
                     self.click_editor(mouse.column, mouse.row);
                     if let Some(text) = Self::read_primary_selection() {
                         self.paste_text(&text);
@@ -729,10 +749,9 @@ impl App {
         let gutter = self.editor_gutter_width() as usize;
         let session = self.session_manager.active_session_mut();
         session.mode = SessionMode::Query;
-        let raw_row = (row.saturating_sub(self.editor_area.y + 1)) as usize
-            + session.editor.scroll_offset;
-        let target_col =
-            (column.saturating_sub(self.editor_area.x + 1 + gutter as u16)) as usize;
+        let raw_row =
+            (row.saturating_sub(self.editor_area.y + 1)) as usize + session.editor.scroll_offset;
+        let target_col = (column.saturating_sub(self.editor_area.x + 1 + gutter as u16)) as usize;
         let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
         session.editor.cursor_row = target_row;
         session.editor.cursor_col =
@@ -791,6 +810,47 @@ impl App {
             return;
         }
 
+        // Completion popup: Ctrl+Space opens it; while open, navigation and
+        // accept keys take precedence over editor movement / focus cycling.
+        let popup_open = self.session_manager.active_session().completion.is_some();
+        if mode == SessionMode::Query && self.active_window == ActiveWindow::Editor {
+            if Self::is_completion_key(key) {
+                self.session_manager.open_completion();
+                return;
+            }
+            if popup_open && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.session_manager.close_completion();
+                        return;
+                    }
+                    KeyCode::Up => {
+                        self.session_manager.move_completion(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        self.session_manager.move_completion(1);
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        self.session_manager.move_completion(-8);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        self.session_manager.move_completion(8);
+                        return;
+                    }
+                    KeyCode::Enter | KeyCode::Tab => {
+                        self.session_manager.accept_completion();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        } else if popup_open {
+            self.session_manager.close_completion();
+        }
+
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
                 self.should_quit = true;
@@ -801,6 +861,7 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char(':'))
             | (KeyModifiers::CONTROL, KeyCode::Char(';'))
             | (KeyModifiers::CONTROL, KeyCode::Char('：')) => {
+                self.session_manager.close_completion();
                 self.command_mode = true;
                 self.command_input.clear();
                 self.command_error = None;
@@ -808,6 +869,7 @@ impl App {
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+                self.session_manager.close_completion();
                 self.session_manager.add_session();
                 return;
             }
@@ -829,6 +891,7 @@ impl App {
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
+                self.session_manager.close_completion();
                 let session = self.session_manager.active_session_mut();
                 let field = session.conn_dialog.active_field;
                 session.conn_dialog.select_field(field);
@@ -872,8 +935,7 @@ impl App {
             // Alt+Y: SQL under cursor, never with line numbers (built from
             // editor.lines, plus OSC52 so it lands on the local clipboard
             // over SSH). Plain `ESC y` survives git-bash like Alt+M/Alt+Enter.
-            (KeyModifiers::ALT, KeyCode::Char('y'))
-            | (KeyModifiers::ALT, KeyCode::Char('Y')) => {
+            (KeyModifiers::ALT, KeyCode::Char('y')) | (KeyModifiers::ALT, KeyCode::Char('Y')) => {
                 self.copy_sql_to_clipboard();
                 return;
             }
@@ -929,18 +991,22 @@ impl App {
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(1)) => {
+                self.session_manager.close_completion();
                 self.session_manager.active_session_mut().mode = SessionMode::Help;
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(2)) => {
+                self.session_manager.close_completion();
                 self.session_manager.enter_session_view();
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(3)) => {
+                self.session_manager.close_completion();
                 self.session_manager.active_session_mut().mode = SessionMode::History;
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(12)) => {
+                self.session_manager.close_completion();
                 // Toggle the DB explorer like a fullscreen browser (cf. F2).
                 let mode = self.session_manager.active_session().mode.clone();
                 if mode == SessionMode::DbExplorer {
@@ -1014,12 +1080,10 @@ impl App {
                             session.scroll_offset = session.scroll_offset.saturating_sub(1)
                         }
                         KeyCode::Right => {
-                            session.col_scroll_offset =
-                                session.col_scroll_offset.saturating_add(1)
+                            session.col_scroll_offset = session.col_scroll_offset.saturating_add(1)
                         }
                         KeyCode::Left => {
-                            session.col_scroll_offset =
-                                session.col_scroll_offset.saturating_sub(1)
+                            session.col_scroll_offset = session.col_scroll_offset.saturating_sub(1)
                         }
                         KeyCode::PageDown => {
                             session.scroll_offset = session.scroll_offset.saturating_add(20)
@@ -1050,6 +1114,46 @@ impl App {
                     self.active_window = ActiveWindow::Editor;
                 }
             }
+        }
+
+        // Typing while the popup is open: recompute for the new prefix. The
+        // catalog is never touched here; only the in-memory store is read.
+        // Any other key (cursor movement, ...) closes the popup so its
+        // word_start can never go stale.
+        if popup_open && mode == SessionMode::Query && self.active_window == ActiveWindow::Editor {
+            if Self::is_editor_edit_key(key) {
+                self.session_manager.refresh_completion();
+            } else {
+                self.session_manager.close_completion();
+            }
+        }
+    }
+
+    /// Ctrl+Space (and Ctrl+@ / Ctrl+., which survive terminals that map the
+    /// NUL byte differently) opens the completion popup. A bare NUL is also
+    /// accepted because some terminals drop the Ctrl modifier for Ctrl+Space.
+    fn is_completion_key(key: event::KeyEvent) -> bool {
+        matches!(
+            (key.modifiers, key.code),
+            (
+                KeyModifiers::CONTROL,
+                KeyCode::Char(' ')
+                    | KeyCode::Char('\0')
+                    | KeyCode::Char('@')
+                    | KeyCode::Char('.')
+                    | KeyCode::Null
+            ) | (KeyModifiers::NONE, KeyCode::Char('\0') | KeyCode::Null)
+        )
+    }
+
+    /// Keys that change the editor text and therefore refresh the popup.
+    fn is_editor_edit_key(key: event::KeyEvent) -> bool {
+        match (key.modifiers, key.code) {
+            (m, KeyCode::Char(c)) => (m.is_empty() || m == KeyModifiers::SHIFT) && !c.is_control(),
+            (m, KeyCode::Backspace) | (m, KeyCode::Delete) => {
+                m.is_empty() || m == KeyModifiers::SHIFT
+            }
+            _ => false,
         }
     }
 
@@ -1323,7 +1427,9 @@ impl App {
         if self.session_manager.active_session().session_view_cursor == idx {
             return;
         }
-        self.session_manager.active_session_mut().session_view_cursor = idx;
+        self.session_manager
+            .active_session_mut()
+            .session_view_cursor = idx;
         self.session_manager.load_selected_sql();
     }
 
@@ -1529,8 +1635,7 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
                 if detail_focused {
                     let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_col_scroll =
-                        s.explorer_detail_col_scroll.saturating_sub(1);
+                    s.explorer_detail_col_scroll = s.explorer_detail_col_scroll.saturating_sub(1);
                 } else {
                     self.session_manager.collapse_explorer_cursor();
                 }
@@ -1538,8 +1643,7 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
                 if detail_focused {
                     let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_col_scroll =
-                        s.explorer_detail_col_scroll.saturating_add(1);
+                    s.explorer_detail_col_scroll = s.explorer_detail_col_scroll.saturating_add(1);
                 } else {
                     self.session_manager.toggle_explorer_cursor();
                 }
@@ -1631,8 +1735,7 @@ impl App {
                             s.explorer_detail_col_scroll =
                                 s.explorer_detail_col_scroll.saturating_add(3);
                         } else {
-                            s.explorer_detail_scroll =
-                                s.explorer_detail_scroll.saturating_add(3);
+                            s.explorer_detail_scroll = s.explorer_detail_scroll.saturating_add(3);
                         }
                     }
                     if !shift {
@@ -1666,8 +1769,7 @@ impl App {
                 if in_detail {
                     self.explorer_focus = ExplorerPane::Detail;
                     let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_col_scroll =
-                        s.explorer_detail_col_scroll.saturating_sub(3);
+                    s.explorer_detail_col_scroll = s.explorer_detail_col_scroll.saturating_sub(3);
                 }
                 return true;
             }
@@ -1675,8 +1777,7 @@ impl App {
                 if in_detail {
                     self.explorer_focus = ExplorerPane::Detail;
                     let s = self.session_manager.active_session_mut();
-                    s.explorer_detail_col_scroll =
-                        s.explorer_detail_col_scroll.saturating_add(3);
+                    s.explorer_detail_col_scroll = s.explorer_detail_col_scroll.saturating_add(3);
                 }
                 return true;
             }
@@ -1856,14 +1957,21 @@ impl App {
                     .session_sql_area
                     .y
                     .saturating_add(self.session_sql_area.height);
-                let in_h_range =
-                    mouse.column >= self.session_view_area.x && mouse.column < self.session_view_area.x + self.session_view_area.width.max(1);
-                if in_h_range && (mouse.row as i16 - list_bottom as i16).abs() <= 1 && self.session_list_area.height > 0 {
+                let in_h_range = mouse.column >= self.session_view_area.x
+                    && mouse.column
+                        < self.session_view_area.x + self.session_view_area.width.max(1);
+                if in_h_range
+                    && (mouse.row as i16 - list_bottom as i16).abs() <= 1
+                    && self.session_list_area.height > 0
+                {
                     self.session_resizing = Some(SessionResize::List);
                     self.session_view_focus = SessionViewPane::List;
                     return true;
                 }
-                if in_h_range && (mouse.row as i16 - sql_bottom as i16).abs() <= 1 && self.session_sql_area.height > 0 {
+                if in_h_range
+                    && (mouse.row as i16 - sql_bottom as i16).abs() <= 1
+                    && self.session_sql_area.height > 0
+                {
                     self.session_resizing = Some(SessionResize::Sql);
                     self.session_view_focus = SessionViewPane::Sql;
                     return true;
@@ -1880,10 +1988,16 @@ impl App {
                         let avail = self.session_list_area.height.saturating_sub(4) as usize;
                         if avail > 0 && rel < avail {
                             let cursor = sess.session_view_cursor.min(total.saturating_sub(1));
-                            let start = if cursor >= avail { cursor + 1 - avail } else { 0 };
+                            let start = if cursor >= avail {
+                                cursor + 1 - avail
+                            } else {
+                                0
+                            };
                             let idx = (start + rel).min(total.saturating_sub(1));
                             if idx != cursor {
-                                self.session_manager.active_session_mut().session_view_cursor = idx;
+                                self.session_manager
+                                    .active_session_mut()
+                                    .session_view_cursor = idx;
                                 self.session_manager.load_selected_sql();
                             }
                         }
@@ -2120,6 +2234,17 @@ impl App {
                             f,
                             self.editor_area,
                         );
+                        if self.active_window == ActiveWindow::Editor {
+                            if let Some(popup) = session.completion.as_ref() {
+                                render_completion_popup(
+                                    session,
+                                    popup,
+                                    self.mouse_capture,
+                                    f,
+                                    self.editor_area,
+                                );
+                            }
+                        }
                     }
                     Some(MaximizedBox::Results) => {
                         let current_res = session.results.last();
@@ -2147,6 +2272,17 @@ impl App {
                             f,
                             self.editor_area,
                         );
+                        if self.active_window == ActiveWindow::Editor {
+                            if let Some(popup) = session.completion.as_ref() {
+                                render_completion_popup(
+                                    session,
+                                    popup,
+                                    self.mouse_capture,
+                                    f,
+                                    self.editor_area,
+                                );
+                            }
+                        }
                         let current_res = session.results.last();
                         render_table(
                             session,
@@ -2257,6 +2393,26 @@ mod tests {
         assert!(build_osc52_sequence("", false).is_none());
         let big = "x".repeat(MAX_OSC52_BYTES + 1);
         assert!(build_osc52_sequence(&big, false).is_none());
+    }
+
+    #[test]
+    fn completion_key_accepts_terminal_variants() {
+        assert!(App::is_completion_key(key(
+            KeyModifiers::CONTROL,
+            KeyCode::Char(' ')
+        )));
+        assert!(App::is_completion_key(key(
+            KeyModifiers::CONTROL,
+            KeyCode::Char('.')
+        )));
+        assert!(App::is_completion_key(key(
+            KeyModifiers::NONE,
+            KeyCode::Null
+        )));
+        assert!(!App::is_completion_key(key(
+            KeyModifiers::NONE,
+            KeyCode::Char(' ')
+        )));
     }
 
     #[test]
@@ -2426,10 +2582,7 @@ mod tests {
 
         assert_eq!(app.session_view_maximized, None);
         app.handle_session_view(key(KeyModifiers::CONTROL, KeyCode::Char('z')));
-        assert_eq!(
-            app.session_view_maximized,
-            Some(SessionViewPane::Sql)
-        );
+        assert_eq!(app.session_view_maximized, Some(SessionViewPane::Sql));
         app.handle_session_view(key(KeyModifiers::NONE, KeyCode::F(11)));
         assert_eq!(app.session_view_maximized, None);
     }
@@ -2453,10 +2606,7 @@ mod tests {
             wrap_sql_lines("aaaa bbbb cccc", 9),
             vec!["aaaa bbbb".to_string(), "cccc".to_string()]
         );
-        assert_eq!(
-            wrap_sql_lines("", 8),
-            vec![String::new()]
-        );
+        assert_eq!(wrap_sql_lines("", 8), vec![String::new()]);
         let long = "x".repeat(25);
         let lines = wrap_sql_lines(&long, 10);
         assert_eq!(lines, vec!["x".repeat(10), "x".repeat(10), "x".repeat(5)]);

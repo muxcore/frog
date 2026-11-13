@@ -2,6 +2,21 @@
 
 All notable changes to frog are documented here.
 
+## [Unreleased]
+
+### Added
+- Toad-style SQL completion popup in the editor (`Ctrl+Space`, `Ctrl+.`
+  fallback): alias → columns, schema → objects, table → columns, plus
+  keywords/functions and identifiers already in the statement. `↑`/`↓`/
+  `PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` closes.
+- Background completion metadata: cached per session (schemas → object names
+  → columns of referenced tables) with TTL, stale-while-revalidate and DDL
+  invalidation. Keystrokes only read memory; catalog queries never run on the
+  UI thread. Oracle uses `USER_TAB_COLUMNS` for the current schema and batched
+  `ALL_TAB_COLUMNS` for others; Postgres resolves refs with `to_regclass` and
+  fetches all requested tables in one `unnest … WITH ORDINALITY` query.
+- `docs/sql-completion.md`: research notes, design and phased plan.
+
 ## [0.5.7] - 2026-10-22
 
 ### Added
