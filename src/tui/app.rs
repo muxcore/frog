@@ -1,5 +1,7 @@
 use crate::cli::Config;
-use crate::db::session_manager::{SessionManager, SessionMode};
+use crate::db::session_manager::{
+    EditorSelection, SessionManager, SessionMode, TableSelection,
+};
 use crate::tui::widgets::*;
 
 use crate::db::session_manager::ConnectionDialog;
@@ -65,6 +67,22 @@ fn effective_editor_height(main_height: u16, configured: u16) -> u16 {
     configured.min(max_editor).max(4)
 }
 
+/// Pin result scroll offsets into the loaded data. Scroll keys and the wheel
+/// only ever grow the offsets (`saturating_add`), so without this, scrolling
+/// past the end accumulates a huge offset and the opposite direction feels
+/// dead for dozens of presses — in every result format. Pure (no I/O) so it
+/// can be unit-tested.
+fn clamp_scroll_offsets(
+    scroll_offset: usize,
+    col_scroll_offset: usize,
+    total_rows: usize,
+    total_cols: usize,
+) -> (usize, usize) {
+    (
+        scroll_offset.min(total_rows.saturating_sub(1)),
+        col_scroll_offset.min(total_cols.saturating_sub(1)),
+    )
+}
 /// Normalize pasted text: `CRLF` -> single `LF`, lone `CR` (git-bash sends
 /// CR-only line breaks) -> `LF`. Caller expands tabs / maps newlines per
 /// target (editor newline vs single-line field).
@@ -226,6 +244,18 @@ pub struct App {
     command_error: Option<String>,
     /// When set, the command bar is in confirm mode for this @file command.
     command_confirm: Option<String>,
+    /// Whether a left-button editor drag is currently building a selection.
+    selecting_editor: bool,
+    /// Whether a left-button table drag is currently building a cell selection.
+    selecting_table: bool,
+    /// Frog's own copy buffer: every in-app copy lands here too, so paste
+    /// works even when the OS clipboard is unreachable. Typical over SSH:
+    /// the copy rides OSC52 to the *local* terminal, but arboard can only
+    /// read the *remote* clipboard — without this fallback, a table just
+    /// copied could never be pasted back.
+    copy_buffer: String,
+    /// Table geometry from the last render (for mouse hit-testing).
+    results_layout: ResultsLayout,
     /// Whether frog captures mouse events. Toggled with Ctrl+M / Alt+M
     /// (tmux-style): while OFF, the terminal handles selection/copy natively
     /// and pastes land via bracketed paste (or plain keys on terminals like
@@ -307,6 +337,33 @@ pub enum ActiveWindow {
     Sidebar,
 }
 
+/// Which content a contextual copy (Ctrl+Y) grabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyTarget {
+    Results,
+    TableSelection,
+    SqlSelection,
+    SqlStatement,
+}
+
+/// Contextual copy dispatch: the focused pane decides. Results (and
+/// Sidebar) prefer an active table drag-selection, else the full table;
+/// the Editor prefers the drag-selection, else the statement at the
+/// cursor (with several statements, only the one under the cursor).
+/// Pure, so it can be unit-tested.
+fn copy_target_for(
+    focus: ActiveWindow,
+    editor_selection: bool,
+    table_selection: bool,
+) -> CopyTarget {
+    match focus {
+        ActiveWindow::Editor if editor_selection => CopyTarget::SqlSelection,
+        ActiveWindow::Editor => CopyTarget::SqlStatement,
+        _ if table_selection => CopyTarget::TableSelection,
+        _ => CopyTarget::Results,
+    }
+}
+
 impl App {
     pub fn new(config: Config, session_manager: SessionManager) -> anyhow::Result<Self> {
         Ok(Self {
@@ -343,6 +400,10 @@ impl App {
             command_input: String::new(),
             command_error: None,
             command_confirm: None,
+            selecting_editor: false,
+            selecting_table: false,
+            copy_buffer: String::new(),
+            results_layout: ResultsLayout::default(),
             mouse_capture: true,
             keyboard_enhanced: false,
         })
@@ -501,6 +562,8 @@ impl App {
                 session.conn_dialog.insert_char(c);
             }
         } else {
+            // Pasting replaces the drag-selection, like a GUI editor.
+            session.delete_selection();
             for c in normalized.chars() {
                 if c == '\n' {
                     session.editor.newline();
@@ -533,6 +596,15 @@ impl App {
     fn toggle_mouse_capture(&mut self) {
         use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
         self.mouse_capture = !self.mouse_capture;
+        // Frog-side drag-selections can't survive the mode switch (no more
+        // drag events in one mode, double highlight in the other).
+        self.selecting_editor = false;
+        self.selecting_table = false;
+        {
+            let s = self.session_manager.active_session_mut();
+            s.editor_selection = None;
+            s.table_selection = None;
+        }
         let mut stdout = io::stdout();
         let _ = if self.mouse_capture {
             execute!(stdout, EnableMouseCapture)
@@ -545,6 +617,32 @@ impl App {
             "Mouse OFF — borderless editor, drag to select clean SQL; Ctrl+V / Shift+Ins pastes, Alt+M restores"
         };
         self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    /// Clamp the active session's result scroll offsets to the loaded rows
+    /// and columns. Runs every frame before the result viewer draws, so all
+    /// three formats (Table/Markdown/ASCII) stay in range even after
+    /// overscroll, a format switch, or shrinking data.
+    fn clamp_result_scroll(&mut self) {
+        let (total_rows, total_cols) =
+            match self.session_manager.active_session().results.last() {
+                Some(qr) if !qr.is_error => (qr.rows.len(), qr.columns.len()),
+                _ => return,
+            };
+        let s = self.session_manager.active_session_mut();
+        let (row, col) =
+            clamp_scroll_offsets(s.scroll_offset, s.col_scroll_offset, total_rows, total_cols);
+        s.scroll_offset = row;
+        s.col_scroll_offset = col;
+    }
+
+    /// Copy `text` to every clipboard we have (OS + OSC52) and remember it
+    /// in the internal buffer so Ctrl+V works even when the OS clipboard
+    /// is unreachable (typical over SSH).
+    fn copy_and_remember(&mut self, text: &str) -> CopyOutcome {
+        let outcome = copy_to_clipboard(text);
+        self.copy_buffer = text.to_string();
+        outcome
     }
 
     /// Status text for a clipboard copy outcome (shared by Ctrl+Y / Alt+Y).
@@ -584,7 +682,8 @@ impl App {
                     text.push_str(&markdown_table(&last_res.columns, &refs));
                 }
                 ResultFormat::Ascii => {
-                    text.push_str(&format_ascii_table(last_res, 0, 0, last_res.rows.len()));
+                    let full = 0..last_res.columns.len();
+                    text.push_str(&format_ascii_table(last_res, full, 0, last_res.rows.len()));
                 }
                 ResultFormat::Table => {
                     text.push_str(&last_res.columns.join("\t"));
@@ -598,7 +697,7 @@ impl App {
             let n = text.chars().count();
             (text, n)
         };
-        let outcome = copy_to_clipboard(&text);
+        let outcome = self.copy_and_remember(&text);
         let msg = Self::copy_status(outcome, chars, "results");
         self.session_manager.active_session_mut().set_status(msg);
     }
@@ -628,7 +727,7 @@ impl App {
             return;
         };
         let chars = text.chars().count();
-        let outcome = copy_to_clipboard(&text);
+        let outcome = self.copy_and_remember(&text);
         let msg = Self::copy_status(outcome, chars, "SQL");
         self.session_manager.active_session_mut().set_status(msg);
     }
@@ -680,13 +779,23 @@ impl App {
         matches!(key.code, KeyCode::Insert)
     }
 
-    /// Paste the OS clipboard content at the active target. No-op with a
-    /// status hint when no clipboard is available (e.g. headless SSH).
+    /// Paste the clipboard content at the active target. Prefers the live
+    /// OS clipboard (so externally copied text wins); falls back to
+    /// frog's own copy buffer — without this, anything copied over SSH
+    /// (OSC52 → local terminal) could never be pasted back, because
+    /// arboard only sees the *remote* clipboard there.
     fn paste_from_clipboard(&mut self) {
         let text = arboard::Clipboard::new()
             .ok()
             .and_then(|mut cb| cb.get().text().ok())
-            .filter(|t| !t.is_empty());
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                if self.copy_buffer.is_empty() {
+                    None
+                } else {
+                    Some(self.copy_buffer.clone())
+                }
+            });
         match text {
             Some(t) => {
                 if self.session_manager.active_session().mode == SessionMode::Query {
@@ -740,8 +849,37 @@ impl App {
                     self.is_resizing = true;
                 } else if in_editor {
                     self.click_editor(mouse.column, mouse.row);
+                    // Start a drag-selection: a plain click just places the
+                    // cursor (empty selection, cleared on release).
+                    let s = self.session_manager.active_session_mut();
+                    let (r, c) = (s.editor.cursor_row, s.editor.cursor_col);
+                    s.editor_selection = Some(EditorSelection {
+                        anchor_row: r,
+                        anchor_col: c,
+                        cursor_row: r,
+                        cursor_col: c,
+                    });
+                    self.selecting_editor = true;
                 } else if in_results {
                     self.active_window = ActiveWindow::Results;
+                    // Start a drag-selection in any result format: header
+                    // clicks select column names, data clicks select cells.
+                    // A plain click just focuses (empty selection, cleared
+                    // on release). Clicks on borders/separators do nothing.
+                    if mouse.row > self.results_area.y {
+                        if let Some((r, c)) =
+                            self.results_cell_to_cursor(mouse.column, mouse.row)
+                        {
+                            self.session_manager.active_session_mut().table_selection =
+                                Some(TableSelection {
+                                    anchor_row: r,
+                                    anchor_col: c,
+                                    cursor_row: r,
+                                    cursor_col: c,
+                                });
+                            self.selecting_table = true;
+                        }
+                    }
                 } else if in_sidebar {
                     self.active_window = ActiveWindow::Sidebar;
                 }
@@ -768,6 +906,23 @@ impl App {
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 self.is_resizing = false;
                 self.session_resizing = None;
+                // End of an editor drag: copy a non-empty selection to the
+                // clipboard (OS + OSC52, so it works over SSH). A plain
+                // click leaves an empty selection, which clears itself.
+                if self.selecting_editor {
+                    self.selecting_editor = false;
+                    if !self.copy_editor_selection() {
+                        self.session_manager.active_session_mut().editor_selection = None;
+                    }
+                }
+                // End of a table drag: same, but header + TSV with no box
+                // borders — just the columns and the content.
+                if self.selecting_table {
+                    self.selecting_table = false;
+                    if !self.copy_table_selection() {
+                        self.session_manager.active_session_mut().table_selection = None;
+                    }
+                }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                 if self.is_resizing {
@@ -779,6 +934,35 @@ impl App {
                 }
                 if let Some(which) = self.session_resizing {
                     self.drag_session_splitter(which, mouse.row);
+                }
+                // Extend the editor drag-selection and follow it with the
+                // text cursor.
+                if self.selecting_editor {
+                    let (r, c) = self.editor_cell_to_cursor(mouse.column, mouse.row);
+                    let s = self.session_manager.active_session_mut();
+                    s.editor.cursor_row = r;
+                    s.editor.cursor_col = c;
+                    s.editor.snap_cursor_to_char_boundary();
+                    if let Some(sel) = s.editor_selection.as_mut() {
+                        sel.cursor_row = s.editor.cursor_row;
+                        sel.cursor_col = s.editor.cursor_col;
+                    }
+                }
+                // Extend the table cell selection.
+                if self.selecting_table {
+                    if let Some((r, c)) =
+                        self.results_cell_to_cursor(mouse.column, mouse.row)
+                    {
+                        if let Some(sel) = self
+                            .session_manager
+                            .active_session_mut()
+                            .table_selection
+                            .as_mut()
+                        {
+                            sel.cursor_row = r;
+                            sel.cursor_col = c;
+                        }
+                    }
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -817,23 +1001,128 @@ impl App {
         }
     }
 
+    /// Convert a mouse cell into an editor (row, byte-col) position, using
+    /// the same border/gutter/scroll math as rendering. Always lands on a
+    /// char boundary. Shared by click-to-place and drag-selection.
+    fn editor_cell_to_cursor(&self, column: u16, row: u16) -> (usize, usize) {
+        let gutter = self.editor_gutter_width() as usize;
+        let frame: u16 = if self.mouse_capture { 1 } else { 0 };
+        let session = self.session_manager.active_session();
+        let raw_row =
+            (row.saturating_sub(self.editor_area.y + frame)) as usize + session.editor.scroll_offset;
+        let target_col =
+            (column.saturating_sub(self.editor_area.x + frame + gutter as u16)) as usize;
+        let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
+        (
+            target_row,
+            byte_offset_for_column(&session.editor.lines[target_row], target_col),
+        )
+    }
+
     /// Focus the editor and move the text cursor to the clicked position.
     /// Borderless (Mouse:OFF) editors have no 1-cell frame, so the offset
     /// skips the border only when borders are drawn.
     fn click_editor(&mut self, column: u16, row: u16) {
+        let (target_row, target_col) = self.editor_cell_to_cursor(column, row);
         self.active_window = ActiveWindow::Editor;
-        let gutter = self.editor_gutter_width() as usize;
-        let frame = if self.mouse_capture { 1 } else { 0 };
         let session = self.session_manager.active_session_mut();
         session.mode = SessionMode::Query;
-        let raw_row =
-            (row.saturating_sub(self.editor_area.y + frame)) as usize + session.editor.scroll_offset;
-        let target_col = (column.saturating_sub(self.editor_area.x + frame + gutter as u16)) as usize;
-        let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
         session.editor.cursor_row = target_row;
-        session.editor.cursor_col =
-            byte_offset_for_column(&session.editor.lines[target_row], target_col);
+        session.editor.cursor_col = target_col;
         session.editor.snap_cursor_to_char_boundary();
+    }
+
+    /// Ctrl+Y: copy what the focused pane shows.
+    fn copy_focused_to_clipboard(&mut self) {
+        let (editor_sel, table_sel) = {
+            let s = self.session_manager.active_session();
+            (
+                s.selected_text().is_some(),
+                s.selected_table_text().is_some(),
+            )
+        };
+        match copy_target_for(self.active_window, editor_sel, table_sel) {
+            CopyTarget::Results => self.copy_results_to_clipboard(),
+            CopyTarget::TableSelection => {
+                self.copy_table_selection();
+            }
+            CopyTarget::SqlSelection => {
+                self.copy_editor_selection();
+            }
+            CopyTarget::SqlStatement => self.copy_sql_to_clipboard(),
+        }
+    }
+
+    /// Convert a mouse cell into a result-table (row, column) position
+    /// using the last frame's render geometry. Works in every result
+    /// format — the layout records each format's header/data line offsets
+    /// (Table 1/2, Markdown 1/3, ASCII 2/4), and columns resolve through
+    /// the uniform grid (Table/ASCII) or per-row Markdown cell widths.
+    /// Returns `None` on chrome (borders, separators) or when there is no
+    /// data under the cursor. Rows are `None` on the header line.
+    fn results_cell_to_cursor(&self, column: u16, row: u16) -> Option<(Option<usize>, usize)> {
+        let layout = &self.results_layout;
+        let area = self.results_area;
+        let session = self.session_manager.active_session();
+        let qr = session.results.last()?;
+        if qr.is_error || qr.columns.is_empty() {
+            return None;
+        }
+        let total_cols = qr.columns.len();
+        let y_rel = row.saturating_sub(area.y);
+        let abs_row: Option<usize> = if y_rel == layout.header_y {
+            None
+        } else {
+            let rel = y_rel.checked_sub(layout.first_data_y)?;
+            if qr.rows.is_empty() {
+                return None;
+            }
+            let visible = layout
+                .visible_rows
+                .min(qr.rows.len().saturating_sub(layout.top_row));
+            if visible == 0 {
+                return None;
+            }
+            let rel = rel as usize;
+            Some(layout.top_row + rel.min(visible.saturating_sub(1)))
+        };
+        let abs_col = match self.result_format {
+            ResultFormat::Markdown => {
+                markdown_col_at(qr, layout, area, abs_row, column)?
+            }
+            _ => uniform_col_at(layout, area, column, total_cols)?,
+        };
+        Some((abs_row, abs_col))
+    }
+
+    /// Copy the current table drag-selection (header + TSV, no borders) to
+    /// the clipboard (OS + OSC52, like Ctrl+Y). Returns false when there
+    /// is no (non-empty) selection.
+    fn copy_table_selection(&mut self) -> bool {
+        let text = match self.session_manager.active_session().selected_table_text() {
+            Some(t) => t,
+            None => return false,
+        };
+        let chars = text.chars().count();
+        let outcome = self.copy_and_remember(&text);
+        let msg = Self::copy_status(outcome, chars, "table selection");
+        self.session_manager.active_session_mut().set_status(msg);
+        true
+    }
+
+    /// Copy the current editor drag-selection to the clipboard (OS +
+    /// OSC52, like Ctrl+Y / Alt+Y). Returns false when there is no
+    /// (non-empty) selection.
+    fn copy_editor_selection(&mut self) -> bool {
+        let text = match self.session_manager.active_session().selected_text() {
+            Some(t) => t,
+            None => return false,
+        };
+        let chars = text.chars().count();
+        let outcome = self.copy_and_remember(&text);
+        let msg = Self::copy_status(outcome, chars, "selection");
+        self.session_manager.active_session_mut().set_status(msg);
+        true
     }
 
     fn handle_key(&mut self, key: event::KeyEvent) {
@@ -983,7 +1272,17 @@ impl App {
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                self.session_manager.cancel_query();
+                // Standard copy key with a safety valve: a running query
+                // still wins (cancel it, so runaway queries stay stoppable);
+                // otherwise this is the same contextual copy as Ctrl+Y —
+                // selection first, else the statement/table the focused
+                // pane shows.
+                // (`cancel_query` is a silent no-op when idle.)
+                if self.session_manager.active_session().pending_query {
+                    self.session_manager.cancel_query();
+                } else {
+                    self.copy_focused_to_clipboard();
+                }
                 return;
             }
             (KeyModifiers::NONE, KeyCode::Esc) => {
@@ -1010,10 +1309,15 @@ impl App {
                 };
                 return;
             }
-            // Ctrl+Y: results (OS clipboard + OSC52 fallback for SSH).
+            // Ctrl+Y: contextual copy — the focused pane decides. Results
+            // (or Sidebar) copies the table drag-selection if present, else
+            // the full table; the Editor copies the drag-selection if
+            // present, else the SQL statement at the cursor (with multiple
+            // statements, only the one under the cursor). Alt+Y always
+            // copies SQL explicitly.
             (KeyModifiers::CONTROL, KeyCode::Char('y'))
             | (KeyModifiers::CONTROL, KeyCode::Char('Y')) => {
-                self.copy_results_to_clipboard();
+                self.copy_focused_to_clipboard();
                 return;
             }
             // Alt+Y: SQL under cursor, never with line numbers (built from
@@ -1109,46 +1413,82 @@ impl App {
         match session.mode {
             SessionMode::Query => match self.active_window {
                 ActiveWindow::Editor => match (key.modifiers, key.code) {
-                    (KeyModifiers::CONTROL, KeyCode::Char('a')) => session.editor.cursor_col = 0,
+                    (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
+                        session.editor_selection = None;
+                        session.editor.cursor_col = 0;
+                    }
                     (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+                        session.editor_selection = None;
                         session.editor.cursor_col =
                             session.editor.lines[session.editor.cursor_row].len();
                     }
-                    (KeyModifiers::CONTROL, KeyCode::Char('k')) => session.editor.kill_line(),
+                    (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                        session.editor_selection = None;
+                        session.editor.kill_line();
+                    }
                     (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                        session.editor_selection = None;
                         session.editor.lines[session.editor.cursor_row].clear();
                         session.editor.cursor_col = 0;
                     }
                     (KeyModifiers::CONTROL, KeyCode::Char('d')) => session.editor.delete(),
                     (m, KeyCode::Char(c)) if m.is_empty() || m == KeyModifiers::SHIFT => {
                         if !c.is_control() {
+                            // Typing replaces the drag-selection, like a GUI editor.
+                            session.delete_selection();
                             session.editor.insert_char(c);
                         }
                     }
                     (m, KeyCode::Backspace) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                        session.editor.backspace()
+                        if !session.delete_selection() {
+                            session.editor.backspace();
+                        }
                     }
                     (m, KeyCode::Delete) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                        session.editor.delete()
+                        if !session.delete_selection() {
+                            session.editor.delete();
+                        }
                     }
                     (m, KeyCode::Enter) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                        session.editor.newline()
+                        session.delete_selection();
+                        session.editor.newline();
                     }
-                    (_, KeyCode::Left) => session.editor.move_left(),
-                    (_, KeyCode::Right) => session.editor.move_right(),
-                    (_, KeyCode::Up) => session.editor.move_up(),
-                    (_, KeyCode::Down) => session.editor.move_down(),
-                    (_, KeyCode::Home) => session.editor.cursor_col = 0,
+                    (m, KeyCode::Esc) if m.is_empty() => {
+                        session.editor_selection = None;
+                    }
+                    (_, KeyCode::Left) => {
+                        session.editor_selection = None;
+                        session.editor.move_left();
+                    }
+                    (_, KeyCode::Right) => {
+                        session.editor_selection = None;
+                        session.editor.move_right();
+                    }
+                    (_, KeyCode::Up) => {
+                        session.editor_selection = None;
+                        session.editor.move_up();
+                    }
+                    (_, KeyCode::Down) => {
+                        session.editor_selection = None;
+                        session.editor.move_down();
+                    }
+                    (_, KeyCode::Home) => {
+                        session.editor_selection = None;
+                        session.editor.cursor_col = 0;
+                    }
                     (_, KeyCode::End) => {
+                        session.editor_selection = None;
                         session.editor.cursor_col =
                             session.editor.lines[session.editor.cursor_row].len();
                     }
                     (_, KeyCode::PageUp) => {
+                        session.editor_selection = None;
                         for _ in 0..10 {
                             session.editor.move_up();
                         }
                     }
                     (_, KeyCode::PageDown) => {
+                        session.editor_selection = None;
                         for _ in 0..10 {
                             session.editor.move_down();
                         }
@@ -1175,7 +1515,15 @@ impl App {
                         KeyCode::PageUp => {
                             session.scroll_offset = session.scroll_offset.saturating_sub(20)
                         }
-                        KeyCode::Esc => self.active_window = ActiveWindow::Editor,
+                        KeyCode::Esc => {
+                            // First Esc clears an active table drag-selection
+                            // (and stays in Results); next Esc goes to Editor.
+                            let had_selection = session.selected_table_text().is_some();
+                            session.table_selection = None;
+                            if !had_selection {
+                                self.active_window = ActiveWindow::Editor;
+                            }
+                        }
                         _ => {}
                     }
                     if matches!(key.code, KeyCode::Down | KeyCode::PageDown) {
@@ -2260,6 +2608,13 @@ impl App {
                 render_connection_dialog(session, f, chunks[1]);
             }
             _ => {
+                // Pin scroll offsets into the loaded data every frame: keys
+                // and wheel only grow them, so overscroll would otherwise
+                // make the opposite direction feel dead (in any format).
+                self.clamp_result_scroll();
+                // Fresh table geometry from this frame's render (for mouse
+                // hit-testing); stored after the last `session` use below.
+                let mut new_results_layout: Option<ResultsLayout> = None;
                 match self.maximized_box {
                     Some(MaximizedBox::Editor) => {
                         self.editor_area = chunks[1];
@@ -2347,7 +2702,7 @@ impl App {
                     }
                     Some(MaximizedBox::Results) => {
                         let current_res = session.results.last();
-                        render_table(
+                        new_results_layout = Some(render_table(
                             session,
                             &current_res,
                             TableViewState {
@@ -2358,7 +2713,7 @@ impl App {
                             },
                             f,
                             self.results_area,
-                        );
+                        ));
                     }
                     Some(MaximizedBox::Sidebar) => {
                         render_right_panel(session, f, self.sidebar_area);
@@ -2383,7 +2738,7 @@ impl App {
                             }
                         }
                         let current_res = session.results.last();
-                        render_table(
+                        new_results_layout = Some(render_table(
                             session,
                             &current_res,
                             TableViewState {
@@ -2394,7 +2749,7 @@ impl App {
                             },
                             f,
                             self.results_area,
-                        );
+                        ));
                         if !self.hide_sidebar {
                             render_right_panel(session, f, self.sidebar_area);
                         }
@@ -2422,6 +2777,11 @@ impl App {
                         let cy = area.y + frame + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
                     }
+                }
+                // Last `session` use is behind us — publish this frame's
+                // table geometry for mouse hit-testing.
+                if let Some(layout) = new_results_layout.take() {
+                    self.results_layout = layout;
                 }
             }
         }
@@ -2471,11 +2831,49 @@ mod tests {
     }
 
     #[test]
+    fn scroll_offsets_clamp_into_loaded_data() {
+        // In-range offsets pass through untouched.
+        assert_eq!(clamp_scroll_offsets(3, 1, 10, 4), (3, 1));
+        // Overscroll (keys/wheel only grow the offsets) pins to the last
+        // row/column instead of accumulating invisibly.
+        assert_eq!(clamp_scroll_offsets(1000, 99, 10, 4), (9, 3));
+        // Empty data pins to zero.
+        assert_eq!(clamp_scroll_offsets(5, 5, 0, 0), (0, 0));
+    }
+
+    #[test]
     fn paste_normalizes_crlf_and_lone_cr() {
         assert_eq!(normalize_paste("a\r\nb"), "a\nb");
         assert_eq!(normalize_paste("a\rb"), "a\nb");
         assert_eq!(normalize_paste("a\nb"), "a\nb");
         assert_eq!(normalize_paste("a\r\n\r\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn contextual_copy_dispatch_follows_focus() {
+        use CopyTarget::*;
+        // Editor: selection wins, else the statement at the cursor.
+        assert_eq!(
+            copy_target_for(ActiveWindow::Editor, true, false),
+            SqlSelection
+        );
+        assert_eq!(
+            copy_target_for(ActiveWindow::Editor, false, true),
+            SqlStatement
+        );
+        // Results/Sidebar: table selection wins, else the full table.
+        assert_eq!(
+            copy_target_for(ActiveWindow::Results, false, true),
+            TableSelection
+        );
+        assert_eq!(
+            copy_target_for(ActiveWindow::Results, true, false),
+            Results
+        );
+        assert_eq!(
+            copy_target_for(ActiveWindow::Sidebar, false, false),
+            Results
+        );
     }
 
     #[test]

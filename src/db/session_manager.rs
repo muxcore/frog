@@ -173,6 +173,90 @@ pub struct SqlEditor {
     pub scroll_offset: usize,
 }
 
+/// Rectangular cell selection in the result table. Row endpoints are
+/// `None` for the header row (column names), `Some(r)` for absolute
+/// data-row indices; columns are absolute indices. Built by mouse drag in
+/// Table view, copied as header + TSV (no box borders) on release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableSelection {
+    pub anchor_row: Option<usize>,
+    pub anchor_col: usize,
+    pub cursor_row: Option<usize>,
+    pub cursor_col: usize,
+}
+
+impl TableSelection {
+    /// Endpoints ordered so `start <= end` (row-major; the header sorts
+    /// before every data row).
+    pub fn ordered(&self) -> ((Option<usize>, usize), (Option<usize>, usize)) {
+        let a = (self.anchor_row, self.anchor_col);
+        let b = (self.cursor_row, self.cursor_col);
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let (a, b) = self.ordered();
+        a == b
+    }
+
+    /// Clamp to the data dimensions. Rows stay `Option` (`None` = header);
+    /// returns `None` for an empty selection or when there is nothing to
+    /// copy (no columns, or neither header-selectable columns... ).
+    /// With zero data rows a header-only selection still clamps fine.
+    pub fn clamp(&self, total_rows: usize, total_cols: usize) -> Option<TableRect> {
+        if self.is_empty() || total_cols == 0 {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = self.ordered();
+        let c1 = c1.min(total_cols - 1);
+        let c0 = c0.min(c1);
+        if total_rows == 0 {
+            return Some(((None, c0), (None, c1)));
+        }
+        let r1 = r1.map(|r| r.min(total_rows - 1));
+        let max_r = r1.unwrap_or(total_rows - 1);
+        let r0 = r0.map(|r| r.min(max_r));
+        Some(((r0, c0), (r1, c1)))
+    }
+}
+
+/// In-editor drag selection (row + byte-column endpoints, both kept on char
+/// boundaries). Created by mouse-drag with capture ON, copied to the
+/// clipboard on release — no terminal-native selection needed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditorSelection {
+    pub anchor_row: usize,
+    pub anchor_col: usize,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+}
+
+impl EditorSelection {
+    /// Endpoints ordered so `start <= end` (row-major).
+    pub fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.anchor_row, self.anchor_col);
+        let b = (self.cursor_row, self.cursor_col);
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let (a, b) = self.ordered();
+        a == b
+    }
+}
+
+/// Ordered, clamped table-selection endpoints: `((r0, c0), (r1, c1))`.
+/// Rows are `None` for the header row.
+pub type TableRect = ((Option<usize>, usize), (Option<usize>, usize));
+
 impl Default for SqlEditor {
     fn default() -> Self {
         Self::new()
@@ -283,6 +367,42 @@ impl SqlEditor {
         self.lines.insert(self.cursor_row + 1, rest);
         self.cursor_row += 1;
         self.cursor_col = 0;
+    }
+
+    /// Delete the text range from `start` to `end` ((row, byte-col),
+    /// `start <= end`) and park the cursor at `start`. Joins the remaining
+    /// head/tail lines. Endpoints are clamped and floored to char
+    /// boundaries, so a stale drag-selection can never panic.
+    pub fn delete_range(&mut self, start: (usize, usize), end: (usize, usize)) {
+        let snap = |line: &str, mut col: usize| -> usize {
+            col = col.min(line.len());
+            while col > 0 && !line.is_char_boundary(col) {
+                col -= 1;
+            }
+            col
+        };
+        let last = self.lines.len().saturating_sub(1);
+        let (sr, er) = (start.0.min(last), end.0.min(last));
+        if sr > er {
+            return;
+        }
+        let sc = snap(&self.lines[sr], start.1);
+        let ec = snap(&self.lines[er], end.1);
+        if sr == er {
+            let (a, b) = (sc.min(ec), sc.max(ec));
+            self.lines[sr].replace_range(a..b, "");
+        } else {
+            let tail = self.lines[er][ec..].to_string();
+            self.lines[sr].truncate(sc);
+            self.lines[sr].push_str(&tail);
+            self.lines.drain(sr + 1..=er);
+            if self.lines.is_empty() {
+                self.lines.push(String::new());
+            }
+        }
+        self.cursor_row = sr.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = sc.min(self.lines[self.cursor_row].len());
+        self.snap_cursor_to_char_boundary();
     }
 
     pub fn move_left(&mut self) {
@@ -478,7 +598,14 @@ pub struct Session {
     pub results: Vec<QueryRow>,
     pub scroll_offset: usize,
     pub col_scroll_offset: usize,
+    /// Rectangular cell selection in the result table (absolute data-row /
+    /// column indices). Built by mouse drag in Table view; copied as
+    /// header + TSV (no box borders) on release via `selected_table_text`.
+    pub table_selection: Option<TableSelection>,
     pub editor: SqlEditor,
+    /// Current mouse-drag text selection in the editor (None = no
+    /// selection). Copied to the clipboard on mouse release.
+    pub editor_selection: Option<EditorSelection>,
     pub mode: SessionMode,
     pub pending_query: bool,
     /// True while a further page of the current result set is being fetched
@@ -1049,6 +1176,89 @@ impl Session {
         }
     }
 
+    /// If an editor drag-selection exists, delete its text and park the
+    /// cursor at its start. Returns true when something was deleted.
+    /// Used for type/paste-replaces-selection and Backspace/Delete.
+    pub fn delete_selection(&mut self) -> bool {
+        let sel = match self.editor_selection.take() {
+            Some(s) if !s.is_empty() => s,
+            _ => return false,
+        };
+        let ((sr, sc), (er, ec)) = sel.ordered();
+        self.editor.delete_range((sr, sc), (er, ec));
+        true
+    }
+
+    /// Header + TSV text for the current table cell selection (selected
+    /// columns, selected rows), or None when there is no non-empty
+    /// selection. Selecting the header row copies just the column names;
+    /// otherwise the header of the selected columns plus the data rows.
+    /// Raw cell values — just columns and content, no box
+    /// borders — like the Table branch of Ctrl+Y.
+    pub fn selected_table_text(&self) -> Option<String> {
+        let sel = self.table_selection?;
+        let qr = self.results.last()?;
+        if qr.is_error || qr.columns.is_empty() {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = sel.clamp(qr.rows.len(), qr.columns.len())?;
+        let mut out = String::new();
+        out.push_str(&qr.columns[c0..=c1].join("\t"));
+        if let Some(e) = r1 {
+            let s = r0.unwrap_or(0);
+            for row in &qr.rows[s..=e] {
+                out.push('\n');
+                // Ragged-safe: missing cells copy as empty.
+                let cells: Vec<&str> = (c0..=c1)
+                    .map(|c| row.get(c).map(String::as_str).unwrap_or(""))
+                    .collect();
+                out.push_str(&cells.join("\t"));
+            }
+        }
+        Some(out)
+    }
+
+    /// Text covered by the current editor drag-selection, if any.
+    /// Endpoints are clamped and floored to char boundaries, so a stale
+    /// selection (lines edited mid-drag can't happen — edits clear it, but
+    /// belt and braces) can never panic.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.editor_selection?;
+        if self.editor.lines.is_empty() {
+            return None;
+        }
+        let ((sr, sc), (er, ec)) = sel.ordered();
+        if sr == er && sc == ec {
+            return None;
+        }
+        let snap = |line: &str, mut col: usize| -> usize {
+            col = col.min(line.len());
+            while col > 0 && !line.is_char_boundary(col) {
+                col -= 1;
+            }
+            col
+        };
+        let last = self.editor.lines.len() - 1;
+        let (sr, er) = (sr.min(last), er.min(last));
+        let (sr, er) = (sr.min(er), sr.max(er));
+        if sr == er {
+            let line = &self.editor.lines[sr];
+            let (mut a, mut b) = (snap(line, sc), snap(line, ec));
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            return Some(line[a..b].to_string());
+        }
+        let mut parts = Vec::with_capacity(er - sr + 1);
+        for r in sr..=er {
+            let line = &self.editor.lines[r];
+            let a = if r == sr { snap(line, sc) } else { 0 };
+            let b = if r == er { snap(line, ec) } else { line.len() };
+            parts.push(line[a.min(b)..b.max(a)].to_string());
+        }
+        Some(parts.join("\n"))
+    }
+
     fn new(id: usize) -> Self {
         Self {
             id,
@@ -1061,7 +1271,9 @@ impl Session {
             results: Vec::new(),
             scroll_offset: 0,
             col_scroll_offset: 0,
+            table_selection: None,
             editor: SqlEditor::new(),
+            editor_selection: None,
             mode: SessionMode::Query,
             pending_query: false,
             paging: false,
@@ -1798,6 +2010,8 @@ impl SessionManager {
                     // Fresh query result
                     sess.results.push(qr);
                     sess.scroll_offset = 0;
+                    sess.col_scroll_offset = 0;
+                    sess.table_selection = None;
                 }
 
                 // Enforce the per-session results cap (drop oldest pages).
@@ -4233,6 +4447,146 @@ mod tests {
         ed.delete();
         assert_eq!(ed.lines[0], "from v");
         assert!(ed.lines[0].is_char_boundary(ed.cursor_col));
+    }
+
+    #[test]
+    fn table_drag_selection_extracts_tsv() {
+        let mut sm = SessionManager::new();
+        let sess = &mut sm.sessions[0];
+        sess.results.push(QueryRow {
+            columns: vec!["A".into(), "B".into(), "C".into()],
+            rows: vec![
+                vec!["a1".into(), "b1".into(), "c1".into()],
+                vec!["a2".into(), "b2".into(), "c2".into()],
+                vec!["a3".into(), "b3".into(), "c3".into()],
+            ],
+            truncated: false,
+            elapsed_ms: 1,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset: 0,
+            page_size: 100,
+            byte_count: 0,
+            total_fetched: 3,
+        });
+        // Rect over B..C, rows 1..2 (0-based) — header + TSV, no borders.
+        sess.table_selection = Some(TableSelection {
+            anchor_row: Some(0),
+            anchor_col: 1,
+            cursor_row: Some(1),
+            cursor_col: 2,
+        });
+        assert_eq!(
+            sess.selected_table_text().as_deref(),
+            Some("B\tC\nb1\tc1\nb2\tc2")
+        );
+        // Reversed endpoints give the same text.
+        sess.table_selection = Some(TableSelection {
+            anchor_row: Some(1),
+            anchor_col: 2,
+            cursor_row: Some(0),
+            cursor_col: 1,
+        });
+        assert_eq!(
+            sess.selected_table_text().as_deref(),
+            Some("B\tC\nb1\tc1\nb2\tc2")
+        );
+        // Out-of-range endpoints clamp to the data, single cell = empty.
+        sess.table_selection = Some(TableSelection {
+            anchor_row: Some(0),
+            anchor_col: 0,
+            cursor_row: Some(99),
+            cursor_col: 99,
+        });
+        assert_eq!(
+            sess.selected_table_text().as_deref(),
+            Some("A\tB\tC\na1\tb1\tc1\na2\tb2\tc2\na3\tb3\tc3")
+        );
+        sess.table_selection = Some(TableSelection {
+            anchor_row: Some(1),
+            anchor_col: 1,
+            cursor_row: Some(1),
+            cursor_col: 1,
+        });
+        assert_eq!(sess.selected_table_text(), None);
+        // Header-row drag copies just the column names.
+        sess.table_selection = Some(TableSelection {
+            anchor_row: None,
+            anchor_col: 0,
+            cursor_row: None,
+            cursor_col: 1,
+        });
+        assert_eq!(sess.selected_table_text().as_deref(), Some("A\tB"));
+        // Header-through-data drag copies names plus those rows.
+        sess.table_selection = Some(TableSelection {
+            anchor_row: None,
+            anchor_col: 1,
+            cursor_row: Some(0),
+            cursor_col: 2,
+        });
+        assert_eq!(
+            sess.selected_table_text().as_deref(),
+            Some("B\tC\nb1\tc1")
+        );
+        sess.table_selection = None;
+        assert_eq!(sess.selected_table_text(), None);
+    }
+
+    #[test]
+    fn editor_drag_selection_extracts_and_deletes() {
+        let mut sm = SessionManager::new();
+        let sess = &mut sm.sessions[0];
+        sess.editor.lines = vec![
+            "select *".to_string(),
+            "from all_tables".to_string(),
+            "where rownum < 10".to_string(),
+        ];
+        // Single-line selection: "all_tables".
+        sess.editor_selection = Some(EditorSelection {
+            anchor_row: 1,
+            anchor_col: 5,
+            cursor_row: 1,
+            cursor_col: 15,
+        });
+        assert_eq!(sess.selected_text().as_deref(), Some("all_tables"));
+        // Reversed endpoints give the same text.
+        sess.editor_selection = Some(EditorSelection {
+            anchor_row: 1,
+            anchor_col: 15,
+            cursor_row: 1,
+            cursor_col: 5,
+        });
+        assert_eq!(sess.selected_text().as_deref(), Some("all_tables"));
+        // Multi-line selection joins with newlines.
+        sess.editor_selection = Some(EditorSelection {
+            anchor_row: 0,
+            anchor_col: 7,
+            cursor_row: 1,
+            cursor_col: 4,
+        });
+        assert_eq!(sess.selected_text().as_deref(), Some("*\nfrom"));
+        // Empty selection yields nothing.
+        sess.editor_selection = Some(EditorSelection {
+            anchor_row: 0,
+            anchor_col: 3,
+            cursor_row: 0,
+            cursor_col: 3,
+        });
+        assert_eq!(sess.selected_text(), None);
+        // Deleting a range joins head and tail, parks cursor at start.
+        sess.editor_selection = Some(EditorSelection {
+            anchor_row: 0,
+            anchor_col: 7,
+            cursor_row: 1,
+            cursor_col: 4,
+        });
+        assert!(sess.delete_selection());
+        assert_eq!(sess.editor.lines[0], "select  all_tables");
+        assert_eq!(sess.editor.lines.len(), 2);
+        assert_eq!((sess.editor.cursor_row, sess.editor.cursor_col), (0, 7));
+        assert_eq!(sess.editor_selection, None);
+        assert!(!sess.delete_selection());
     }
 
     #[test]

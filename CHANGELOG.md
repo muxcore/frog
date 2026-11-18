@@ -2,6 +2,46 @@
 
 All notable changes to frog are documented here.
 
+## [0.7.0] - 2026-11-18
+
+### Fixed
+- Result scrolling parity across formats: Markdown/ASCII now use the
+  same responsive column window as Table (no more fixed 10-col slice),
+  correct per-format pane sizing, `▲▼◀▶` + scrollbars in every title,
+  and scroll offsets are clamped into the loaded data each frame so
+  overscrolling past the end can't wedge the opposite direction in any
+  format. Fresh results also reset the column offset.
+
+### Added
+- In-editor drag selection with mouse capture ON: dragging across SQL
+  text highlights it and auto-copies to the clipboard on release (OS +
+  OSC52, so it works over SSH with no terminal-native selection or
+  Mouse:OFF toggle needed). `Ctrl+C` copies the active selection when
+  no query is running, typing/pasting replaces the selection, `Esc`
+  clears it.
+- `Ctrl+C` is now the standard copy key when no query is running (cancel
+  still wins mid-query): same contextual copy as `Ctrl+Y` — selection
+  first, else the statement/table the focused pane shows. `Ctrl+V`
+  pastes the OS clipboard, falling back to frog's own copy buffer.
+- Fixed paste-after-copy over SSH: the copy rides OSC52 to the *local*
+  terminal but arboard only reads the *remote* clipboard, so a table
+  just copied could never be pasted back. Every in-app copy is now also
+  remembered internally and used when the OS clipboard is unavailable.
+- Header-row selection in Table view: dragging from the header selects
+  column names (highlighted in place); every table copy automatically
+  includes the header row. The title shows the range (`[sel hdr c1-3]`,
+  `[sel hdr-5 c2-4]`).
+- `Ctrl+Y` is now contextual: in Results it copies the table
+  drag-selection (or the full table), in the Editor the drag-selection
+  (or the SQL statement at the cursor) — one copy key driven by focus.
+  `Alt+Y` remains as the explicit copy-SQL key.
+- Table drag-selection in every result format (Table, Markdown, ASCII):
+  dragging across result cells highlights them and copies header + TSV
+  on release — just columns and content, no box borders. Works with
+  mouse capture ON over SSH (OS clipboard + OSC52); `Ctrl+C` copies it
+  when no query runs, `Esc` clears it, and the title shows the selected
+  range (`[sel r3-5 c2-4]`).
+
 ## [0.6.0] - 2026-11-18
 
 ### Fixed

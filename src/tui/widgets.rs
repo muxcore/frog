@@ -1,7 +1,7 @@
 use crate::db::completion::CompletionPopup;
 use crate::db::connection::QueryRow;
 use crate::db::session_manager::{
-    ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode,
+    ConnectionDialog, ExplorerRow, Session, SessionManager, SessionMode, TableRect, TableSelection,
 };
 use crate::db::DbType;
 use crate::tui::app::{ActiveWindow, ExplorerPane, ResultFormat, SessionViewPane};
@@ -208,7 +208,7 @@ pub fn render_status_bar(
     } else if session.mode == SessionMode::DbExplorer {
         " | Tab: Pane | Ctrl+Z: Zoom | Alt+Up/Down: Resize | Arrows/PgUp/PgDn: Scroll | Ctrl+F: More | Esc: Back"
     } else {
-        " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+Y: Copy | Alt+Y: SQL | Alt+M: Mouse"
+        " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+C: Copy | Ctrl+V: Paste | Alt+M: Mouse"
     };
 
     let status_text = Line::from(vec![
@@ -255,9 +255,9 @@ pub fn render_editor(
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else if show_line_numbers {
-        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Ctrl+Space: complete | Alt+Up/Down: resize) "
+        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Ctrl+Space: complete | Alt+Up/Down: resize | drag: select+copy) "
     } else {
-        " SQL Editor — Mouse:OFF, gutter hidden for clean copy (Alt+M restores | Alt+Y copies SQL) "
+        " SQL Editor — Mouse:OFF, gutter hidden for clean copy (Alt+M restores | Ctrl+Y copies SQL) "
     };
 
     let block = Block::default()
@@ -305,11 +305,52 @@ pub fn render_editor(
 
             let text_style = Style::default().bg(bg).fg(Color::White);
 
+            // Mouse drag-selection window for this line, if any. Endpoints
+            // are floored to char boundaries so wide chars highlight cleanly.
+            let sel_span: Option<(usize, usize)> = session.editor_selection.and_then(|sel| {
+                let ((sr, sc), (er, ec)) = sel.ordered();
+                if sr == er && sc == ec {
+                    return None;
+                }
+                if idx < sr || idx > er {
+                    return None;
+                }
+                let len = line_str.len();
+                let mut a = if idx == sr { sc.min(len) } else { 0 };
+                let mut b = if idx == er { ec.min(len) } else { len };
+                while a > 0 && !line_str.is_char_boundary(a) {
+                    a -= 1;
+                }
+                while b > 0 && !line_str.is_char_boundary(b) {
+                    b -= 1;
+                }
+                if a >= b {
+                    None
+                } else {
+                    Some((a, b))
+                }
+            });
+
             if show_line_numbers {
-                Line::from(vec![
-                    Span::styled(line_num_str, num_style),
-                    Span::styled(line_str.to_string(), text_style),
-                ])
+                if let Some((a, b)) = sel_span {
+                    // Selected text wins over the cursor/statement tint.
+                    let sel_style = Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD);
+                    let mut spans = vec![Span::styled(line_num_str, num_style)];
+                    for (bi, ch) in line_str.char_indices() {
+                        let be = bi + ch.len_utf8();
+                        let st = if bi >= a && be <= b { sel_style } else { text_style };
+                        spans.push(Span::styled(ch.to_string(), st));
+                    }
+                    Line::from(spans)
+                } else {
+                    Line::from(vec![
+                        Span::styled(line_num_str, num_style),
+                        Span::styled(line_str.to_string(), text_style),
+                    ])
+                }
             } else {
                 // Mouse:OFF native-selection mode: no gutter, so a terminal
                 // drag-select copies clean SQL without `  12 ` prefixes.
@@ -523,7 +564,7 @@ pub fn render_table(
     view: TableViewState,
     f: &mut Frame,
     area: Rect,
-) {
+) -> ResultsLayout {
     let TableViewState {
         scroll_offset,
         col_scroll_offset,
@@ -558,7 +599,7 @@ pub fn render_table(
             )
             .block(block);
         f.render_widget(p, area);
-        return;
+        return ResultsLayout::default();
     }
 
     if let Some(qr) = query_row {
@@ -568,61 +609,161 @@ pub fn render_table(
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                 .block(block);
             f.render_widget(p, area);
-            return;
+            return ResultsLayout::default();
         }
 
         match result_format {
             ResultFormat::Markdown => {
-                let range = visible_col_range(qr.columns.len(), col_scroll_offset);
+                // Same responsive column window as Table mode (not a fixed
+                // 10-col slice), so a wide screen shows more columns here
+                // too and Left/Right scroll identically in every format.
+                let total_cols = qr.columns.len();
+                let avail_width = area.width.saturating_sub(4) as usize;
+                let ideal = ideal_col_widths(qr);
+                let range =
+                    visible_col_range_fit(total_cols, col_scroll_offset, &ideal, avail_width.max(20));
+                let start_col = range.start;
+                let end_col = range.end;
                 let visible_cols = &qr.columns[range.clone()];
 
-                // Apply vertical scroll (rows) just like Table mode.
-                let avail_height = area.height.saturating_sub(3) as usize;
+                // Markdown text occupies header + separator + one line per
+                // row inside the block, so visible rows = height - 4.
+                let avail_height = area.height.saturating_sub(4) as usize;
+                let top = scroll_offset.min(qr.rows.len().saturating_sub(1));
                 let rows: Vec<&[String]> = qr
                     .rows
                     .iter()
-                    .skip(scroll_offset)
+                    .skip(top)
                     .take(avail_height)
-                    .map(|r| &r[range.clone()])
+                    .map(|r| row_window(r, &range))
                     .collect();
 
                 let visible_rows = rows.len();
                 let md_text = markdown_table(visible_cols, &rows);
-                let p = Paragraph::new(md_text)
+                let counts = result_title_counts(
+                    top,
+                    visible_rows,
+                    qr.rows.len(),
+                    start_col,
+                    end_col,
+                    total_cols,
+                    qr.truncated,
+                );
+                let sel_note =
+                    selection_title_note(session.table_selection, qr.rows.len(), total_cols);
+                let mut md_lines: Vec<Line> = md_text
+                    .lines()
+                    .map(|l| Line::from(l.to_string()))
+                    .collect();
+                // Row-band highlight for a table drag-selection (header and
+                // separator are lines 0-1, data starts at line 2).
+                tint_selected_lines(
+                    &mut md_lines,
+                    Some(0),
+                    2,
+                    top,
+                    selected_row_range(session.table_selection, qr.rows.len()),
+                    selection_covers_header(
+                        session.table_selection,
+                        qr.rows.len(),
+                        total_cols,
+                    ),
+                );
+                let p = Paragraph::new(md_lines)
                     .style(Style::default().fg(Color::White))
                     .block(
                         Block::default()
-                            .title(format!(
-                                " Result Viewer (Markdown Format | rows {}-{} of {}) ",
-                                scroll_offset + 1,
-                                (scroll_offset + visible_rows).min(qr.rows.len()),
-                                qr.rows.len()
-                            ))
+                            .title(format!(" {} (Markdown){} ", counts, sel_note))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Magenta)),
                     );
                 f.render_widget(p, area);
-                return;
+                render_result_scrollbars(f, area, top, qr, start_col, end_col, avail_height);
+                return ResultsLayout {
+                    top_row: top,
+                    start_col,
+                    end_col,
+                    col_starts: Vec::new(),
+                    inner_width: area.width.saturating_sub(2),
+                    visible_rows,
+                    header_y: 1,
+                    first_data_y: 3,
+                };
             }
             ResultFormat::Ascii => {
-                let start_col = visible_col_range(qr.columns.len(), col_scroll_offset).start;
-                let avail_height = area.height.saturating_sub(3) as usize;
-                let ascii_text = format_ascii_table(qr, start_col, scroll_offset, avail_height);
-                let p = Paragraph::new(ascii_text)
+                // Same responsive column window as Table mode.
+                let total_cols = qr.columns.len();
+                let avail_width = area.width.saturating_sub(4) as usize;
+                let ideal = ideal_col_widths(qr);
+                let range =
+                    visible_col_range_fit(total_cols, col_scroll_offset, &ideal, avail_width.max(20));
+                let start_col = range.start;
+                let end_col = range.end;
+                // The ASCII text draws its own borders + header + separator
+                // inside the outer block (4 chrome lines), so visible data
+                // rows = height - 2 (block) - 4 (inner chrome).
+                let avail_height = area.height.saturating_sub(6) as usize;
+                let top = scroll_offset.min(qr.rows.len().saturating_sub(1));
+                let ascii_text = format_ascii_table(qr, range.clone(), top, avail_height);
+                let visible_rows = qr.rows.len().saturating_sub(top).min(avail_height);
+                let counts = result_title_counts(
+                    top,
+                    visible_rows,
+                    qr.rows.len(),
+                    start_col,
+                    end_col,
+                    total_cols,
+                    qr.truncated,
+                );
+                let sel_note =
+                    selection_title_note(session.table_selection, qr.rows.len(), total_cols);
+                let mut ascii_lines: Vec<Line> = ascii_text
+                    .lines()
+                    .map(|l| Line::from(l.to_string()))
+                    .collect();
+                // Row-band highlight for a table drag-selection (top
+                // border, header and separator are lines 0-2, data at 3+).
+                tint_selected_lines(
+                    &mut ascii_lines,
+                    Some(1),
+                    3,
+                    top,
+                    selected_row_range(session.table_selection, qr.rows.len()),
+                    selection_covers_header(
+                        session.table_selection,
+                        qr.rows.len(),
+                        total_cols,
+                    ),
+                );
+                let p = Paragraph::new(ascii_lines)
                     .style(Style::default().fg(Color::White))
                     .block(
                         Block::default()
-                            .title(format!(
-                                " Result Viewer (ASCII Table | rows {}-{} of {}) ",
-                                scroll_offset + 1,
-                                (scroll_offset + avail_height).min(qr.rows.len()),
-                                qr.rows.len()
-                            ))
+                            .title(format!(" {} (ASCII){} ", counts, sel_note))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Cyan)),
                     );
                 f.render_widget(p, area);
-                return;
+                render_result_scrollbars(f, area, top, qr, start_col, end_col, avail_height);
+                // ASCII grid lines look like `| cell | cell |`: first cell
+                // starts 2 past the inner `|`, then width + 3 (` | `) each.
+                let col_widths = ascii_col_widths(qr, &range, top, avail_height);
+                let mut col_starts = Vec::with_capacity(end_col - start_col);
+                let mut x: u16 = 3;
+                for w in &col_widths {
+                    col_starts.push(x);
+                    x = x.saturating_add(*w as u16).saturating_add(3);
+                }
+                return ResultsLayout {
+                    top_row: top,
+                    start_col,
+                    end_col,
+                    col_starts,
+                    inner_width: area.width.saturating_sub(2),
+                    visible_rows,
+                    header_y: 2,
+                    first_data_y: 4,
+                };
             }
             ResultFormat::Table => {
                 // Fall through to normal table rendering
@@ -642,7 +783,7 @@ pub fn render_table(
                 .style(Style::default().fg(Color::Yellow))
                 .block(block);
             f.render_widget(p, area);
-            return;
+            return ResultsLayout::default();
         }
 
         let total_cols = qr.columns.len();
@@ -656,17 +797,51 @@ pub fn render_table(
         let end_col = range.end;
         let visible_cols: Vec<String> = qr.columns[range].to_vec();
 
-        let header = Row::new(visible_cols.clone())
-            .style(
-                Style::default()
-                    .bg(Color::Rgb(40, 40, 80))
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .height(1);
-
         let total_rows = qr.rows.len();
         let avail_height = area.height.saturating_sub(4) as usize;
+
+        // Active table drag-selection as an absolute cell rectangle, if any.
+        // Rows are `None` for the header row.
+        let sel_rect = selected_cell_rect(session.table_selection, total_rows, total_cols);
+        let sel_style = Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let cell_selected = |abs_row: usize, abs_col: usize| -> bool {
+            sel_rect.is_some_and(|((r0, c0), (r1, c1))| {
+                abs_col >= c0
+                    && abs_col <= c1
+                    && r0.is_none_or(|s| abs_row >= s)
+                    && r1.is_none_or(|e| abs_row <= e)
+            })
+        };
+        let header_selected = |abs_col: usize| -> bool {
+            sel_rect.is_some_and(|((r0, c0), (_, c1))| {
+                r0.is_none() && abs_col >= c0 && abs_col <= c1
+            })
+        };
+
+        let header = Row::new(
+            visible_cols
+                .iter()
+                .enumerate()
+                .map(|(k, h)| {
+                    let cell = Cell::from(h.clone());
+                    if header_selected(start_col + k) {
+                        cell.style(sel_style)
+                    } else {
+                        cell
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .style(
+            Style::default()
+                .bg(Color::Rgb(40, 40, 80))
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
 
         let mut visible_rows: Vec<Row> = qr
             .rows
@@ -680,13 +855,22 @@ pub fn render_table(
                 } else {
                     Color::Rgb(24, 24, 30)
                 };
-                let sliced_row: Vec<String> = row
+                let abs_row = scroll_offset + idx;
+                let cells: Vec<Cell> = row
                     .iter()
                     .skip(start_col)
                     .take(end_col - start_col)
-                    .map(|c| clean_cell(c))
+                    .enumerate()
+                    .map(|(k, c)| {
+                        let cell = Cell::from(clean_cell(c));
+                        if cell_selected(abs_row, start_col + k) {
+                            cell.style(sel_style)
+                        } else {
+                            cell
+                        }
+                    })
                     .collect();
-                Row::new(sliced_row).style(Style::default().bg(bg).fg(Color::White))
+                Row::new(cells).style(Style::default().bg(bg).fg(Color::White))
             })
             .collect();
 
@@ -718,37 +902,25 @@ pub fn render_table(
             ""
         };
         // Overflow arrows: visible at a glance, not just counts in the title.
-        // left/right for columns, up/down for rows.
-        let left_mark = if start_col > 0 { "◀" } else { "" };
-        let right_mark = if end_col < total_cols { "▶" } else { "" };
-        let shown_rows = (scroll_offset + visible_rows.len()).min(total_rows);
-        let up_mark = if scroll_offset > 0 { "▲" } else { "" };
-        let down_mark = if shown_rows < total_rows || qr.truncated {
-            "▼"
-        } else {
-            ""
-        };
-        let title = format!(
-            " {}rows {}-{} of {}{} {}{}cols {}-{} of {}{} | {} rows, {} | {}ms{} ",
-            up_mark,
-            scroll_offset + 1,
-            shown_rows,
+        let data_rows = visible_rows.len();
+        let counts = result_title_counts(
+            scroll_offset,
+            data_rows,
             total_rows,
-            down_mark,
-            left_mark,
-            if left_mark.is_empty() { "" } else { " " },
-            start_col + 1,
+            start_col,
             end_col,
             total_cols,
-            if right_mark.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", right_mark)
-            },
+            qr.truncated,
+        );
+        let sel_note = selection_title_note(session.table_selection, total_rows, total_cols);
+        let title = format!(
+            " {} | {} rows, {} | {}ms{}{} ",
+            counts,
             qr.total_fetched,
             format_bytes(qr.byte_count),
             qr.elapsed_ms,
             more_indicator,
+            sel_note,
         );
 
         // Stretch columns to fill a wide screen instead of leaving dead
@@ -791,33 +963,43 @@ pub fn render_table(
             .row_highlight_style(Style::default().bg(Color::Rgb(60, 60, 80)));
 
         f.render_widget(table, area);
-        // Scroll position signals beyond the title: thin scrollbars so it's
-        // obvious the table continues below / to the right.
-        if total_rows > avail_height.max(1) && area.height >= 5 {
-            let mut vstate =
-                ScrollbarState::new(total_rows.saturating_sub(1)).position(scroll_offset);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_style(Style::default().fg(Color::Cyan)),
-                area,
-                &mut vstate,
-            );
+        render_result_scrollbars(
+            f,
+            area,
+            scroll_offset,
+            qr,
+            start_col,
+            end_col,
+            avail_height,
+        );
+        // Column screen geometry for mouse hit-testing: first cell starts
+        // one past the left border, columns are separated by one space.
+        let mut col_starts = Vec::with_capacity(end_col - start_col);
+        let mut x: u16 = 1;
+        for w in &col_widths {
+            col_starts.push(x);
+            x = x.saturating_add(*w as u16).saturating_add(1);
         }
-        if end_col < total_cols && area.height >= 3 {
-            let mut hstate =
-                ScrollbarState::new(total_cols.saturating_sub(1)).position(start_col);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                    .thumb_style(Style::default().fg(Color::Cyan)),
-                area,
-                &mut hstate,
-            );
+        ResultsLayout {
+            top_row: scroll_offset,
+            start_col,
+            end_col,
+            col_starts,
+            inner_width: area.width.saturating_sub(2),
+            visible_rows: qr
+                .rows
+                .len()
+                .saturating_sub(scroll_offset)
+                .min(avail_height),
+            header_y: 1,
+            first_data_y: 2,
         }
     } else {
         let p = Paragraph::new("No query executed yet. Type SQL and press F5.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
         f.render_widget(p, area);
+        ResultsLayout::default()
     }
 }
 
@@ -895,11 +1077,284 @@ fn visible_col_range_fit(
     start..end
 }
 
-/// Column window for the 10-wide horizontal viewport shared by the
-/// Table/Markdown/ASCII result formats.
-fn visible_col_range(total_cols: usize, start_col: usize) -> std::ops::Range<usize> {
-    let start = start_col.min(total_cols.saturating_sub(1));
-    start..(start + 10).min(total_cols)
+/// Panic-safe row window: clamps `range` to the row's actual length so a
+/// ragged row can never panic an ASCII/Markdown slice.
+fn row_window<'a>(row: &'a [String], range: &std::ops::Range<usize>) -> &'a [String] {
+    let end = range.end.min(row.len());
+    let start = range.start.min(end);
+    &row[start..end]
+}
+
+/// What `render_table` actually laid out: the visible data window plus the
+/// on-screen geometry needed for mouse hit-testing. `header_y` /
+/// `first_data_y` are screen offsets from the draw area's y for the
+/// header line and the first data row (Table 1/2, Markdown 1/3, ASCII
+/// 2/4 — each format draws different chrome above its rows).
+/// `col_starts` holds column starts for uniformly-padded views (Table
+/// widget cells, ASCII grid); Markdown cells are unpadded, so its
+/// columns are resolved per row at hit-test time.
+#[derive(Debug, Clone, Default)]
+pub struct ResultsLayout {
+    /// First visible data-row index.
+    pub top_row: usize,
+    /// First visible column index.
+    pub start_col: usize,
+    /// One past the last visible column index.
+    pub end_col: usize,
+    /// Column start offsets from the draw area's x (one per visible
+    /// column). Empty when cells can't be hit-tested this way.
+    pub col_starts: Vec<u16>,
+    /// Inner width (draw area minus borders), for clamping the last column.
+    pub inner_width: u16,
+    /// How many data rows are actually drawn.
+    pub visible_rows: usize,
+    /// Screen offset (from area.y) of the header line.
+    pub header_y: u16,
+    /// Screen offset (from area.y) of the first data row.
+    pub first_data_y: u16,
+}
+
+/// Selected table cells clamped to the data, if any:
+/// `((r0, c0), (r1, c1))` with rows `None` for the header row.
+pub fn selected_cell_rect(
+    sel: Option<TableSelection>,
+    total_rows: usize,
+    total_cols: usize,
+) -> Option<TableRect> {
+    sel?.clamp(total_rows, total_cols)
+}
+
+/// Selected data-row range (absolute indices), for row-band highlights.
+/// A header-only selection has no data rows → None.
+pub fn selected_row_range(
+    sel: Option<TableSelection>,
+    total_rows: usize,
+) -> Option<(usize, usize)> {
+    let s = sel?;
+    if s.is_empty() || total_rows == 0 {
+        return None;
+    }
+    let ((r0, _), (r1, _)) = s.ordered();
+    let e = r1?;
+    let start = r0.unwrap_or(0).min(total_rows - 1);
+    Some((start, e.min(total_rows - 1)))
+}
+
+/// Whether the header row is part of the selection.
+pub fn selection_covers_header(
+    sel: Option<TableSelection>,
+    total_rows: usize,
+    total_cols: usize,
+) -> bool {
+    matches!(
+        selected_cell_rect(sel, total_rows, total_cols),
+        Some(((None, _), _))
+    )
+}
+
+/// Compact selection note for result titles (` [sel r3-5 c2-4]`,
+/// ` [sel hdr c1-2]`, ` [sel hdr-5 c2-4]`), empty when nothing selected.
+pub fn selection_title_note(
+    sel: Option<TableSelection>,
+    total_rows: usize,
+    total_cols: usize,
+) -> String {
+    match selected_cell_rect(sel, total_rows, total_cols) {
+        Some(((r0, c0), (r1, c1))) => {
+            let rows = match (r0, r1) {
+                (None, None) => "hdr".to_string(),
+                (None, Some(e)) => format!("hdr-{}", e + 1),
+                (Some(s), Some(e)) => format!("r{}-{}", s + 1, e + 1),
+                // Ordered + clamped, so a data start always has a data end.
+                (Some(s), None) => format!("r{}", s + 1),
+            };
+            format!(" [sel {} c{}-{}]", rows, c0 + 1, c1 + 1)
+        }
+        None => String::new(),
+    }
+}
+
+/// Tint whole lines for a table drag-selection (row-band highlight used by
+/// the Markdown/ASCII views). `header_line` is the index of the header
+/// line (tinted when the header row is selected), `first_data_line` the
+/// index of the first data line, `top` the absolute data-row shown there.
+fn tint_selected_lines(
+    lines: &mut [Line],
+    header_line: Option<usize>,
+    first_data_line: usize,
+    top: usize,
+    sel_rows: Option<(usize, usize)>,
+    header_selected: bool,
+) {
+    let style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let tint = |line: &mut Line| {
+        for span in line.spans.iter_mut() {
+            span.style = style;
+        }
+    };
+    if header_selected {
+        if let Some(i) = header_line {
+            if let Some(line) = lines.get_mut(i) {
+                tint(line);
+            }
+        }
+    }
+    let Some((r0, r1)) = sel_rows else {
+        return;
+    };
+    for (i, line) in lines.iter_mut().enumerate() {
+        if i < first_data_line {
+            continue;
+        }
+        let abs = top + (i - first_data_line);
+        if abs >= r0 && abs <= r1 {
+            tint(line);
+        }
+    }
+}
+
+/// Shared `rows a-b of M / cols c-d of N` title core with `▲▼◀▶` overflow
+/// arrows, used by all three result formats so scrolled-out content is
+/// visible at a glance (not just raw counts).
+fn result_title_counts(
+    top: usize,
+    shown_rows: usize,
+    total_rows: usize,
+    start_col: usize,
+    end_col: usize,
+    total_cols: usize,
+    truncated: bool,
+) -> String {
+    let up = if top > 0 { "▲ " } else { "" };
+    let down = if top + shown_rows < total_rows || truncated {
+        " ▼"
+    } else {
+        ""
+    };
+    let left = if start_col > 0 { "◀ " } else { "" };
+    let right = if end_col < total_cols { " ▶" } else { "" };
+    format!(
+        "{}rows {}-{} of {}{}{}cols {}-{} of {}{}",
+        up,
+        top + 1,
+        (top + shown_rows).min(total_rows),
+        total_rows,
+        down,
+        left,
+        start_col + 1,
+        end_col,
+        total_cols,
+        right
+    )
+}
+
+/// Thin scrollbars shared by all three result formats: vertical when more
+/// rows sit below the visible window, horizontal when more columns sit to
+/// the right. `row_capacity` is how many data rows fit in the pane.
+fn render_result_scrollbars(
+    f: &mut Frame,
+    area: Rect,
+    top: usize,
+    qr: &QueryRow,
+    start_col: usize,
+    end_col: usize,
+    row_capacity: usize,
+) {
+    if qr.rows.len() > row_capacity.max(1) && area.height >= 5 {
+        let mut vstate =
+            ScrollbarState::new(qr.rows.len().saturating_sub(1)).position(top);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::default().fg(Color::Cyan)),
+            area,
+            &mut vstate,
+        );
+    }
+    if end_col < qr.columns.len() && area.height >= 3 {
+        let mut hstate =
+            ScrollbarState::new(qr.columns.len().saturating_sub(1)).position(start_col);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .thumb_style(Style::default().fg(Color::Cyan)),
+            area,
+            &mut hstate,
+        );
+    }
+}
+
+/// Escape one cell for Markdown: single-line it and escape pipes so one
+/// `VARCHAR` can't break the table layout. Shared by the renderer and
+/// the Markdown hit-tester so both agree on cell widths.
+fn markdown_esc_cell(s: &str) -> String {
+    clean_cell(s).replace('|', "\\|")
+}
+
+/// Column at x for uniformly-padded views (Table widget cells, ASCII
+/// grid): the last column whose start is at/left of the cursor.
+pub fn uniform_col_at(
+    layout: &ResultsLayout,
+    area: Rect,
+    column: u16,
+    total_cols: usize,
+) -> Option<usize> {
+    if layout.col_starts.is_empty() || total_cols == 0 {
+        return None;
+    }
+    let rel_x = column.saturating_sub(area.x);
+    let mut c = layout.start_col;
+    for (i, &sx) in layout.col_starts.iter().enumerate() {
+        if sx <= rel_x {
+            c = layout.start_col + i;
+        } else {
+            break;
+        }
+    }
+    Some(c.min(total_cols.saturating_sub(1)))
+}
+
+/// Column at x for the Markdown view: cells are unpadded, so boundaries
+/// are rebuilt from the clicked row's (or header's) own escaped cell
+/// widths. `abs_row` is `None` on the header line.
+pub fn markdown_col_at(
+    qr: &QueryRow,
+    layout: &ResultsLayout,
+    area: Rect,
+    abs_row: Option<usize>,
+    column: u16,
+) -> Option<usize> {
+    let end = layout.end_col.min(qr.columns.len());
+    let start = layout.start_col.min(end);
+    if start >= end {
+        return None;
+    }
+    let cells: Vec<String> = match abs_row {
+        None => row_window(&qr.columns, &(start..end))
+            .iter()
+            .map(|s| markdown_esc_cell(s))
+            .collect(),
+        Some(r) => row_window(qr.rows.get(r)?, &(start..end))
+            .iter()
+            .map(|s| markdown_esc_cell(s))
+            .collect(),
+    };
+    if cells.is_empty() {
+        return None;
+    }
+    // "| " prefix = inner border (1) + 2; cells joined by " | " (3).
+    let rel_x = column.saturating_sub(area.x);
+    let mut x: u16 = 3;
+    let mut c = start;
+    for (i, cell) in cells.iter().enumerate() {
+        if x <= rel_x {
+            c = start + i;
+        } else {
+            break;
+        }
+        x = x
+            .saturating_add(UnicodeWidthStr::width(cell.as_str()) as u16)
+            .saturating_add(3);
+    }
+    Some(c)
 }
 
 /// Markdown table over a column window + row slices. Shared by the Markdown
@@ -907,15 +1362,12 @@ fn visible_col_range(total_cols: usize, start_col: usize) -> std::ops::Range<usi
 /// Pipes and newlines inside string values are escaped/collapsed so one
 /// `VARCHAR` can't break the whole table layout.
 pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
-    fn esc(s: &str) -> String {
-        clean_cell(s).replace('|', "\\|")
-    }
     let mut md = String::new();
     md.push_str("| ");
     md.push_str(
         &columns
             .iter()
-            .map(|c| esc(c))
+            .map(|c| markdown_esc_cell(c))
             .collect::<Vec<_>>()
             .join(" | "),
     );
@@ -927,8 +1379,9 @@ pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
     for row in rows {
         md.push_str("| ");
         md.push_str(
-            &row.iter()
-                .map(|c| esc(c))
+            &row
+                .iter()
+                .map(|c| markdown_esc_cell(c))
                 .collect::<Vec<_>>()
                 .join(" | "),
         );
@@ -937,11 +1390,34 @@ pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
     md
 }
 
+/// Column widths for an ASCII page (display-width aware, cleaned cells).
+/// Shared by the renderer and the hit-test geometry so both agree.
+pub fn ascii_col_widths(
+    qr: &QueryRow,
+    range: &std::ops::Range<usize>,
+    scroll_offset: usize,
+    avail_height: usize,
+) -> Vec<usize> {
+    let mut col_widths = Vec::new();
+    for i in range.clone() {
+        let mut w = UnicodeWidthStr::width(clean_cell(&qr.columns[i]).as_str());
+        for row in qr.rows.iter().skip(scroll_offset).take(avail_height) {
+            for cell in row_window(row, &(i..i + 1)) {
+                w = w.max(UnicodeWidthStr::width(clean_cell(cell).as_str()));
+            }
+        }
+        col_widths.push(w);
+    }
+    col_widths
+}
+
 /// Format a result page as an ASCII table using display width (so wide /
-/// multibyte characters align correctly).
+/// multibyte characters align correctly). `range` is the caller's column
+/// window (responsive fit when rendering, full `0..len` for clipboard
+/// export); rows are sliced defensively so ragged data can't panic.
 pub fn format_ascii_table(
     qr: &QueryRow,
-    start_col: usize,
+    range: std::ops::Range<usize>,
     scroll_offset: usize,
     avail_height: usize,
 ) -> String {
@@ -949,25 +1425,18 @@ pub fn format_ascii_table(
         return "No data to display".to_string();
     }
 
-    let visible_range = visible_col_range(qr.columns.len(), start_col);
+    let end = range.end.min(qr.columns.len());
+    let start = range.start.min(end);
+    let visible_range = start..end;
 
-    let mut col_widths = Vec::new();
-    for i in visible_range.clone() {
-        let mut w = UnicodeWidthStr::width(clean_cell(&qr.columns[i]).as_str());
-        for row in qr.rows.iter().skip(scroll_offset).take(avail_height) {
-            if i < row.len() {
-                w = w.max(UnicodeWidthStr::width(clean_cell(&row[i]).as_str()));
-            }
-        }
-        col_widths.push(w);
-    }
+    let col_widths = ascii_col_widths(qr, &visible_range, scroll_offset, avail_height);
 
     // Pad `s` on the right to the display width `w`.
     fn padded(s: &str, w: usize) -> String {
         format!("{}{}", s, " ".repeat(w - UnicodeWidthStr::width(s) + 1))
     }
 
-    let columns: Vec<String> = qr.columns[visible_range.clone()]
+    let columns: Vec<String> = row_window(&qr.columns, &visible_range)
         .iter()
         .map(|s| clean_cell(s))
         .collect();
@@ -977,7 +1446,7 @@ pub fn format_ascii_table(
         .skip(scroll_offset)
         .take(avail_height)
         .map(|r| {
-            r[visible_range.clone()]
+            row_window(r, &visible_range)
                 .iter()
                 .map(|s| clean_cell(s))
                 .collect()
@@ -1551,8 +2020,9 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Mouse Hover         Auto-focus panels (Hyprland style)"),
         Line::from("  Mouse Drag Border   Resize panels horizontally"),
         Line::from("  Mouse Scroll        Scroll result table vertically"),
+        Line::from("  Mouse drag editor   Select SQL text — release copies it to clipboard"),
         Line::from("  Middle-click        Paste selection at cursor (tmux style)"),
-        Line::from("  Ctrl+V / Shift+Ins  Paste clipboard at cursor (works with mouse ON or OFF)"),
+        Line::from("  Ctrl+V / Shift+Ins  Paste clipboard at cursor (OS clipboard, else frog's copy buffer — works over SSH)"),
         Line::from("  Ctrl+M / Alt+M        Toggle mouse capture — while OFF the editor"),
         Line::from("                      handles select/copy natively, gutter hidden for clean"),
         Line::from("                      SQL copy (or hold Shift+drag). Alt+M works on git-bash."),
@@ -1565,15 +2035,16 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+Enter / Alt+Enter / Ctrl+J / F8 / F9  Execute statement under cursor"),
         Line::from("  F5 / Ctrl+R         Execute all statements as script"),
         Line::from("  Ctrl+:              Command bar (e.g. @file.sql, @@inc, clear)"),
-        Line::from("  Ctrl+C / Esc          Cancel running query"),
+        Line::from("  Ctrl+C / Esc          Cancel running query, else standard copy (selection, else statement/table)"),
         Line::from(""),
         Line::from(Span::styled(
             " ─ Results ─ ",
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  Ctrl+F              Fetch next page of results (auto-loads when scrolling)"),
-        Line::from("  Ctrl+Y              Copy results to clipboard (OS + OSC52 for SSH)"),
-        Line::from("  Alt+Y               Copy SQL statement to clipboard (no line numbers)"),
+        Line::from("  Ctrl+Y              Contextual copy: table selection (else full table) in Results, drag-selection (else statement) in Editor"),
+        Line::from("  Alt+Y               Copy SQL statement explicitly (never with line numbers)"),
+        Line::from("  Mouse drag table    Select result cells (Table/Markdown/ASCII) — release copies TSV without borders (drag from the header row to copy column names)"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
         Line::from("  Arrow keys / PgUp/PgDn  Scroll results"),
         Line::from(""),
@@ -2505,5 +2976,220 @@ mod tests {
         let wide = visible_col_range_fit(12, 0, &ideal, 200);
         assert!(wide.len() > narrow.len());
         assert_eq!(wide.start, 0);
+    }
+
+    fn sample_query_row() -> QueryRow {
+        QueryRow {
+            columns: vec!["ID".into(), "NAME".into(), "NOTE".into()],
+            rows: (1..=8)
+                .map(|i| vec![i.to_string(), format!("name{i}"), format!("note{i}")])
+                .collect(),
+            truncated: false,
+            elapsed_ms: 7,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset: 0,
+            page_size: 100,
+            byte_count: 0,
+            total_fetched: 8,
+        }
+    }
+
+    #[test]
+    fn ascii_table_follows_scroll_and_column_window() {
+        let qr = sample_query_row();
+        // Vertical scroll skips the first rows.
+        let scrolled = format_ascii_table(&qr, 0..3, 2, 3);
+        assert!(scrolled.contains("name3"));
+        assert!(!scrolled.contains("name1"));
+        // Column window restricts to the requested slice.
+        let windowed = format_ascii_table(&qr, 1..2, 0, 8);
+        assert!(windowed.contains("NAME"));
+        assert!(windowed.contains("name1"));
+        assert!(!windowed.contains("NOTE"));
+        assert!(!windowed.contains("note1"));
+    }
+
+    #[test]
+    fn row_window_never_panics_on_ragged_rows() {
+        let row = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(row_window(&row, &(0..5)), &["a".to_string(), "b".to_string()]);
+        assert!(row_window(&row, &(5..9)).is_empty());
+    }
+
+    #[test]
+    fn result_title_marks_overflow_directions() {
+        let qr = sample_query_row();
+        // Top-left, everything fits: no arrows.
+        let plain = result_title_counts(0, 8, 8, 0, 3, 3, false);
+        assert!(!plain.contains('▲') && !plain.contains('▼'));
+        assert!(!plain.contains('◀') && !plain.contains('▶'));
+        // Scrolled down with columns to the right: both arrows.
+        let scrolled = result_title_counts(3, 3, 8, 1, 3, 5, false);
+        assert!(scrolled.contains('▲') && scrolled.contains('▼'));
+        assert!(scrolled.contains('◀') && scrolled.contains('▶'));
+        // Truncated (more pages server-side) always hints ▼.
+        let more = result_title_counts(0, 8, 8, 0, 3, 3, true);
+        assert!(more.contains('▼'));
+        let _ = qr;
+    }
+
+    #[test]
+    fn selection_title_marks_header_selection() {
+        let hdr_only = Some(TableSelection {
+            anchor_row: None,
+            anchor_col: 0,
+            cursor_row: None,
+            cursor_col: 2,
+        });
+        assert_eq!(
+            selection_title_note(hdr_only, 8, 5),
+            " [sel hdr c1-3]"
+        );
+        let hdr_plus_rows = Some(TableSelection {
+            anchor_row: None,
+            anchor_col: 1,
+            cursor_row: Some(4),
+            cursor_col: 3,
+        });
+        assert_eq!(
+            selection_title_note(hdr_plus_rows, 8, 5),
+            " [sel hdr-5 c2-4]"
+        );
+    }
+
+    fn sample_layout() -> ResultsLayout {
+        ResultsLayout {
+            top_row: 0,
+            start_col: 0,
+            end_col: 3,
+            col_starts: vec![1],
+            inner_width: 78,
+            visible_rows: 8,
+            header_y: 1,
+            first_data_y: 2,
+        }
+    }
+
+    #[test]
+    fn uniform_col_at_maps_table_cells() {
+        // Table widget geometry: first cell at rel 1, +width+1 each.
+        let layout = ResultsLayout {
+            col_starts: vec![1, 9, 20],
+            ..sample_layout()
+        };
+        let area = Rect::new(0, 5, 80, 24);
+        assert_eq!(uniform_col_at(&layout, area, 0, 3), Some(0));
+        assert_eq!(uniform_col_at(&layout, area, 2, 3), Some(0));
+        assert_eq!(uniform_col_at(&layout, area, 10, 3), Some(1));
+        assert_eq!(uniform_col_at(&layout, area, 79, 3), Some(2));
+    }
+
+    #[test]
+    fn markdown_col_at_uses_per_row_widths() {
+        // Markdown cells are unpadded: "| ID | NAME |" then data widths.
+        let qr = sample_query_row();
+        let area = Rect::new(0, 5, 80, 24);
+        let layout = sample_layout();
+        // Header line: "| ID(2) | NAME(4) |" → NAME starts at rel 3+2+3=8.
+        assert_eq!(
+            markdown_col_at(&qr, &layout, area, None, 4),
+            Some(0)
+        );
+        assert_eq!(
+            markdown_col_at(&qr, &layout, area, None, 9),
+            Some(1)
+        );
+        // Data row 0: "| 1 | name1 |" → name1 starts at rel 3+1+3=7.
+        assert_eq!(
+            markdown_col_at(&qr, &layout, area, Some(0), 4),
+            Some(0)
+        );
+        assert_eq!(
+            markdown_col_at(&qr, &layout, area, Some(0), 8),
+            Some(1)
+        );
+        // Missing row → None, ragged-safe.
+        assert_eq!(markdown_col_at(&qr, &layout, area, Some(99), 8), None);
+    }
+
+    #[test]
+    fn markdown_view_renders_scrolled_rows() {
+        let qr = sample_query_row();
+        let mut sm = SessionManager::new();
+        let session = sm.sessions.remove(0);
+        let view = TableViewState {
+            scroll_offset: 5,
+            col_scroll_offset: 0,
+            result_format: ResultFormat::Markdown,
+            focused: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render_table(&session, &Some(&qr), view, f, f.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        // Scrolled window shows name6.., not the first rows; ▲ marks it.
+        assert!(text.contains("name6"));
+        assert!(!text.contains("name1"));
+        assert!(text.contains('▲'));
+    }
+
+    #[test]
+    fn table_view_marks_active_cell_selection() {
+        let qr = sample_query_row();
+        let mut sm = SessionManager::new();
+        let mut session = sm.sessions.remove(0);
+        session.results.push(QueryRow {
+            columns: qr.columns.clone(),
+            rows: qr.rows.clone(),
+            truncated: false,
+            elapsed_ms: 7,
+            is_error: false,
+            error_msg: None,
+            rows_affected: None,
+            page_offset: 0,
+            page_size: 100,
+            byte_count: 0,
+            total_fetched: 8,
+        });
+        session.table_selection = Some(TableSelection {
+            anchor_row: Some(1),
+            anchor_col: 0,
+            cursor_row: Some(2),
+            cursor_col: 1,
+        });
+        // `session` is moved below; build the view first (Copy state).
+        let view = TableViewState {
+            scroll_offset: 0,
+            col_scroll_offset: 0,
+            result_format: ResultFormat::Table,
+            focused: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                render_table(&session, &session.results.last(), view, f, f.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        // Selection range is advertised in the title; selected rows render.
+        assert!(text.contains("[sel r2-3 c1-2]"));
+        assert!(text.contains("name2"));
     }
 }
