@@ -240,6 +240,10 @@ pub fn render_editor(
     f: &mut Frame,
     area: Rect,
 ) {
+    // Mouse:OFF native-copy mode: no box borders and no gutter, so a
+    // terminal drag-select copies clean SQL without `│`/`─` or ` 12 ` junk.
+    // (Borders stay on in normal mouse-capture mode.)
+    let borderless = !show_line_numbers;
     let border_color = if session.pending_query {
         Color::Yellow
     } else if focused {
@@ -261,7 +265,7 @@ pub fn render_editor(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
 
-    let inner_area = block.inner(area);
+    let inner_area = if borderless { area } else { block.inner(area) };
     let vis_height = inner_area.height as usize;
     let scroll = session.editor.scroll_offset;
 
@@ -316,8 +320,12 @@ pub fn render_editor(
         })
         .collect();
 
-    let paragraph = Paragraph::new(lines).block(block);
-    f.render_widget(paragraph, area);
+    if borderless {
+        f.render_widget(Paragraph::new(lines), area);
+    } else {
+        let paragraph = Paragraph::new(lines).block(block);
+        f.render_widget(paragraph, area);
+    }
 }
 
 /// Draw the completion popup just below (or above) the cursor. This overlays
@@ -334,9 +342,13 @@ pub fn render_completion_popup(
     }
     let ed = &session.editor;
     let gutter = if show_gutter { 4 } else { 0 };
+    let frame: u16 = if show_gutter { 1 } else { 0 };
     let visible_row = ed.cursor_row.saturating_sub(ed.scroll_offset);
     let line = &ed.lines[ed.cursor_row];
-    let col = ed.cursor_col.min(line.len());
+    let mut col = ed.cursor_col.min(line.len());
+    while col > 0 && !line.is_char_boundary(col) {
+        col -= 1;
+    }
     let x_off = UnicodeWidthStr::width(&line[..col]) as u16;
 
     let max_rows = 10usize;
@@ -359,19 +371,19 @@ pub fn render_completion_popup(
             };
         width = width.max(w);
     }
-    let max_width = f.area().right().saturating_sub(editor_area.x + 1);
+    let max_width = f.area().right().saturating_sub(editor_area.x + frame);
     let width = width.min(64).min(max_width).max(12.min(max_width));
 
-    let below_y = editor_area.y + 1 + visible_row as u16 + 1;
+    let below_y = editor_area.y + frame + visible_row as u16 + 1;
     let below_room = editor_area.bottom().saturating_sub(below_y);
-    let y = if below_room >= height || below_y <= editor_area.y + 1 + height {
+    let y = if below_room >= height || below_y <= editor_area.y + frame + height {
         below_y.min(editor_area.bottom().saturating_sub(height))
     } else {
-        (below_y.saturating_sub(height)).max(editor_area.y + 1)
+        (below_y.saturating_sub(height)).max(editor_area.y + frame)
     };
-    let x = (editor_area.x + 1 + gutter + x_off)
+    let x = (editor_area.x + frame + gutter + x_off)
         .min(f.area().right().saturating_sub(width))
-        .max(editor_area.x + 1);
+        .max(editor_area.x + frame);
     let area = Rect::new(x, y, width, height);
 
     f.render_widget(Clear, area);
@@ -634,8 +646,14 @@ pub fn render_table(
         }
 
         let total_cols = qr.columns.len();
-        let range = visible_col_range(total_cols, col_scroll_offset);
+        // Responsive viewport: fit as many columns as the pane allows, so a
+        // bigger screen shows a bigger table instead of a fixed 10-col slice
+        // with dead space on the right.
+        let avail_width = area.width.saturating_sub(4) as usize;
+        let ideal = ideal_col_widths(qr);
+        let range = visible_col_range_fit(total_cols, col_scroll_offset, &ideal, avail_width.max(20));
         let start_col = range.start;
+        let end_col = range.end;
         let visible_cols: Vec<String> = qr.columns[range].to_vec();
 
         let header = Row::new(visible_cols.clone())
@@ -662,8 +680,12 @@ pub fn render_table(
                 } else {
                     Color::Rgb(24, 24, 30)
                 };
-                let sliced_row: Vec<String> =
-                    row.iter().skip(start_col).take(10).cloned().collect();
+                let sliced_row: Vec<String> = row
+                    .iter()
+                    .skip(start_col)
+                    .take(end_col - start_col)
+                    .map(|c| clean_cell(c))
+                    .collect();
                 Row::new(sliced_row).style(Style::default().bg(bg).fg(Color::White))
             })
             .collect();
@@ -695,24 +717,68 @@ pub fn render_table(
         } else {
             ""
         };
+        // Overflow arrows: visible at a glance, not just counts in the title.
+        // left/right for columns, up/down for rows.
+        let left_mark = if start_col > 0 { "◀" } else { "" };
+        let right_mark = if end_col < total_cols { "▶" } else { "" };
+        let shown_rows = (scroll_offset + visible_rows.len()).min(total_rows);
+        let up_mark = if scroll_offset > 0 { "▲" } else { "" };
+        let down_mark = if shown_rows < total_rows || qr.truncated {
+            "▼"
+        } else {
+            ""
+        };
         let title = format!(
-            " Result Viewer (rows {}-{} of {}{} | cols {}-{} of {} | {} rows, {} | {}ms) ",
+            " {}rows {}-{} of {}{} {}{}cols {}-{} of {}{} | {} rows, {} | {}ms{} ",
+            up_mark,
             scroll_offset + 1,
-            (scroll_offset + visible_rows.len()).min(total_rows),
+            shown_rows,
             total_rows,
-            more_indicator,
+            down_mark,
+            left_mark,
+            if left_mark.is_empty() { "" } else { " " },
             start_col + 1,
-            start_col + visible_cols.len(),
+            end_col,
             total_cols,
+            if right_mark.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", right_mark)
+            },
             qr.total_fetched,
             format_bytes(qr.byte_count),
-            qr.elapsed_ms
+            qr.elapsed_ms,
+            more_indicator,
         );
 
-        let widths: Vec<Constraint> = visible_cols
-            .iter()
-            .map(|c| Constraint::Length((c.len() as u16).clamp(12, 35)))
-            .collect();
+        // Stretch columns to fill a wide screen instead of leaving dead
+        // space: distribute leftover cells across the visible columns.
+        let mut col_widths: Vec<usize> =
+            ideal.iter().skip(start_col).take(end_col - start_col).cloned().collect();
+        let used: usize = col_widths.iter().sum::<usize>() + col_widths.len();
+        if avail_width > used && !col_widths.is_empty() {
+            let mut extra = avail_width - used;
+            // Round-robin so narrow columns grow too, capped at 60.
+            while extra > 0 {
+                let mut grown = false;
+                for w in col_widths.iter_mut() {
+                    if extra == 0 || *w >= 60 {
+                        continue;
+                    }
+                    *w += 1;
+                    extra -= 1;
+                    grown = true;
+                    if extra == 0 {
+                        break;
+                    }
+                }
+                if !grown {
+                    break;
+                }
+            }
+        }
+        let widths: Vec<Constraint> =
+            col_widths.iter().map(|w| Constraint::Length(*w as u16)).collect();
 
         let table = Table::new(visible_rows, widths)
             .header(header)
@@ -725,12 +791,108 @@ pub fn render_table(
             .row_highlight_style(Style::default().bg(Color::Rgb(60, 60, 80)));
 
         f.render_widget(table, area);
+        // Scroll position signals beyond the title: thin scrollbars so it's
+        // obvious the table continues below / to the right.
+        if total_rows > avail_height.max(1) && area.height >= 5 {
+            let mut vstate =
+                ScrollbarState::new(total_rows.saturating_sub(1)).position(scroll_offset);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(Color::Cyan)),
+                area,
+                &mut vstate,
+            );
+        }
+        if end_col < total_cols && area.height >= 3 {
+            let mut hstate =
+                ScrollbarState::new(total_cols.saturating_sub(1)).position(start_col);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                    .thumb_style(Style::default().fg(Color::Cyan)),
+                area,
+                &mut hstate,
+            );
+        }
     } else {
         let p = Paragraph::new("No query executed yet. Type SQL and press F5.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
         f.render_widget(p, area);
     }
+}
+
+/// Single-line, control-char-free cell text for the Table view.
+///
+/// Database strings can contain newlines/tabs (e.g. `VARCHAR2` with embedded
+/// line breaks). A raw newline inside a `Row` would break the table layout,
+/// so it is rendered as `⏎`; tabs become two spaces and other control chars
+/// are dropped. Keeps the full value (ratatui truncates to the column width)
+/// instead of breaking rows.
+fn clean_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.replace('\r', " ").replace('\n', " ⏎ ").replace('\t', "  ").chars() {
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Ideal display width for every column: max of the header and a sample of
+/// the loaded rows (cleaned, display-width aware). Clamped so one huge
+/// `VARCHAR(4000)` can't eat the whole screen, but wide enough that normal
+/// strings aren't truncated to the header width (the old bug: widths came
+/// from `header.len()` only).
+fn ideal_col_widths(qr: &QueryRow) -> Vec<usize> {
+    let sample_rows = 60usize;
+    qr.columns
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let mut w = UnicodeWidthStr::width(h.as_str()).max(8);
+            for row in qr.rows.iter().take(sample_rows) {
+                if let Some(cell) = row.get(i) {
+                    w = w.max(UnicodeWidthStr::width(clean_cell(cell).as_str()));
+                }
+            }
+            // +2 breathing room, clamp so a single CLOB doesn't dominate.
+            (w + 2).clamp(10, 45)
+        })
+        .collect()
+}
+
+/// Column window that fits `avail_width` cells, starting at `start_col`.
+/// Guarantees at least one column; on wide screens this shows far more than
+/// the old fixed 10-column window, on narrow screens it shrinks to fit.
+fn visible_col_range_fit(
+    total_cols: usize,
+    start_col: usize,
+    ideal: &[usize],
+    avail_width: usize,
+) -> std::ops::Range<usize> {
+    if total_cols == 0 {
+        return 0..0;
+    }
+    let start = start_col.min(total_cols.saturating_sub(1));
+    let mut used = 0usize;
+    let mut end = start;
+    for (i, w) in ideal.iter().enumerate().skip(start) {
+        // +1 for the column separator.
+        let need = w + 1;
+        if end > start && used + need > avail_width {
+            break;
+        }
+        used += need;
+        end = i + 1;
+        if end >= total_cols {
+            break;
+        }
+    }
+    if end == start {
+        end = (start + 1).min(total_cols);
+    }
+    start..end
 }
 
 /// Column window for the 10-wide horizontal viewport shared by the
@@ -742,10 +904,21 @@ fn visible_col_range(total_cols: usize, start_col: usize) -> std::ops::Range<usi
 
 /// Markdown table over a column window + row slices. Shared by the Markdown
 /// result format (windowed) and Ctrl+Y clipboard export (full range).
+/// Pipes and newlines inside string values are escaped/collapsed so one
+/// `VARCHAR` can't break the whole table layout.
 pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
+    fn esc(s: &str) -> String {
+        clean_cell(s).replace('|', "\\|")
+    }
     let mut md = String::new();
     md.push_str("| ");
-    md.push_str(&columns.join(" | "));
+    md.push_str(
+        &columns
+            .iter()
+            .map(|c| esc(c))
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
     md.push_str(" |\n|");
     for _ in columns {
         md.push_str("---|");
@@ -753,7 +926,12 @@ pub(crate) fn markdown_table(columns: &[String], rows: &[&[String]]) -> String {
     md.push('\n');
     for row in rows {
         md.push_str("| ");
-        md.push_str(&row.join(" | "));
+        md.push_str(
+            &row.iter()
+                .map(|c| esc(c))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
         md.push_str(" |\n");
     }
     md
@@ -775,10 +953,10 @@ pub fn format_ascii_table(
 
     let mut col_widths = Vec::new();
     for i in visible_range.clone() {
-        let mut w = UnicodeWidthStr::width(qr.columns[i].as_str());
+        let mut w = UnicodeWidthStr::width(clean_cell(&qr.columns[i]).as_str());
         for row in qr.rows.iter().skip(scroll_offset).take(avail_height) {
             if i < row.len() {
-                w = w.max(UnicodeWidthStr::width(row[i].as_str()));
+                w = w.max(UnicodeWidthStr::width(clean_cell(&row[i]).as_str()));
             }
         }
         col_widths.push(w);
@@ -789,11 +967,11 @@ pub fn format_ascii_table(
         format!("{}{}", s, " ".repeat(w - UnicodeWidthStr::width(s) + 1))
     }
 
-    let columns: Vec<&str> = qr.columns[visible_range.clone()]
+    let columns: Vec<String> = qr.columns[visible_range.clone()]
         .iter()
-        .map(|s| s.as_str())
+        .map(|s| clean_cell(s))
         .collect();
-    let rows: Vec<Vec<&str>> = qr
+    let rows: Vec<Vec<String>> = qr
         .rows
         .iter()
         .skip(scroll_offset)
@@ -801,7 +979,7 @@ pub fn format_ascii_table(
         .map(|r| {
             r[visible_range.clone()]
                 .iter()
-                .map(|s| s.as_str())
+                .map(|s| clean_cell(s))
                 .collect()
         })
         .collect();
@@ -1374,7 +1552,8 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Mouse Drag Border   Resize panels horizontally"),
         Line::from("  Mouse Scroll        Scroll result table vertically"),
         Line::from("  Middle-click        Paste selection at cursor (tmux style)"),
-        Line::from("  Ctrl+M / Alt+M        Toggle mouse capture — while OFF the terminal"),
+        Line::from("  Ctrl+V / Shift+Ins  Paste clipboard at cursor (works with mouse ON or OFF)"),
+        Line::from("  Ctrl+M / Alt+M        Toggle mouse capture — while OFF the editor"),
         Line::from("                      handles select/copy natively, gutter hidden for clean"),
         Line::from("                      SQL copy (or hold Shift+drag). Alt+M works on git-bash."),
         Line::from("  Alt+Y               Copy SQL statement to clipboard (no line numbers, OSC52)"),
@@ -2317,5 +2496,14 @@ mod tests {
         }
         assert!(text.contains("EMPNO"));
         assert!(text.contains("Completion"));
+    }
+
+    #[test]
+    fn wider_pane_fits_more_table_columns() {
+        let ideal = vec![12usize; 12];
+        let narrow = visible_col_range_fit(12, 0, &ideal, 40);
+        let wide = visible_col_range_fit(12, 0, &ideal, 200);
+        assert!(wide.len() > narrow.len());
+        assert_eq!(wide.start, 0);
     }
 }

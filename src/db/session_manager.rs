@@ -207,12 +207,14 @@ impl SqlEditor {
         if c.is_control() {
             return;
         }
+        self.snap_cursor_to_char_boundary();
         let line = &mut self.lines[self.cursor_row];
         line.insert(self.cursor_col, c);
         self.cursor_col += c.len_utf8();
     }
 
     pub fn backspace(&mut self) {
+        self.snap_cursor_to_char_boundary();
         if self.cursor_col > 0 {
             let line = &mut self.lines[self.cursor_row];
             let before = &line[..self.cursor_col];
@@ -237,6 +239,7 @@ impl SqlEditor {
     }
 
     pub fn delete(&mut self) {
+        self.snap_cursor_to_char_boundary();
         if self.cursor_col < self.lines[self.cursor_row].len() {
             let line = &mut self.lines[self.cursor_row];
             let rest = &line[self.cursor_col..];
@@ -254,6 +257,7 @@ impl SqlEditor {
     }
 
     pub fn kill_line(&mut self) {
+        self.snap_cursor_to_char_boundary();
         if self.cursor_col < self.lines[self.cursor_row].len() {
             self.lines[self.cursor_row].truncate(self.cursor_col);
         } else if self.cursor_row + 1 < self.lines.len() {
@@ -274,6 +278,7 @@ impl SqlEditor {
     }
 
     pub fn newline(&mut self) {
+        self.snap_cursor_to_char_boundary();
         let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
         self.lines.insert(self.cursor_row + 1, rest);
         self.cursor_row += 1;
@@ -281,6 +286,7 @@ impl SqlEditor {
     }
 
     pub fn move_left(&mut self) {
+        self.snap_cursor_to_char_boundary();
         if self.cursor_col > 0 {
             let line = &self.lines[self.cursor_row];
             self.cursor_col = line[..self.cursor_col]
@@ -295,6 +301,7 @@ impl SqlEditor {
     }
 
     pub fn move_right(&mut self) {
+        self.snap_cursor_to_char_boundary();
         let len = self.lines[self.cursor_row].len();
         if self.cursor_col < len {
             let line = &self.lines[self.cursor_row];
@@ -312,10 +319,15 @@ impl SqlEditor {
     pub fn snap_cursor_to_char_boundary(&mut self) {
         let len = self.lines[self.cursor_row].len();
         self.cursor_col = self.cursor_col.min(len);
-        while self.cursor_col < len
+        // Floor to the previous char boundary: the cursor may sit inside a
+        // multi-byte char after a vertical move (kept byte column) onto a
+        // line starting with e.g. a `│` border glyph pasted from a table.
+        // (This was a hard crash: `delete`/`backspace` sliced at byte 1 of
+        // a 3-byte char.)
+        while self.cursor_col > 0
             && !self.lines[self.cursor_row].is_char_boundary(self.cursor_col)
         {
-            self.cursor_col += 1;
+            self.cursor_col -= 1;
         }
     }
 
@@ -326,6 +338,7 @@ impl SqlEditor {
             if self.cursor_col > len {
                 self.cursor_col = len;
             }
+            self.snap_cursor_to_char_boundary();
         }
     }
 
@@ -336,6 +349,7 @@ impl SqlEditor {
             if self.cursor_col > len {
                 self.cursor_col = len;
             }
+            self.snap_cursor_to_char_boundary();
         }
     }
 
@@ -354,7 +368,13 @@ impl SqlEditor {
         let mut off = 0;
         for (i, line) in self.lines.iter().enumerate() {
             if i == self.cursor_row {
-                off += self.cursor_col.min(line.len());
+                // Floor to a char boundary: the byte column may sit inside
+                // a multi-byte char after a vertical move.
+                let mut col = self.cursor_col.min(line.len());
+                while col > 0 && !line.is_char_boundary(col) {
+                    col -= 1;
+                }
+                off += col;
                 break;
             }
             off += line.len() + 1;
@@ -4213,6 +4233,28 @@ mod tests {
         ed.delete();
         assert_eq!(ed.lines[0], "from v");
         assert!(ed.lines[0].is_char_boundary(ed.cursor_col));
+    }
+
+    #[test]
+    fn editor_vertical_move_onto_border_glyph_stays_on_boundary() {
+        // Regression: crash from the screenshot — `delete` panicked at
+        // `&line[cursor..]` with "byte index 1 is not a char boundary, it is
+        // inside '│'". A vertical move kept the byte column (1) onto a line
+        // starting with a 3-byte box glyph, then Delete sliced mid-char.
+        let mut ed = SqlEditor::new();
+        ed.lines = vec!["ab".to_string(), "│select".to_string()];
+        ed.cursor_row = 0;
+        ed.cursor_col = 1;
+        ed.move_down();
+        assert!(ed.lines[1].is_char_boundary(ed.cursor_col));
+        // Must not panic.
+        ed.delete();
+        ed.backspace();
+        ed.newline();
+        ed.kill_line();
+        for line in &ed.lines {
+            assert!(line.is_char_boundary(ed.cursor_col.min(line.len())));
+        }
     }
 
     fn fake_session_info(sid: i32, username: &str, status: &str) -> DbSessionInfo {

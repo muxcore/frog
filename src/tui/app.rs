@@ -39,6 +39,32 @@ fn scroll_by(current: usize, delta: isize, max: usize) -> usize {
     next.min(max)
 }
 
+/// Sidebar share after adapting to the terminal width: the info panel has a
+/// roughly fixed content width, so on a big monitor a flat 25% would waste
+/// table columns. Pure (no I/O) so it can be unit-tested.
+fn effective_sidebar_pct(term_width: u16, configured: u16) -> u16 {
+    let cap = if term_width >= 220 {
+        12
+    } else if term_width >= 180 {
+        15
+    } else if term_width >= 140 {
+        20
+    } else {
+        70
+    };
+    configured.min(cap).clamp(10, 70)
+}
+
+/// Editor height after adapting to the terminal height: on short screens the
+/// configured height would leave the table with ~4 rows, so shrink the
+/// editor and give the rows back to the results. On tall screens the editor
+/// stays as configured and all extra rows go to the table.
+fn effective_editor_height(main_height: u16, configured: u16) -> u16 {
+    let min_results = 8u16;
+    let max_editor = main_height.saturating_sub(min_results).max(4);
+    configured.min(max_editor).max(4)
+}
+
 /// Normalize pasted text: `CRLF` -> single `LF`, lone `CR` (git-bash sends
 /// CR-only line breaks) -> `LF`. Caller expands tabs / maps newlines per
 /// target (editor newline vs single-line field).
@@ -514,9 +540,9 @@ impl App {
             execute!(stdout, DisableMouseCapture)
         };
         let msg = if self.mouse_capture {
-            "Mouse capture ON (Alt+M to release for native copy)"
+            "Mouse capture ON (Alt+M for native copy)"
         } else {
-            "Mouse:OFF — gutter hidden, drag to select clean SQL; Alt+M restores; paste via Shift+Ins/Ctrl+Shift+V"
+            "Mouse OFF — borderless editor, drag to select clean SQL; Ctrl+V / Shift+Ins pastes, Alt+M restores"
         };
         self.session_manager.active_session_mut().set_status(msg);
     }
@@ -641,6 +667,40 @@ impl App {
         key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
     }
 
+    /// Explicit keyboard paste: Ctrl+V (incl. Ctrl+Shift+V, which arrives as
+    /// Ctrl+V / Ctrl+Shift+V) and Shift+Insert read the OS clipboard and
+    /// insert it via the same path as bracketed paste. Works with mouse
+    /// capture ON or OFF — the easy-paste counterpart to Mouse:OFF copy.
+    fn is_paste_key(key: event::KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            return true;
+        }
+        matches!(key.code, KeyCode::Insert)
+    }
+
+    /// Paste the OS clipboard content at the active target. No-op with a
+    /// status hint when no clipboard is available (e.g. headless SSH).
+    fn paste_from_clipboard(&mut self) {
+        let text = arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut cb| cb.get().text().ok())
+            .filter(|t| !t.is_empty());
+        match text {
+            Some(t) => {
+                if self.session_manager.active_session().mode == SessionMode::Query {
+                    self.active_window = ActiveWindow::Editor;
+                }
+                self.paste_text(&t)
+            }
+            None => self
+                .session_manager
+                .active_session_mut()
+                .set_status("Clipboard empty/unavailable — use Shift+Ins or bracketed paste"),
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         // Clicking anywhere relocates focus/cursor; a completion popup anchored
         // to the old position must not accept into the wrong range.
@@ -726,9 +786,17 @@ impl App {
                     .results_area
                     .contains(Position::new(mouse.column, mouse.row))
                 {
-                    let session = self.session_manager.active_session_mut();
-                    session.scroll_offset = session.scroll_offset.saturating_add(3);
-                    self.session_manager.maybe_fetch_next_page();
+                    // Shift+wheel scrolls columns (reveals ▶), plain wheel
+                    // scrolls rows (reveals ▼).
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        let session = self.session_manager.active_session_mut();
+                        session.col_scroll_offset =
+                            session.col_scroll_offset.saturating_add(1);
+                    } else {
+                        let session = self.session_manager.active_session_mut();
+                        session.scroll_offset = session.scroll_offset.saturating_add(3);
+                        self.session_manager.maybe_fetch_next_page();
+                    }
                 }
             }
             MouseEventKind::ScrollUp
@@ -736,22 +804,31 @@ impl App {
                     .results_area
                     .contains(Position::new(mouse.column, mouse.row)) =>
             {
-                let session = self.session_manager.active_session_mut();
-                session.scroll_offset = session.scroll_offset.saturating_sub(3);
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let session = self.session_manager.active_session_mut();
+                    session.col_scroll_offset =
+                        session.col_scroll_offset.saturating_sub(1);
+                } else {
+                    let session = self.session_manager.active_session_mut();
+                    session.scroll_offset = session.scroll_offset.saturating_sub(3);
+                }
             }
             _ => {}
         }
     }
 
     /// Focus the editor and move the text cursor to the clicked position.
+    /// Borderless (Mouse:OFF) editors have no 1-cell frame, so the offset
+    /// skips the border only when borders are drawn.
     fn click_editor(&mut self, column: u16, row: u16) {
         self.active_window = ActiveWindow::Editor;
         let gutter = self.editor_gutter_width() as usize;
+        let frame = if self.mouse_capture { 1 } else { 0 };
         let session = self.session_manager.active_session_mut();
         session.mode = SessionMode::Query;
         let raw_row =
-            (row.saturating_sub(self.editor_area.y + 1)) as usize + session.editor.scroll_offset;
-        let target_col = (column.saturating_sub(self.editor_area.x + 1 + gutter as u16)) as usize;
+            (row.saturating_sub(self.editor_area.y + frame)) as usize + session.editor.scroll_offset;
+        let target_col = (column.saturating_sub(self.editor_area.x + frame + gutter as u16)) as usize;
         let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
         session.editor.cursor_row = target_row;
         session.editor.cursor_col =
@@ -783,6 +860,13 @@ impl App {
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
         {
             self.should_quit = true;
+            return;
+        }
+        // Explicit keyboard paste (Ctrl+V / Shift+Ins) works in the command
+        // bar, the connection dialog and the SQL editor — both with mouse
+        // capture ON and OFF.
+        if Self::is_paste_key(key) {
+            self.paste_from_clipboard();
             return;
         }
 
@@ -2187,7 +2271,15 @@ impl App {
                         self.sidebar_area = chunks[1];
                     }
                     None => {
-                        let left_pct = 100 - self.sidebar_split_pct;
+                        // Responsive split: the sidebar is a fixed info panel,
+                        // so on a wide monitor it must not eat 25% of the
+                        // table width. Cap its share as the screen grows, so
+                        // the result viewer gets the extra columns.
+                        let sidebar_pct = effective_sidebar_pct(
+                            size.width,
+                            self.sidebar_split_pct,
+                        );
+                        let left_pct = 100 - sidebar_pct;
                         let (left, right) = if self.hide_sidebar {
                             (chunks[1], Rect::default())
                         } else {
@@ -2195,16 +2287,22 @@ impl App {
                                 .direction(Direction::Horizontal)
                                 .constraints([
                                     Constraint::Percentage(left_pct),
-                                    Constraint::Percentage(self.sidebar_split_pct),
+                                    Constraint::Percentage(sidebar_pct),
                                 ])
                                 .split(chunks[1]);
                             (h_split[0], h_split[1])
                         };
 
+                        // On short screens a fixed 12-row editor would starve
+                        // the table; shrink it so results keep at least ~8
+                        // rows. On tall screens the editor stays fixed and
+                        // every extra row goes to the table.
+                        let editor_h =
+                            effective_editor_height(chunks[1].height, self.editor_height);
                         let main_chunks = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
-                                Constraint::Length(self.editor_height),
+                                Constraint::Length(editor_h),
                                 Constraint::Min(4),
                             ])
                             .split(left);
@@ -2215,8 +2313,9 @@ impl App {
                     }
                 }
 
-                if self.editor_area.height > 2 {
-                    let vis_height = self.editor_area.height.saturating_sub(2) as usize;
+                if self.editor_area.height > 0 {
+                    let frame = if self.mouse_capture { 2 } else { 0 };
+                    let vis_height = self.editor_area.height.saturating_sub(frame) as usize;
                     self.session_manager
                         .active_session_mut()
                         .editor
@@ -2308,17 +2407,19 @@ impl App {
                         || self.maximized_box == Some(MaximizedBox::Editor))
                 {
                     let area = self.editor_area;
-                    let vis_height = area.height.saturating_sub(2) as usize;
+                    let frame: u16 = if self.mouse_capture { 1 } else { 0 };
+                    let vis_height = area.height.saturating_sub(frame * 2) as usize;
                     let row = session.editor.cursor_row;
                     let scroll = session.editor.scroll_offset;
-                    if row >= scroll && row < scroll + vis_height {
+                    if row >= scroll && row < scroll + vis_height.max(1) {
                         let gutter = self.editor_gutter_width();
-                        let max_text_width = area.width.saturating_sub(2 + gutter) as usize;
+                        let max_text_width =
+                            area.width.saturating_sub(frame * 2 + gutter) as usize;
                         let cx = area.x
-                            + 1
+                            + frame
                             + gutter
                             + session.editor.cursor_col.min(max_text_width) as u16;
-                        let cy = area.y + 1 + (row - scroll) as u16;
+                        let cy = area.y + frame + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
                     }
                 }
@@ -2375,6 +2476,25 @@ mod tests {
         assert_eq!(normalize_paste("a\rb"), "a\nb");
         assert_eq!(normalize_paste("a\nb"), "a\nb");
         assert_eq!(normalize_paste("a\r\n\r\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn wide_monitor_gives_table_more_width() {
+        // Same 25% config: a big monitor caps the sidebar so the table keeps
+        // the extra columns instead of the info panel.
+        assert_eq!(effective_sidebar_pct(90, 25), 25);
+        assert_eq!(effective_sidebar_pct(150, 25), 20);
+        assert_eq!(effective_sidebar_pct(190, 25), 15);
+        assert_eq!(effective_sidebar_pct(230, 25), 12);
+    }
+
+    #[test]
+    fn short_screen_shrinks_editor_for_table_rows() {
+        // Tall screen: editor untouched, extra rows go to the table.
+        assert_eq!(effective_editor_height(50, 12), 12);
+        // Short screen: editor shrinks so results keep ~8 rows.
+        assert_eq!(effective_editor_height(16, 12), 8);
+        assert!(effective_editor_height(12, 12) >= 4);
     }
 
     #[test]

@@ -2,6 +2,33 @@
 
 All notable changes to frog are documented here.
 
+## [0.6.0] - 2026-11-18
+
+### Fixed
+- Editor crash on multi-byte border glyphs: vertical cursor move onto a
+  line starting with `│` left the byte column mid-char, then `Delete` /
+  `Backspace` panicked (`byte index 1 is not a char boundary`). All
+  cursor setters now snap to char boundaries; added regression test.
+- Result table string handling: column widths are content-based
+  (header-only widths truncated long strings), embedded newlines/tabs
+  in values are collapsed to single-line cells, Markdown export escapes
+  pipes.
+
+### Added
+- Mouse:OFF native-copy mode renders the editor borderless with no
+  gutter, so terminal drag-select copies clean SQL without `│`/`─`
+  border junk (`Alt+M` restores).
+- Explicit keyboard paste: `Ctrl+V` / `Shift+Ins` pastes the OS
+  clipboard via the bracketed-paste path in editor, dialog and command
+  bar, with capture ON or OFF; `Shift+wheel` scrolls result columns.
+- Responsive table on big monitors: sidebar share is capped as the
+  terminal widens (25% → 20/15/12%), so extra width goes to result
+  columns; the column viewport fits the pane instead of a fixed 10-col
+  slice, with leftover space distributed across columns. Short screens
+  shrink the editor so results keep ~8 rows.
+- Overflow signals beyond counts: `◀`/`▶` and `▲`/`▼` arrows in the
+  result title plus vertical/horizontal scrollbars.
+
 ## [0.5.8] - 2026-11-13
 
 ### Added
