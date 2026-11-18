@@ -639,7 +639,17 @@ pub fn render_table(
                     .collect();
 
                 let visible_rows = rows.len();
-                let md_text = markdown_table(visible_cols, &rows);
+                let sel_rect =
+                    selected_cell_rect(session.table_selection, qr.rows.len(), total_cols);
+                // Exact per-cell highlight: the builder emits the same text
+                // as `markdown_table`, only selected cells get styled.
+                let md_lines = markdown_table_lines(
+                    visible_cols,
+                    &rows,
+                    top,
+                    start_col,
+                    sel_rect,
+                );
                 let counts = result_title_counts(
                     top,
                     visible_rows,
@@ -651,24 +661,6 @@ pub fn render_table(
                 );
                 let sel_note =
                     selection_title_note(session.table_selection, qr.rows.len(), total_cols);
-                let mut md_lines: Vec<Line> = md_text
-                    .lines()
-                    .map(|l| Line::from(l.to_string()))
-                    .collect();
-                // Row-band highlight for a table drag-selection (header and
-                // separator are lines 0-1, data starts at line 2).
-                tint_selected_lines(
-                    &mut md_lines,
-                    Some(0),
-                    2,
-                    top,
-                    selected_row_range(session.table_selection, qr.rows.len()),
-                    selection_covers_header(
-                        session.table_selection,
-                        qr.rows.len(),
-                        total_cols,
-                    ),
-                );
                 let p = Paragraph::new(md_lines)
                     .style(Style::default().fg(Color::White))
                     .block(
@@ -715,26 +707,36 @@ pub fn render_table(
                     total_cols,
                     qr.truncated,
                 );
+                let sel_rect =
+                    selected_cell_rect(session.table_selection, qr.rows.len(), total_cols);
                 let sel_note =
                     selection_title_note(session.table_selection, qr.rows.len(), total_cols);
                 let mut ascii_lines: Vec<Line> = ascii_text
                     .lines()
                     .map(|l| Line::from(l.to_string()))
                     .collect();
-                // Row-band highlight for a table drag-selection (top
-                // border, header and separator are lines 0-2, data at 3+).
-                tint_selected_lines(
-                    &mut ascii_lines,
-                    Some(1),
-                    3,
-                    top,
-                    selected_row_range(session.table_selection, qr.rows.len()),
-                    selection_covers_header(
-                        session.table_selection,
-                        qr.rows.len(),
-                        total_cols,
-                    ),
-                );
+                // Exact per-cell highlight: header is line 1, data from
+                // line 3. Only columns inside the selection get tinted.
+                if let Some(((r0, c0), (r1, c1))) = sel_rect {
+                    let sel_cols: Vec<bool> = (start_col..end_col)
+                        .map(|c| c >= c0 && c <= c1)
+                        .collect();
+                    if r0.is_none() {
+                        if let Some(line) = ascii_lines.get_mut(1) {
+                            tint_ascii_cells(line, &sel_cols);
+                        }
+                    }
+                    for k in 0..visible_rows {
+                        let abs = top + k;
+                        let in_rows = r0.is_none_or(|s| abs >= s)
+                            && r1.is_none_or(|e| abs <= e);
+                        if in_rows {
+                            if let Some(line) = ascii_lines.get_mut(3 + k) {
+                                tint_ascii_cells(line, &sel_cols);
+                            }
+                        }
+                    }
+                }
                 let p = Paragraph::new(ascii_lines)
                     .style(Style::default().fg(Color::White))
                     .block(
@@ -1124,34 +1126,6 @@ pub fn selected_cell_rect(
     sel?.clamp(total_rows, total_cols)
 }
 
-/// Selected data-row range (absolute indices), for row-band highlights.
-/// A header-only selection has no data rows → None.
-pub fn selected_row_range(
-    sel: Option<TableSelection>,
-    total_rows: usize,
-) -> Option<(usize, usize)> {
-    let s = sel?;
-    if s.is_empty() || total_rows == 0 {
-        return None;
-    }
-    let ((r0, _), (r1, _)) = s.ordered();
-    let e = r1?;
-    let start = r0.unwrap_or(0).min(total_rows - 1);
-    Some((start, e.min(total_rows - 1)))
-}
-
-/// Whether the header row is part of the selection.
-pub fn selection_covers_header(
-    sel: Option<TableSelection>,
-    total_rows: usize,
-    total_cols: usize,
-) -> bool {
-    matches!(
-        selected_cell_rect(sel, total_rows, total_cols),
-        Some(((None, _), _))
-    )
-}
-
 /// Compact selection note for result titles (` [sel r3-5 c2-4]`,
 /// ` [sel hdr c1-2]`, ` [sel hdr-5 c2-4]`), empty when nothing selected.
 pub fn selection_title_note(
@@ -1171,45 +1145,6 @@ pub fn selection_title_note(
             format!(" [sel {} c{}-{}]", rows, c0 + 1, c1 + 1)
         }
         None => String::new(),
-    }
-}
-
-/// Tint whole lines for a table drag-selection (row-band highlight used by
-/// the Markdown/ASCII views). `header_line` is the index of the header
-/// line (tinted when the header row is selected), `first_data_line` the
-/// index of the first data line, `top` the absolute data-row shown there.
-fn tint_selected_lines(
-    lines: &mut [Line],
-    header_line: Option<usize>,
-    first_data_line: usize,
-    top: usize,
-    sel_rows: Option<(usize, usize)>,
-    header_selected: bool,
-) {
-    let style = Style::default().bg(Color::Cyan).fg(Color::Black);
-    let tint = |line: &mut Line| {
-        for span in line.spans.iter_mut() {
-            span.style = style;
-        }
-    };
-    if header_selected {
-        if let Some(i) = header_line {
-            if let Some(line) = lines.get_mut(i) {
-                tint(line);
-            }
-        }
-    }
-    let Some((r0, r1)) = sel_rows else {
-        return;
-    };
-    for (i, line) in lines.iter_mut().enumerate() {
-        if i < first_data_line {
-            continue;
-        }
-        let abs = top + (i - first_data_line);
-        if abs >= r0 && abs <= r1 {
-            tint(line);
-        }
     }
 }
 
@@ -1355,6 +1290,103 @@ pub fn markdown_col_at(
             .saturating_add(3);
     }
     Some(c)
+}
+
+/// Tint exact cells of an ASCII grid line (`| a | bb |`): every `|…|`
+/// segment maps to one window column, so `selected[i]` tints that cell
+/// block (padding included). Reassembles to byte-identical text.
+fn tint_ascii_cells(line: &mut Line, selected: &[bool]) {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let parts: Vec<&str> = text.split('|').collect();
+    if parts.len() < 3 {
+        return;
+    }
+    let base = Style::default().fg(Color::White);
+    let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let mut spans = vec![Span::styled("|", base)];
+    for (i, part) in parts[1..parts.len() - 1].iter().enumerate() {
+        let seg = format!("{}|", part);
+        if selected.get(i).copied().unwrap_or(false) {
+            spans.push(Span::styled(seg, sel_style));
+        } else {
+            spans.push(Span::styled(seg, base));
+        }
+    }
+    *line = Line::from(spans);
+}
+
+/// Markdown table as styled lines with exact per-cell selection
+/// highlight. Produces byte-for-byte the same text as `markdown_table`
+/// (verified by test) — only span styles differ for selected cells.
+/// `top`/`start_col` map the window to absolute indices; `sel` is the
+/// absolute selection rectangle.
+fn markdown_table_lines(
+    columns: &[String],
+    rows: &[&[String]],
+    top: usize,
+    start_col: usize,
+    sel: Option<TableRect>,
+) -> Vec<Line<'static>> {
+    let base = Style::default().fg(Color::White);
+    let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let cell_selected = |abs_row: Option<usize>, abs_col: usize| -> bool {
+        sel.is_some_and(|((r0, c0), (r1, c1))| {
+            if abs_col < c0 || abs_col > c1 {
+                return false;
+            }
+            match (abs_row, r0, r1) {
+                (None, None, _) => true,
+                (Some(r), _, _) => {
+                    r0.is_none_or(|s| r >= s) && r1.is_none_or(|e| r <= e)
+                }
+                _ => false,
+            }
+        })
+    };
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    // Header line.
+    {
+        let mut spans = vec![Span::styled("| ", base)];
+        for (k, col) in columns.iter().enumerate() {
+            if k > 0 {
+                spans.push(Span::styled(" | ", base));
+            }
+            let st = if cell_selected(None, start_col + k) {
+                sel_style
+            } else {
+                base
+            };
+            spans.push(Span::styled(markdown_esc_cell(col), st));
+        }
+        spans.push(Span::styled(" |", base));
+        lines.push(Line::from(spans));
+    }
+    // Separator line, identical to `markdown_table`'s.
+    lines.push(Line::from(Span::styled(
+        format!(
+            "|{}|",
+            columns.iter().map(|_| "---").collect::<Vec<_>>().join("|")
+        ),
+        base,
+    )));
+    // Data rows.
+    for (j, row) in rows.iter().enumerate() {
+        let mut spans = vec![Span::styled("| ", base)];
+        for (k, cell) in row.iter().enumerate() {
+            if k > 0 {
+                spans.push(Span::styled(" | ", base));
+            }
+            let st = if cell_selected(Some(top + j), start_col + k) {
+                sel_style
+            } else {
+                base
+            };
+            spans.push(Span::styled(markdown_esc_cell(cell), st));
+        }
+        spans.push(Span::styled(" |", base));
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// Markdown table over a column window + row slices. Shared by the Markdown
@@ -2044,7 +2076,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+F              Fetch next page of results (auto-loads when scrolling)"),
         Line::from("  Ctrl+Y              Contextual copy: table selection (else full table) in Results, drag-selection (else statement) in Editor"),
         Line::from("  Alt+Y               Copy SQL statement explicitly (never with line numbers)"),
-        Line::from("  Mouse drag table    Select result cells (Table/Markdown/ASCII) — release copies TSV without borders (drag from the header row to copy column names)"),
+        Line::from("  Mouse drag table    Select result cells — release copies in the view's format (TSV / Markdown with pipes / ASCII grid). Drag from the header row to copy column names"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
         Line::from("  Arrow keys / PgUp/PgDn  Scroll results"),
         Line::from(""),
@@ -3142,6 +3174,74 @@ mod tests {
         assert!(text.contains("name6"));
         assert!(!text.contains("name1"));
         assert!(text.contains('▲'));
+    }
+
+    #[test]
+    fn markdown_lines_match_plain_table_without_selection() {
+        let cols = vec!["A".to_string(), "B|C".to_string()];
+        let r1 = vec!["x".to_string(), "y".to_string()];
+        let rows = vec![r1.as_slice()];
+        let plain = markdown_table(&cols, &rows);
+        let lines = markdown_table_lines(&cols, &rows, 0, 0, None);
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(text, plain);
+        // No selection → nothing highlighted.
+        assert!(lines.iter().flat_map(|l| l.spans.iter()).all(|s| {
+            s.style.bg != Some(Color::Cyan)
+        }));
+    }
+
+    #[test]
+    fn markdown_lines_highlight_only_selected_cells() {
+        let cols = vec!["ID".to_string(), "NAME".to_string()];
+        let r1 = vec!["1".to_string(), "ann".to_string()];
+        let r2 = vec!["2".to_string(), "bob".to_string()];
+        let rows = vec![r1.as_slice(), r2.as_slice()];
+        let sel = Some(TableSelection {
+            anchor_row: Some(1),
+            anchor_col: 0,
+            cursor_row: Some(1),
+            cursor_col: 1,
+        });
+        let rect = selected_cell_rect(sel, 2, 2);
+        let lines = markdown_table_lines(&cols, &rows, 0, 0, rect);
+        // Header line + separator + 2 rows.
+        assert_eq!(lines.len(), 4);
+        let cyan: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.bg == Some(Color::Cyan))
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Exactly the selected cells light up.
+        assert_eq!(cyan, vec!["2", "bob"]);
+    }
+
+    #[test]
+    fn ascii_segment_tint_reassembles_identically() {
+        let mut line = Line::from("| OWNER   | ACTIVE |".to_string());
+        let original: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        tint_ascii_cells(&mut line, &[false, true]);
+        let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rebuilt, original);
+        // Only the second cell block is tinted.
+        let tinted: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Cyan))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(tinted, vec![" ACTIVE |"]);
     }
 
     #[test]

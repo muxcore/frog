@@ -1,4 +1,5 @@
 use crate::cli::Config;
+use crate::db::connection::QueryRow;
 use crate::db::session_manager::{
     EditorSelection, SessionManager, SessionMode, TableSelection,
 };
@@ -1095,13 +1096,56 @@ impl App {
         Some((abs_row, abs_col))
     }
 
-    /// Copy the current table drag-selection (header + TSV, no borders) to
-    /// the clipboard (OS + OSC52, like Ctrl+Y). Returns false when there
-    /// is no (non-empty) selection.
+    /// Copy the current table drag-selection to the clipboard (OS +
+    /// OSC52, like Ctrl+Y). The text matches the current view format, so
+    /// what you paste looks like what you selected: TSV in Table view
+    /// (header + rows, no borders), Markdown with its `|` vertical lines
+    /// kept in Markdown view, the ASCII grid in ASCII view. Returns false
+    /// when there is no (non-empty) selection.
     fn copy_table_selection(&mut self) -> bool {
-        let text = match self.session_manager.active_session().selected_table_text() {
-            Some(t) => t,
-            None => return false,
+        let text = {
+            let session = self.session_manager.active_session();
+            let Some((header, rows)) = session.selected_table_cells() else {
+                return false;
+            };
+            match self.result_format {
+                ResultFormat::Table => {
+                    let mut out = header.join("\t");
+                    for row in &rows {
+                        out.push('\n');
+                        out.push_str(&row.join("\t"));
+                    }
+                    out
+                }
+                ResultFormat::Markdown => {
+                    let refs: Vec<&[String]> =
+                        rows.iter().map(|r| r.as_slice()).collect();
+                    markdown_table(&header, &refs)
+                }
+                ResultFormat::Ascii => {
+                    if rows.is_empty() {
+                        // Header-only selection: no grid to draw, just names.
+                        header.join("\t")
+                    } else {
+                        let w = header.len();
+                        let h = rows.len();
+                        let tmp = QueryRow {
+                            columns: header,
+                            rows,
+                            truncated: false,
+                            elapsed_ms: 0,
+                            is_error: false,
+                            error_msg: None,
+                            rows_affected: None,
+                            page_offset: 0,
+                            page_size: h,
+                            byte_count: 0,
+                            total_fetched: h,
+                        };
+                        format_ascii_table(&tmp, 0..w, 0, h)
+                    }
+                }
+            }
         };
         let chars = text.chars().count();
         let outcome = self.copy_and_remember(&text);

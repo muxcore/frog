@@ -1189,6 +1189,32 @@ impl Session {
         true
     }
 
+    /// Header + data rows of the current table selection (owned, clamped
+    /// to the data). The basis for every copy format: TSV keeps them raw,
+    /// Markdown/ASCII go through their (escaping, padding) renderers.
+    pub fn selected_table_cells(&self) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+        let sel = self.table_selection?;
+        let qr = self.results.last()?;
+        if qr.is_error || qr.columns.is_empty() {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = sel.clamp(qr.rows.len(), qr.columns.len())?;
+        let header = qr.columns[c0..=c1].to_vec();
+        let mut rows = Vec::new();
+        if let Some(e) = r1 {
+            let s = r0.unwrap_or(0);
+            for row in &qr.rows[s..=e] {
+                // Ragged-safe: missing cells copy as empty.
+                rows.push(
+                    (c0..=c1)
+                        .map(|c| row.get(c).cloned().unwrap_or_default())
+                        .collect(),
+                );
+            }
+        }
+        Some((header, rows))
+    }
+
     /// Header + TSV text for the current table cell selection (selected
     /// columns, selected rows), or None when there is no non-empty
     /// selection. Selecting the header row copies just the column names;
@@ -1196,24 +1222,11 @@ impl Session {
     /// Raw cell values — just columns and content, no box
     /// borders — like the Table branch of Ctrl+Y.
     pub fn selected_table_text(&self) -> Option<String> {
-        let sel = self.table_selection?;
-        let qr = self.results.last()?;
-        if qr.is_error || qr.columns.is_empty() {
-            return None;
-        }
-        let ((r0, c0), (r1, c1)) = sel.clamp(qr.rows.len(), qr.columns.len())?;
-        let mut out = String::new();
-        out.push_str(&qr.columns[c0..=c1].join("\t"));
-        if let Some(e) = r1 {
-            let s = r0.unwrap_or(0);
-            for row in &qr.rows[s..=e] {
-                out.push('\n');
-                // Ragged-safe: missing cells copy as empty.
-                let cells: Vec<&str> = (c0..=c1)
-                    .map(|c| row.get(c).map(String::as_str).unwrap_or(""))
-                    .collect();
-                out.push_str(&cells.join("\t"));
-            }
+        let (header, rows) = self.selected_table_cells()?;
+        let mut out = header.join("\t");
+        for row in &rows {
+            out.push('\n');
+            out.push_str(&row.join("\t"));
         }
         Some(out)
     }

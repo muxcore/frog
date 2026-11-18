@@ -36,8 +36,11 @@ All notable changes to frog are documented here.
   (or the SQL statement at the cursor) — one copy key driven by focus.
   `Alt+Y` remains as the explicit copy-SQL key.
 - Table drag-selection in every result format (Table, Markdown, ASCII):
-  dragging across result cells highlights them and copies header + TSV
-  on release — just columns and content, no box borders. Works with
+  dragging highlights exactly the selected cells and copies on release
+  in the view's own format — TSV (header + rows, no borders) in Table,
+  Markdown with its `|` vertical lines kept in Markdown, the ASCII grid
+  in ASCII. Every table copy automatically includes the header row; drag
+  from the header row itself to copy column names only. Works with
   mouse capture ON over SSH (OS clipboard + OSC52); `Ctrl+C` copies it
   when no query runs, `Esc` clears it, and the title shows the selected
   range (`[sel r3-5 c2-4]`).
