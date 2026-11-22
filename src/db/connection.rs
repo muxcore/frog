@@ -356,6 +356,22 @@ pub fn strip_leading_comments(mut sql: &str) -> &str {
     }
 }
 
+fn starts_with_keyword(upper: &str, kw: &str) -> bool {
+    match upper.strip_prefix(kw) {
+        Some(rest) => rest
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric() && !matches!(c, '_' | '$' | '#'))
+            .unwrap_or(true),
+        None => false,
+    }
+}
+
+/// Strip leading comments/whitespace and trailing `;`/whitespace for command matching.
+pub(crate) fn clean_command_word(sql: &str) -> &str {
+    strip_leading_comments(sql).trim_end().trim_end_matches(';').trim()
+}
+
 fn is_query_sql(trimmed: &str) -> bool {
     is_query_sql_for(DbType::Oracle, trimmed)
 }
@@ -364,21 +380,40 @@ pub fn is_query_sql_for(db_type: DbType, trimmed: &str) -> bool {
     let upper = strip_leading_comments(trimmed).to_uppercase();
     match db_type {
         DbType::Oracle => {
-            upper.starts_with("SELECT")
-                || upper.starts_with("WITH")
-                || upper.starts_with("DESCRIBE")
-                || upper.starts_with("EXPLAIN")
+            starts_with_keyword(&upper, "SELECT")
+                || starts_with_keyword(&upper, "WITH")
+                || starts_with_keyword(&upper, "DESCRIBE")
+                || starts_with_keyword(&upper, "EXPLAIN")
         }
         DbType::Postgres => {
-            upper.starts_with("SELECT")
-                || upper.starts_with("WITH")
-                || upper.starts_with("VALUES")
-                || upper.starts_with("TABLE")
-                || upper.starts_with("SHOW")
-                || upper.starts_with("DESCRIBE")
-                || upper.starts_with("EXPLAIN")
+            starts_with_keyword(&upper, "SELECT")
+                || starts_with_keyword(&upper, "WITH")
+                || starts_with_keyword(&upper, "VALUES")
+                || starts_with_keyword(&upper, "TABLE")
+                || starts_with_keyword(&upper, "SHOW")
+                || starts_with_keyword(&upper, "DESCRIBE")
+                || starts_with_keyword(&upper, "EXPLAIN")
                 // INSERT/UPDATE/DELETE ... RETURNING yields rows in Postgres.
                 || upper.contains("RETURNING")
+        }
+    }
+}
+
+/// Whether `sql` can safely be wrapped in a subquery / `OFFSET ... FETCH` to
+/// load subsequent pages. Unlike [`is_query_sql_for`], DML with `RETURNING`,
+/// `EXPLAIN`, `SHOW`, and `DESCRIBE` are excluded so scrolling never re-runs
+/// mutations or wraps non-subquery commands in `SELECT * FROM (...)`.
+pub fn is_paginatable_query_for(db_type: DbType, trimmed: &str) -> bool {
+    let upper = strip_leading_comments(trimmed).to_uppercase();
+    match db_type {
+        DbType::Oracle => {
+            starts_with_keyword(&upper, "SELECT") || starts_with_keyword(&upper, "WITH")
+        }
+        DbType::Postgres => {
+            starts_with_keyword(&upper, "SELECT")
+                || starts_with_keyword(&upper, "WITH")
+                || starts_with_keyword(&upper, "VALUES")
+                || starts_with_keyword(&upper, "TABLE")
         }
     }
 }
@@ -441,15 +476,16 @@ impl OracleConnection {
         let start = std::time::Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;
         let trimmed = sql.trim();
+        let cmd = clean_command_word(sql);
 
-        if trimmed.eq_ignore_ascii_case("commit") {
+        if cmd.eq_ignore_ascii_case("commit") {
             return match self.conn.commit() {
                 Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
                 Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
             };
         }
 
-        if trimmed.eq_ignore_ascii_case("rollback") {
+        if cmd.eq_ignore_ascii_case("rollback") {
             return match self.conn.rollback() {
                 Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
                 Err(e) => QueryRow::error(e.to_string(), elapsed(), 0, max_rows),
@@ -480,28 +516,9 @@ impl OracleConnection {
 
     pub fn execute_query_paged(&self, sql: &str, page_offset: usize, page_size: usize) -> QueryRow {
         let start = std::time::Instant::now();
-        let inner_sql = sql.trim().trim_end_matches(';').trim();
-        // Fetch one extra row so we can tell whether more data follows.
-        let fetch_limit = page_offset + page_size + 1;
+        let (paged_sql, skip_col) = oracle_paged_sql(sql, page_offset, page_size);
 
-        let paged_sql = if strip_leading_comments(inner_sql)
-            .to_uppercase()
-            .starts_with("WITH ")
-        {
-            format!(
-                "{} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                inner_sql,
-                page_offset,
-                page_size + 1
-            )
-        } else {
-            format!(
-                "SELECT * FROM (SELECT a.*, ROWNUM AS rn FROM ({}) a WHERE ROWNUM <= {}) WHERE rn > {}",
-                inner_sql, fetch_limit, page_offset
-            )
-        };
-
-        match Self::do_query(self, &paged_sql, page_size, Some("RN")) {
+        match Self::do_query(self, &paged_sql, page_size, skip_col) {
             Ok(data) => QueryRow::from_query(
                 data,
                 start.elapsed().as_millis() as u64,
@@ -1314,6 +1331,40 @@ impl OracleConnection {
     }
 }
 
+/// Build the paged Oracle SQL and optional helper column to strip from output.
+///
+/// CTE queries (`WITH ...`) use `OFFSET ... FETCH NEXT ...` directly and have
+/// no synthetic row-number column (passing `Some("RN")` there previously
+/// dropped any real user column named `RN`). Regular `SELECT` queries use a
+/// `ROWNUM AS FROG_RN__` wrapper to avoid colliding with user columns named `RN`.
+pub(crate) fn oracle_paged_sql(
+    sql: &str,
+    page_offset: usize,
+    page_size: usize,
+) -> (String, Option<&'static str>) {
+    let inner_sql = sql.trim().trim_end_matches(';').trim();
+    let upper = strip_leading_comments(inner_sql).to_uppercase();
+    let extra_fetch = page_size.saturating_add(1);
+    if starts_with_keyword(&upper, "WITH") {
+        (
+            format!(
+                "{} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                inner_sql, page_offset, extra_fetch
+            ),
+            None,
+        )
+    } else {
+        let fetch_limit = page_offset.saturating_add(extra_fetch);
+        (
+            format!(
+                "SELECT * FROM (SELECT a.*, ROWNUM AS FROG_RN__ FROM ({}) a WHERE ROWNUM <= {}) WHERE FROG_RN__ > {}",
+                inner_sql, fetch_limit, page_offset
+            ),
+            Some("FROG_RN__"),
+        )
+    }
+}
+
 /// Unique `EXPLAIN PLAN` statement id (`FROG_<pid>_<counter>`, ≤ 30 chars).
 pub(crate) fn oracle_statement_id() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1447,5 +1498,31 @@ mod tests {
         // Unrelated errors pass through untouched.
         let plain = "ORA-12170: TNS:Connect timeout occurred";
         assert_eq!(OracleConnection::friendly_session_error(plain), plain);
+    }
+
+    #[test]
+    fn oracle_paged_sql_preserves_user_rn_and_handles_multiline_with() {
+        let (cte, skip) = oracle_paged_sql("/* c */\nWITH\nt AS (SELECT 1 AS rn FROM dual) SELECT * FROM t;", 20, 10);
+        assert!(cte.ends_with("OFFSET 20 ROWS FETCH NEXT 11 ROWS ONLY"));
+        assert_eq!(skip, None);
+
+        let (sel, skip) = oracle_paged_sql("SELECT rn FROM t;", 20, 10);
+        assert!(sel.contains("ROWNUM AS FROG_RN__"));
+        assert_eq!(skip, Some("FROG_RN__"));
+    }
+
+    #[test]
+    fn paginatable_excludes_dml_returning_and_clean_command_strips_comments() {
+        assert!(is_query_sql_for(
+            DbType::Postgres,
+            "INSERT INTO t VALUES (1) RETURNING id"
+        ));
+        assert!(!is_paginatable_query_for(
+            DbType::Postgres,
+            "INSERT INTO t VALUES (1) RETURNING id"
+        ));
+        assert!(is_paginatable_query_for(DbType::Postgres, "SELECT\n1"));
+        assert!(!is_query_sql_for(DbType::Postgres, "TABLESPACE foo"));
+        assert_eq!(clean_command_word("-- tx end\n  COMMIT ; "), "COMMIT");
     }
 }

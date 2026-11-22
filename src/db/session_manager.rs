@@ -626,6 +626,9 @@ pub struct Session {
     /// Monotonic job sequence — bumped for each new execution so results
     /// from an older (superseded) spawn can be ignored as stale.
     pub job_seq: u64,
+    /// Monotonic connection sequence — bumped for each connect attempt so
+    /// stale or post-close background connects are closed and ignored.
+    pub conn_seq: u64,
     /// Serializes query execution on this session's connection so two spawned
     /// worker threads never call ODPI-C concurrently on the same connection
     /// (breaking is the only operation allowed from the UI thread).
@@ -974,7 +977,7 @@ impl ConnectionDialog {
         }
     }
 
-    /// Snap the cursor to a valid position inside the active field.
+    /// Snap the cursor to a valid char boundary inside the active field.
     pub fn clamp_cursor(&mut self) {
         if self.is_type_field() {
             self.cursor = 0;
@@ -982,8 +985,8 @@ impl ConnectionDialog {
         }
         let len = self.field().len();
         let mut pos = self.cursor.min(len);
-        while pos < len && !self.field().is_char_boundary(pos) {
-            pos += 1;
+        while pos > 0 && !self.field().is_char_boundary(pos) {
+            pos -= 1;
         }
         self.cursor = pos;
     }
@@ -1079,6 +1082,7 @@ impl ConnectionDialog {
             self.toggle_db_type();
             return;
         }
+        self.clamp_cursor();
         let s = self.field();
         let next = s[self.cursor..].chars().next().map(|c| c.len_utf8());
         if let Some(n) = next {
@@ -1297,6 +1301,7 @@ impl Session {
             status_message_since: None,
             status_message_ttl: std::time::Duration::from_secs(5),
             job_seq: 0,
+            conn_seq: 0,
             exec_lock: Arc::new(Mutex::new(())),
             session_view_cursor: 0,
             session_view_active_only: false,
@@ -1326,14 +1331,19 @@ impl Session {
     }
 }
 
+/// `(session_id, job_seq, result_row, is_final_for_job)`
+type ResultMsg = (usize, u64, QueryRow, bool);
+/// `(session_id, conn_seq, conn_or_error, display_name)`
+type ConnResultMsg = (usize, u64, Result<Arc<dyn DbConnection>, String>, String);
+
 pub struct SessionManager {
     pub sessions: Vec<Session>,
     pub active_idx: usize,
     next_id: AtomicUsize,
-    result_rx: Receiver<(usize, u64, QueryRow)>,
-    result_tx: Sender<(usize, u64, QueryRow)>,
-    conn_result_rx: Receiver<(usize, bool, String, String)>,
-    conn_result_tx: Sender<(usize, bool, String, String)>,
+    result_rx: Receiver<ResultMsg>,
+    result_tx: Sender<ResultMsg>,
+    conn_result_rx: Receiver<ConnResultMsg>,
+    conn_result_tx: Sender<ConnResultMsg>,
     explorer_rx: Receiver<ExplorerMsg>,
     explorer_tx: Sender<ExplorerMsg>,
     meta_rx: Receiver<MetaMsg>,
@@ -1489,15 +1499,17 @@ impl SessionManager {
             byte_count: 0,
             total_fetched: 0,
         };
-        let _ = result_tx.send((id, seq, err_row));
+        let _ = result_tx.send((id, seq, err_row, true));
     }
 
     /// Open a backend connection in a background thread and report back
-    /// through the conn_result channel.
+    /// through the conn_result channel. Ownership stays in the channel until
+    /// `poll_conn_result` validates that the session still exists and that
+    /// `conn_seq` has not been superseded, preventing leaked or raced handles.
     fn spawn_connect(
-        conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
-        conn_result_tx: Sender<(usize, bool, String, String)>,
+        conn_result_tx: Sender<ConnResultMsg>,
         id: usize,
+        conn_seq: u64,
         params: ConnectionParams,
         autocommit: bool,
         null_display: String,
@@ -1523,20 +1535,17 @@ impl SessionManager {
                 )
                 .map(|c| c as Arc<dyn DbConnection>),
             };
-            match result {
-                Ok(conn) => {
-                    if let Ok(mut map) = conn_map.lock() {
-                        map.insert(id, conn);
-                    }
-                    let _ = conn_result_tx.send((id, true, String::new(), name_str));
+            let outcome = result.map_err(|e| {
+                if params.db_type == DbType::Oracle {
+                    OracleConnection::friendly_connect_error(&e)
+                } else {
+                    e.to_string()
                 }
-                Err(e) => {
-                    let msg = if params.db_type == DbType::Oracle {
-                        OracleConnection::friendly_connect_error(&e)
-                    } else {
-                        e.to_string()
-                    };
-                    let _ = conn_result_tx.send((id, false, msg, name_str));
+            });
+            if let Err(send_err) = conn_result_tx.send((id, conn_seq, outcome, name_str)) {
+                //SessionManager dropped before connect finished: close cleanly.
+                if let (_, _, Ok(conn), _) = send_err.0 {
+                    let _ = conn.close();
                 }
             }
         });
@@ -1557,25 +1566,26 @@ impl SessionManager {
         let new_idx = self.active_idx;
 
         if should_connect && !params.user.is_empty() {
-            let id = self.sessions[new_idx].id;
+            let sess = &mut self.sessions[new_idx];
+            sess.conn_seq = sess.conn_seq.wrapping_add(1);
+            let (id, conn_seq) = (sess.id, sess.conn_seq);
+            sess.connecting = true;
+            sess.connect_error = None;
             Self::spawn_connect(
-                self.conn_map.clone(),
                 self.conn_result_tx.clone(),
                 id,
+                conn_seq,
                 params,
                 self.autocommit,
                 self.null_display.clone(),
             );
-
-            self.sessions[new_idx].connecting = true;
-            self.sessions[new_idx].connect_error = None;
         }
 
         new_idx
     }
 
     pub fn remove_session(&mut self, idx: usize) {
-        if self.sessions.len() <= 1 {
+        if self.sessions.len() <= 1 || idx >= self.sessions.len() {
             return;
         }
         let removed_id = self.sessions[idx].id;
@@ -1590,10 +1600,9 @@ impl SessionManager {
 
         // Release the DB connection for the removed session so the underlying
         // DB session is closed promptly instead of lingering until app exit.
-        if let Ok(mut map) = self.conn_map.lock() {
-            if let Some(conn) = map.remove(&removed_id) {
-                let _ = conn.close();
-            }
+        let mut map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = map.remove(&removed_id) {
+            let _ = conn.close();
         }
     }
 
@@ -1623,27 +1632,27 @@ impl SessionManager {
     }
 
     pub fn connect_active(&mut self, params: &ConnectionParams) {
-        let id = self.sessions[self.active_idx].id;
+        let sess = &mut self.sessions[self.active_idx];
+        sess.conn_seq = sess.conn_seq.wrapping_add(1);
+        let (id, conn_seq) = (sess.id, sess.conn_seq);
+        sess.connecting = true;
+        sess.connect_error = None;
         Self::spawn_connect(
-            self.conn_map.clone(),
             self.conn_result_tx.clone(),
             id,
+            conn_seq,
             params.clone(),
             self.autocommit,
             self.null_display.clone(),
         );
-
-        self.sessions[self.active_idx].connecting = true;
-        self.sessions[self.active_idx].connect_error = None;
     }
 
     /// Backend of the active session's connection if connected, else the
     /// backend selected in its connection dialog.
     pub fn active_db_type(&self) -> DbType {
-        if let Ok(map) = self.conn_map.lock() {
-            if let Some(conn) = map.get(&self.sessions[self.active_idx].id) {
-                return conn.db_type();
-            }
+        let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = map.get(&self.sessions[self.active_idx].id) {
+            return conn.db_type();
         }
         self.sessions[self.active_idx].conn_dialog.db_type
     }
@@ -1705,8 +1714,9 @@ impl SessionManager {
         self.sessions[idx].paging = false;
 
         // Persist every executed statement to disk history + session history
-        // Also track last SELECT for pagination
+        // Also track last paginatable SELECT/WITH for pagination
         {
+            let active_db_type = self.active_db_type();
             let max_history = self.max_history;
             let sess = &mut self.sessions[self.active_idx];
             for sql in &statements {
@@ -1714,7 +1724,7 @@ impl SessionManager {
                 if !trimmed.is_empty() {
                     append_history(&trimmed);
                     sess.query_history.push(trimmed.clone());
-                    if crate::db::connection::is_query_sql_for(sess.conn_dialog.db_type, &trimmed) {
+                    if crate::db::connection::is_paginatable_query_for(active_db_type, &trimmed) {
                         sess.last_sql = Some(trimmed);
                     }
                 }
@@ -1731,14 +1741,14 @@ impl SessionManager {
         thread::spawn(move || {
             // Serialize on this session's connection so only one statement runs
             // at a time on it (avoids concurrent driver calls from duplicate spawns).
-            let _guard = exec_lock.lock().ok();
-            let conn_opt = conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let conn_opt = conn_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
             if let Some(conn) = conn_opt {
-                let mut had_error = false;
                 for (n, sql) in statements.iter().enumerate() {
-                    if had_error {
-                        break;
-                    }
                     let result = conn.execute_query(sql, page_size);
                     let was_cancelled = result.is_error
                         && result
@@ -1770,12 +1780,11 @@ impl SessionManager {
                         result
                     };
 
-                    let _ = result_tx.send((id, seq, result));
-                    // Abort the script on the first real error.
-                    if is_error && !was_cancelled {
-                        had_error = true;
-                    }
-                    if was_cancelled {
+                    // Abort the script on cancellation or the first real error.
+                    let abort = is_error || was_cancelled;
+                    let done = abort || n + 1 == statements.len();
+                    let _ = result_tx.send((id, seq, result, done));
+                    if abort {
                         break;
                     }
                 }
@@ -1793,7 +1802,7 @@ impl SessionManager {
                     byte_count: 0,
                     total_fetched: 0,
                 };
-                let _ = result_tx.send((id, seq, err));
+                let _ = result_tx.send((id, seq, err, true));
             }
         });
     }
@@ -1847,12 +1856,16 @@ impl SessionManager {
         self.sessions[idx].paging = true;
 
         thread::spawn(move || {
-            let _guard = exec_lock.lock().ok();
-            let conn_opt = conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let conn_opt = conn_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
             match conn_opt {
                 Some(conn) => {
                     let result = conn.execute_query_paged(&sql, current_offset, allowed);
-                    let _ = result_tx.send((id, seq, result));
+                    let _ = result_tx.send((id, seq, result, true));
                 }
                 None => {
                     let err = QueryRow::error(
@@ -1861,7 +1874,7 @@ impl SessionManager {
                         current_offset,
                         allowed,
                     );
-                    let _ = result_tx.send((id, seq, err));
+                    let _ = result_tx.send((id, seq, err, true));
                 }
             }
         });
@@ -1945,43 +1958,71 @@ impl SessionManager {
     }
 
     pub fn poll_conn_result(&mut self) {
-        if let Ok((id, success, err, name)) = self.conn_result_rx.try_recv() {
-            let mut connected_idx = None;
-            if let Some(idx) = self.sessions.iter().position(|s| s.id == id) {
-                let sess = &mut self.sessions[idx];
-                sess.connecting = false;
-                if success {
+        while let Ok((id, seq, outcome, name)) = self.conn_result_rx.try_recv() {
+            let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
+                // Session tab was closed while connecting: close the handle so
+                // the DB session does not leak.
+                if let Ok(conn) = outcome {
+                    let _ = conn.close();
+                }
+                continue;
+            };
+            if self.sessions[idx].conn_seq != seq {
+                // Superseded by a newer connect attempt on this session.
+                if let Ok(conn) = outcome {
+                    let _ = conn.close();
+                }
+                continue;
+            }
+            match outcome {
+                Ok(conn) => {
+                    let dialect = conn.db_type();
+                    let old_conn = self
+                        .conn_map
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id, conn);
+                    if let Some(old) = old_conn {
+                        let _ = old.close();
+                    }
+                    let sess = &mut self.sessions[idx];
+                    sess.connecting = false;
                     sess.is_connected = true;
                     sess.connect_error = None;
                     sess.name = name;
-                    // Fresh connection: drop any metadata from a previous one.
+                    // Fresh connection: drop any metadata/explorer state from a previous one.
                     sess.metadata = MetadataStore::default();
+                    sess.metadata.set_dialect(dialect);
                     sess.completion = None;
-                    connected_idx = Some(idx);
-                } else {
+                    sess.explorer_loaded = false;
+                    sess.explorer_schemas.clear();
+                    self.request_bootstrap(idx);
+                }
+                Err(err) => {
+                    let sess = &mut self.sessions[idx];
+                    sess.connecting = false;
                     sess.connect_error = Some(err);
                 }
-            }
-            if let Some(idx) = connected_idx {
-                let dialect = self.sessions[idx].conn_dialog.db_type;
-                self.sessions[idx].metadata.set_dialect(dialect);
-                self.request_bootstrap(idx);
             }
         }
     }
 
     pub fn poll_result(&mut self) {
-        if let Ok((session_id, seq, qr)) = self.result_rx.try_recv() {
-            let cap = self.max_results_per_session;
+        let cap = self.max_results_per_session;
+        for _ in 0..32 {
+            let Ok((session_id, seq, qr, done)) = self.result_rx.try_recv() else {
+                break;
+            };
             if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                 // Ignore results from an outdated job (superseded by a newer
                 // execution on the same session) — prevents interleaving/stale data.
-                let is_stale = seq < sess.job_seq;
-                if is_stale {
-                    return;
+                if seq < sess.job_seq {
+                    continue;
                 }
-                sess.pending_query = false;
-                sess.paging = false;
+                if done {
+                    sess.pending_query = false;
+                    sess.paging = false;
+                }
 
                 // A cancellation is not an error — surface it as a status message
                 // and clear the stale "Cancelling…" notice, instead of pushing a
@@ -1993,8 +2034,10 @@ impl SessionManager {
                         .map(Self::is_cancelled_msg)
                         .unwrap_or(false);
                 if cancelled {
+                    sess.pending_query = false;
+                    sess.paging = false;
                     sess.set_status("Query cancelled");
-                    return;
+                    continue;
                 }
 
                 if qr.page_offset > 0 {
@@ -2431,22 +2474,43 @@ impl SessionManager {
         }
     }
 
+    /// Run a short catalog/session operation on the active session's connection,
+    /// serialized on `exec_lock`. Fails fast without blocking the UI thread if
+    /// a user query or page fetch is currently running on the connection.
+    fn with_active_conn_sync<T>(
+        &self,
+        op: impl FnOnce(&dyn DbConnection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let sess = &self.sessions[self.active_idx];
+        if sess.pending_query || sess.paging {
+            return Err("Connection busy (query running) — wait or cancel with Esc.".into());
+        }
+        let id = sess.id;
+        let exec_lock = sess.exec_lock.clone();
+        let conn = self
+            .conn_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| String::from("Not connected. Use Ctrl+O to connect."))?;
+        let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+        op(conn.as_ref())
+    }
+
     /// Query the backend for its session list. Failures (notably missing
     /// `V$SESSION` privileges on Oracle) are returned as a displayable
     /// message instead of being swallowed.
     pub fn get_session_info(&self) -> Result<Vec<DbSessionInfo>, String> {
-        let id = self.sessions[self.active_idx].id;
-        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
-        match conn {
-            Some(c) => c.query_sessions().map_err(|e| {
+        self.with_active_conn_sync(|c| {
+            c.query_sessions().map_err(|e| {
                 if c.db_type() == DbType::Oracle {
                     OracleConnection::friendly_session_error(&e.to_string())
                 } else {
                     e.to_string()
                 }
-            }),
-            None => Err("Not connected. Use Ctrl+O to connect.".into()),
-        }
+            })
+        })
     }
 
     /// Number of visible columns in the F2 session browser (shared by
@@ -2787,25 +2851,18 @@ impl SessionManager {
         };
         let label = format!("{} {}", info.sid, info.username);
         let idx = self.active_idx;
-        let id = self.sessions[idx].id;
-        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
+        let res = self.with_active_conn_sync(|c| c.session_sql(&info).map_err(|e| e.to_string()));
         let sess = &mut self.sessions[idx];
         sess.plan_for = Some(label);
         sess.plan_scroll = 0;
         sess.plan_hscroll = 0;
         sess.sql_scroll = 0;
         sess.plan_result = None;
-        match conn {
-            Some(c) => match c.session_sql(&info) {
-                Ok(text) => sess.plan_sql_text = Some(text),
-                Err(e) => {
-                    sess.plan_sql_text = None;
-                    sess.set_status(format!("No SQL text: {}", e));
-                }
-            },
-            None => {
+        match res {
+            Ok(text) => sess.plan_sql_text = Some(text),
+            Err(e) => {
                 sess.plan_sql_text = None;
-                sess.set_status("Not connected");
+                sess.set_status(format!("No SQL text: {}", e));
             }
         }
     }
@@ -2823,17 +2880,14 @@ impl SessionManager {
                 _ => return,
             }
         };
-        let id = self.sessions[idx].id;
-        let conn = self.conn_map.lock().ok().and_then(|m| m.get(&id).cloned());
-        match conn {
-            Some(c) => {
-                let result = c.explain_plan(&sql, max_rows);
+        match self.with_active_conn_sync(|c| Ok(c.explain_plan(&sql, max_rows))) {
+            Ok(result) => {
                 let sess = &mut self.sessions[idx];
                 sess.plan_result = Some(result);
                 sess.plan_scroll = 0;
                 sess.plan_hscroll = 0;
             }
-            None => self.sessions[idx].set_status("Not connected"),
+            Err(msg) => self.sessions[idx].set_status(msg),
         }
     }
 
@@ -2858,39 +2912,33 @@ impl SessionManager {
     /// (Re)load the top-level schema list from the backend.
     pub fn refresh_explorer(&mut self) {
         let idx = self.active_idx;
-        let conn = self.active_connection();
+        let res = self.with_active_conn_sync(|c| c.list_schemas().map_err(|e| e.to_string()));
         let sess = &mut self.sessions[idx];
-        match conn {
-            Some(c) => match c.list_schemas() {
-                Ok(names) => {
-                    sess.explorer_schemas = names
-                        .into_iter()
-                        .map(|n| {
-                            // Preserve expansion of schemas that are still there.
-                            let prev = sess.explorer_schemas.iter().find(|p| p.name == n);
-                            ExplorerSchema {
-                                name: n,
-                                expanded: prev.map(|p| p.expanded).unwrap_or(false),
-                                groups: prev.and_then(|p| p.groups.clone()),
-                                load_error: None,
-                            }
-                        })
-                        .collect();
-                    sess.explorer_loaded = true;
-                    sess.explorer_error = None;
-                    if sess.explorer_schemas.is_empty() {
-                        sess.explorer_error =
-                            Some("No schemas found (or no dictionary access).".into());
-                    }
-                }
-                Err(e) => {
-                    sess.explorer_loaded = true;
-                    sess.explorer_error = Some(explorer_error_hint(&e.to_string()));
-                }
-            },
-            None => {
+        match res {
+            Ok(names) => {
+                sess.explorer_schemas = names
+                    .into_iter()
+                    .map(|n| {
+                        // Preserve expansion of schemas that are still there.
+                        let prev = sess.explorer_schemas.iter().find(|p| p.name == n);
+                        ExplorerSchema {
+                            name: n,
+                            expanded: prev.map(|p| p.expanded).unwrap_or(false),
+                            groups: prev.and_then(|p| p.groups.clone()),
+                            load_error: None,
+                        }
+                    })
+                    .collect();
                 sess.explorer_loaded = true;
-                sess.explorer_error = Some("Not connected. Use Ctrl+O to connect.".into());
+                sess.explorer_error = None;
+                if sess.explorer_schemas.is_empty() {
+                    sess.explorer_error =
+                        Some("No schemas found (or no dictionary access).".into());
+                }
+            }
+            Err(e) => {
+                sess.explorer_loaded = true;
+                sess.explorer_error = Some(explorer_error_hint(&e));
             }
         }
         self.clamp_explorer_cursor();
@@ -2998,17 +3046,13 @@ impl SessionManager {
             Some(s) => s.name.clone(),
             None => return,
         };
-        let conn = self.active_connection();
+        let res =
+            self.with_active_conn_sync(|c| c.list_object_groups(&schema).map_err(|e| e.to_string()));
         let sess = &mut self.sessions[self.active_idx];
         let Some(entry) = sess.explorer_schemas.get_mut(sidx) else {
             return;
         };
-        let Some(c) = conn else {
-            entry.groups = Some(Vec::new());
-            entry.load_error = Some("Not connected.".into());
-            return;
-        };
-        match c.list_object_groups(&schema) {
+        match res {
             Ok(mut groups) => {
                 groups.sort_by(|a, b| {
                     explorer_group_order(&a.0)
@@ -3040,7 +3084,7 @@ impl SessionManager {
             }
             Err(e) => {
                 entry.groups = Some(Vec::new());
-                entry.load_error = Some(explorer_error_hint(&e.to_string()));
+                entry.load_error = Some(explorer_error_hint(&e));
             }
         }
     }
@@ -3061,7 +3105,8 @@ impl SessionManager {
             ),
             None => return,
         };
-        let conn = self.active_connection();
+        let res =
+            self.with_active_conn_sync(|c| c.list_objects(&schema, &key).map_err(|e| e.to_string()));
         let sess = &mut self.sessions[self.active_idx];
         let Some(entry) = sess
             .explorer_schemas
@@ -3071,12 +3116,7 @@ impl SessionManager {
         else {
             return;
         };
-        let Some(c) = conn else {
-            entry.objects = Some(Vec::new());
-            entry.load_error = Some("Not connected.".into());
-            return;
-        };
-        match c.list_objects(&schema, &key) {
+        match res {
             Ok(items) => {
                 // Preserve loaded children (columns/previews/DDL) across
                 // refreshes; cap the list so huge schemas stay usable.
@@ -3107,7 +3147,7 @@ impl SessionManager {
             }
             Err(e) => {
                 entry.objects = Some(Vec::new());
-                entry.load_error = Some(explorer_error_hint(&e.to_string()));
+                entry.load_error = Some(explorer_error_hint(&e));
             }
         }
     }
@@ -3130,7 +3170,10 @@ impl SessionManager {
             ),
             None => return,
         };
-        let conn = self.active_connection();
+        let res = self.with_active_conn_sync(|c| {
+            c.list_columns(&schema, &name, &kind)
+                .map_err(|e| e.to_string())
+        });
         let sess = &mut self.sessions[self.active_idx];
         let Some(entry) = sess
             .explorer_schemas
@@ -3142,20 +3185,14 @@ impl SessionManager {
         else {
             return;
         };
-        match conn {
-            Some(c) => match c.list_columns(&schema, &name, &kind) {
-                Ok(cols) => {
-                    entry.columns = Some(cols);
-                    entry.load_error = None;
-                }
-                Err(e) => {
-                    entry.columns = Some(Vec::new());
-                    entry.load_error = Some(explorer_error_hint(&e.to_string()));
-                }
-            },
-            None => {
+        match res {
+            Ok(cols) => {
+                entry.columns = Some(cols);
+                entry.load_error = None;
+            }
+            Err(e) => {
                 entry.columns = Some(Vec::new());
-                entry.load_error = Some("Not connected.".into());
+                entry.load_error = Some(explorer_error_hint(&e));
             }
         }
     }
@@ -3720,7 +3757,7 @@ impl SessionManager {
             let result = match conn {
                 Some(c) => {
                     // Serialize with editor queries on the same connection.
-                    let _guard = exec_lock.lock().ok();
+                    let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
                     c.execute_query_paged(&sql, offset, Self::EXPLORER_PREVIEW_LIMIT)
                 }
                 None => QueryRow {
@@ -3778,7 +3815,7 @@ impl SessionManager {
         thread::spawn(move || {
             let result = match conn {
                 Some(c) => {
-                    let _guard = exec_lock.lock().ok();
+                    let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
                     c.object_ddl(&schema, &name, &kind)
                         // {:#} keeps the whole cause chain, not just the top line.
                         .map_err(|e| format!("{:#}", e))
@@ -3908,17 +3945,15 @@ impl SessionManager {
     }
 
     pub fn check_connections(&mut self) {
-        let conn_map = self.conn_map.lock().ok();
-        if let Some(ref map) = conn_map {
-            for session in &mut self.sessions {
-                session.is_connected = map.contains_key(&session.id);
-            }
+        let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
+        for session in &mut self.sessions {
+            session.is_connected = map.contains_key(&session.id);
         }
     }
 
     pub fn active_connection(&self) -> Option<Arc<dyn DbConnection>> {
         let id = self.sessions[self.active_idx].id;
-        let map = self.conn_map.lock().ok()?;
+        let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
         map.get(&id).cloned()
     }
 }
@@ -4724,5 +4759,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![30, 10, 20]
         );
+    }
+
+    #[test]
+    fn poll_result_keeps_pending_query_until_final_script_statement() {
+        let mut sm = SessionManager::new();
+        let id = sm.sessions[0].id;
+        sm.sessions[0].job_seq = 1;
+        sm.sessions[0].pending_query = true;
+
+        // Statement 1 of 2 finishes (`done = false`): session must stay pending.
+        let r1 = QueryRow::notice("Statement 1", 1, 100);
+        sm.result_tx.send((id, 1, r1, false)).unwrap();
+        sm.poll_result();
+        assert!(sm.sessions[0].pending_query);
+        assert_eq!(sm.sessions[0].results.len(), 1);
+
+        // Statement 2 of 2 finishes (`done = true`): pending_query clears.
+        let r2 = QueryRow::notice("Statement 2", 1, 100);
+        sm.result_tx.send((id, 1, r2, true)).unwrap();
+        sm.poll_result();
+        assert!(!sm.sessions[0].pending_query);
+        assert_eq!(sm.sessions[0].results.len(), 2);
+    }
+
+    #[test]
+    fn conn_dialog_cursor_right_clamps_stale_cursor_safely() {
+        let mut dlg = ConnectionDialog {
+            active_field: 1, // Host
+            host: "äb".into(),
+            cursor: 99, // stale / out-of-bounds
+            ..ConnectionDialog::default()
+        };
+        dlg.cursor_right();
+        assert_eq!(dlg.cursor, dlg.host.len());
+
+        // Mid-char byte index snaps cleanly to a valid UTF-8 boundary.
+        dlg.cursor = 1; // inside 2-byte 'ä'
+        dlg.cursor_right();
+        assert!(dlg.host.is_char_boundary(dlg.cursor));
     }
 }

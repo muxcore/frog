@@ -14,9 +14,33 @@ use crossterm::{
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
 use std::time::Instant;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Outcome of a clipboard copy: which channel actually landed.
+/// Restore terminal modes unconditionally (normal exit, early `?`, or panic).
+fn restore_terminal_state(keyboard_enhanced: bool) {
+    let mut stdout = io::stdout();
+    if keyboard_enhanced {
+        let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show
+    );
+    let _ = disable_raw_mode();
+}
+
+struct TerminalGuard {
+    keyboard_enhanced: bool,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal_state(self.keyboard_enhanced);
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyOutcome {
     /// Remote/local OS clipboard via arboard (X11/Wayland/macOS/Windows).
@@ -420,6 +444,16 @@ impl App {
             crossterm::terminal::supports_keyboard_enhancement(),
             Ok(true)
         );
+        let kb_enhanced = self.keyboard_enhanced;
+        let _guard = TerminalGuard {
+            keyboard_enhanced: kb_enhanced,
+        };
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal_state(kb_enhanced);
+            prev_hook(info);
+        }));
+
         let mut stdout = io::stdout();
         let _ = execute!(
             stdout,
@@ -461,23 +495,8 @@ impl App {
         }
 
         let res = self.run_loop(&mut terminal);
-
-        if self.keyboard_enhanced {
-            let _ = execute!(
-                terminal.backend_mut(),
-                crossterm::event::PopKeyboardEnhancementFlags,
-            );
-        }
-        let _ = execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            crossterm::cursor::Hide
-        );
-        disable_raw_mode()?;
-        terminal.show_cursor()?;
-
+        let _ = terminal.show_cursor();
+        // `_guard` restores raw mode, alternate screen, mouse, paste, and keyboard flags on drop.
         res
     }
 
@@ -2814,10 +2833,21 @@ impl App {
                         let gutter = self.editor_gutter_width();
                         let max_text_width =
                             area.width.saturating_sub(frame * 2 + gutter) as usize;
+                        let line = session
+                            .editor
+                            .lines
+                            .get(row)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let mut col_bytes = session.editor.cursor_col.min(line.len());
+                        while col_bytes > 0 && !line.is_char_boundary(col_bytes) {
+                            col_bytes -= 1;
+                        }
+                        let visual_col = UnicodeWidthStr::width(&line[..col_bytes]);
                         let cx = area.x
                             + frame
                             + gutter
-                            + session.editor.cursor_col.min(max_text_width) as u16;
+                            + visual_col.min(max_text_width) as u16;
                         let cy = area.y + frame + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
                     }

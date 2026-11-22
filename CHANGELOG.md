@@ -2,50 +2,40 @@
 
 All notable changes to frog are documented here.
 
-## [0.7.0] - 2026-11-18
+## [0.8.1] - 2026-11-22
 
 ### Fixed
-- Result scrolling parity across formats: Markdown/ASCII now use the
-  same responsive column window as Table (no more fixed 10-col slice),
-  correct per-format pane sizing, `▲▼◀▶` + scrollbars in every title,
-  and scroll offsets are clamped into the loaded data each frame so
-  overscrolling past the end can't wedge the opposite direction in any
-  format. Fresh results also reset the column offset.
+- Terminal recovery on panic or early startup failure: an RAII terminal
+  guard and panic hook now unconditionally restore raw mode, alternate
+  screen, mouse capture, bracketed paste, and Kitty keyboard flags.
+- Connection lifecycle & race safety: background connects now carry a
+  per-session `conn_seq` token and register in `conn_map` on the main
+  loop, closing superseded, replaced, or post-tab-close DB handles
+  promptly so sessions never leak or overwrite a newer connection.
+- Thread-safe `F2` / `F12` catalog queries: synchronous UI queries now
+  fail fast while a user query is running and serialize on `exec_lock`
+  (with mutex poison recovery), preventing concurrent ODPI-C calls and
+  UI freezes.
+- Multi-statement script state (`F5`): `pending_query` stays active
+  across all statements in a script (keeping the `RUNNING` indicator and
+  `Esc`/`Ctrl+C` cancellation working past statement 1) and drains up to
+  32 results per frame.
+- Oracle pagination & `RN` column preservation: `WITH` CTE pagination no
+  longer strips real user columns named `RN` on page 2+, recognizes
+  multiline `WITH` headers, uses saturating bounds, and renames the
+  internal `ROWNUM` helper column to `FROG_RN__` to avoid `ORA-00918`.
+- Safe pagination tracking & transaction commands: `INSERT`/`UPDATE`/
+  `DELETE ... RETURNING`, `EXPLAIN`, and `SHOW` no longer overwrite
+  `last_sql` for scroll pagination; `COMMIT`/`ROLLBACK` now tolerate
+  leading SQL comments and trailing `;`.
+- SQL splitter & UTF-8 cursor positioning: `statement_ranges` now
+  respects Oracle `q'[...]'` alternative quotes and Postgres `$$...$$` /
+  `$tag$...$tag$` dollar-quoted blocks/functions; fixed editor terminal
+  cursor display-width alignment on multi-byte characters, clamped
+  `ConnectionDialog::cursor_right`, and aligned masked password cursors
+  by character index.
 
-### Added
-- In-editor drag selection with mouse capture ON: dragging across SQL
-  text highlights it and auto-copies to the clipboard on release (OS +
-  OSC52, so it works over SSH with no terminal-native selection or
-  Mouse:OFF toggle needed). `Ctrl+C` copies the active selection when
-  no query is running, typing/pasting replaces the selection, `Esc`
-  clears it.
-- `Ctrl+C` is now the standard copy key when no query is running (cancel
-  still wins mid-query): same contextual copy as `Ctrl+Y` — selection
-  first, else the statement/table the focused pane shows. `Ctrl+V`
-  pastes the OS clipboard, falling back to frog's own copy buffer.
-- Fixed paste-after-copy over SSH: the copy rides OSC52 to the *local*
-  terminal but arboard only reads the *remote* clipboard, so a table
-  just copied could never be pasted back. Every in-app copy is now also
-  remembered internally and used when the OS clipboard is unavailable.
-- Header-row selection in Table view: dragging from the header selects
-  column names (highlighted in place); every table copy automatically
-  includes the header row. The title shows the range (`[sel hdr c1-3]`,
-  `[sel hdr-5 c2-4]`).
-- `Ctrl+Y` is now contextual: in Results it copies the table
-  drag-selection (or the full table), in the Editor the drag-selection
-  (or the SQL statement at the cursor) — one copy key driven by focus.
-  `Alt+Y` remains as the explicit copy-SQL key.
-- Table drag-selection in every result format (Table, Markdown, ASCII):
-  dragging highlights exactly the selected cells and copies on release
-  in the view's own format — TSV (header + rows, no borders) in Table,
-  Markdown with its `|` vertical lines kept in Markdown, the ASCII grid
-  in ASCII. Every table copy automatically includes the header row; drag
-  from the header row itself to copy column names only. Works with
-  mouse capture ON over SSH (OS clipboard + OSC52); `Ctrl+C` copies it
-  when no query runs, `Esc` clears it, and the title shows the selected
-  range (`[sel r3-5 c2-4]`).
-
-## [0.6.0] - 2026-11-18
+## [0.8.0] - 2026-11-20
 
 ### Fixed
 - Editor crash on multi-byte border glyphs: vertical cursor move onto a
@@ -56,6 +46,16 @@ All notable changes to frog are documented here.
   (header-only widths truncated long strings), embedded newlines/tabs
   in values are collapsed to single-line cells, Markdown export escapes
   pipes.
+- Result scrolling parity across formats: Markdown/ASCII now use the
+  same responsive column window as Table (no more fixed 10-col slice),
+  correct per-format pane sizing, `▲▼◀▶` + scrollbars in every title,
+  and scroll offsets are clamped into the loaded data each frame so
+  overscrolling past the end can't wedge the opposite direction in any
+  format. Fresh results also reset the column offset.
+- Fixed paste-after-copy over SSH: the copy rides OSC52 to the *local*
+  terminal but arboard only reads the *remote* clipboard, so a table
+  just copied could never be pasted back. Every in-app copy is now also
+  remembered internally and used when the OS clipboard is unavailable.
 
 ### Added
 - Mouse:OFF native-copy mode renders the editor borderless with no
@@ -71,6 +71,35 @@ All notable changes to frog are documented here.
   shrink the editor so results keep ~8 rows.
 - Overflow signals beyond counts: `◀`/`▶` and `▲`/`▼` arrows in the
   result title plus vertical/horizontal scrollbars.
+- In-editor drag selection with mouse capture ON: dragging across SQL
+  text highlights it and auto-copies to the clipboard on release (OS +
+  OSC52, so it works over SSH with no terminal-native selection or
+  Mouse:OFF toggle needed). `Ctrl+C` copies the active selection when
+  no query is running, typing/pasting replaces the selection, `Esc`
+  clears it.
+- `Ctrl+C` is now the standard copy key when no query is running (cancel
+  still wins mid-query): same contextual copy as `Ctrl+Y` — selection
+  first, else the statement/table the focused pane shows. `Ctrl+V`
+  pastes the OS clipboard, falling back to frog's own copy buffer.
+- Header-row selection: dragging from the header selects column names
+  (highlighted in place); every table copy automatically includes the
+  header row. The title shows the range (`[sel hdr c1-3]`,
+  `[sel hdr-5 c2-4]`).
+- `Ctrl+Y` is now contextual: in Results it copies the table
+  drag-selection (or the full table), in the Editor the drag-selection
+  (or the SQL statement at the cursor) — one copy key driven by focus.
+  `Alt+Y` remains as the explicit copy-SQL key.
+- Table drag-selection in every result format (Table, Markdown, ASCII):
+  dragging highlights exactly the selected cells and copies on release
+  in the view's own format — TSV (header + rows, no borders) in Table,
+  Markdown with its `|` vertical lines kept in Markdown, the ASCII grid
+  in ASCII. Works with mouse capture ON over SSH (OS clipboard + OSC52);
+  `Ctrl+C` copies it when no query runs, `Esc` clears it, and the title
+  shows the selected range (`[sel r3-5 c2-4]`).
+- ARM builds: `scripts/build-old-glibc.sh` takes an arch (`x86_64` /
+  `aarch64`, host arch by default) and produces `dist/frog-<arch>`;
+  `scripts/release.sh` builds and publishes both (`frog-x86_64.gz`,
+  `frog-aarch64.gz`), single-arch via `FROG_ARCHES="x86_64"`.
 
 ## [0.5.8] - 2026-11-13
 

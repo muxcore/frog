@@ -178,6 +178,42 @@ fn scan_q_quote(bytes: &[u8], i: usize) -> Option<usize> {
     Some(bytes.len())
 }
 
+/// Postgres dollar-quoted string literal: `$$...$$` or `$tag$...$tag$`.
+/// Tag must be empty or start with an ASCII letter / `_` (never a digit, so
+/// `$1` parameters are untouched). Caller checks that `i` is not preceded by
+/// an identifier character (so Oracle names like `v$session` or `BIN$x$0`
+/// never match).
+fn scan_dollar_quote(bytes: &[u8], i: usize) -> Option<usize> {
+    if i + 1 >= bytes.len() || bytes[i] != b'$' {
+        return None;
+    }
+    let mut tag_end = i + 1;
+    if tag_end < bytes.len() && bytes[tag_end] != b'$' {
+        let first = bytes[tag_end];
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        tag_end += 1;
+        while tag_end < bytes.len()
+            && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_')
+        {
+            tag_end += 1;
+        }
+    }
+    if tag_end >= bytes.len() || bytes[tag_end] != b'$' {
+        return None;
+    }
+    let delim = &bytes[i..=tag_end];
+    let mut j = tag_end + 1;
+    while j + delim.len() <= bytes.len() {
+        if &bytes[j..j + delim.len()] == delim {
+            return Some(j + delim.len());
+        }
+        j += 1;
+    }
+    Some(bytes.len())
+}
+
 /// Tokenize a piece of SQL. Whitespace is skipped. Never fails: unterminated
 /// strings/comments simply run to the end of the input, which is exactly what
 /// we need while the user is still typing.
@@ -214,14 +250,14 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             continue;
         }
 
-        // Strings (with '' escaping and Oracle q'...').
+        // Strings (with '' escaping, Oracle q'...' and Postgres $$...$$).
         let prev_is_ident = text[..start]
             .chars()
             .next_back()
             .map(is_ident_cont)
             .unwrap_or(false);
         if let Some(end) = if !prev_is_ident {
-            scan_q_quote(bytes, i)
+            scan_q_quote(bytes, i).or_else(|| scan_dollar_quote(bytes, i))
         } else {
             None
         } {
@@ -473,6 +509,7 @@ pub fn statement_ranges(text: &str) -> Vec<(usize, usize, String)> {
     let mut in_double = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
+    let mut saw_dollar_quote = false;
 
     while i < len {
         let c = bytes[i];
@@ -516,6 +553,30 @@ pub fn statement_ranges(text: &str) -> Vec<(usize, usize, String)> {
             continue;
         }
 
+        // Oracle `q'[...]'` and Postgres `$$...$$` / `$tag$...$tag$` literals.
+        if c == b'q' || c == b'Q' || c == b'$' {
+            let prev_is_ident = text[..i]
+                .chars()
+                .next_back()
+                .map(is_ident_cont)
+                .unwrap_or(false);
+            if !prev_is_ident {
+                if let Some((end, is_dollar)) = scan_q_quote(bytes, i)
+                    .map(|e| (e, false))
+                    .or_else(|| scan_dollar_quote(bytes, i).map(|e| (e, true)))
+                {
+                    if is_dollar {
+                        saw_dollar_quote = true;
+                    }
+                    if let Some(rel_nl) = bytes[i..end].iter().rposition(|&b| b == b'\n') {
+                        line_start = i + rel_nl + 1;
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
         match c {
             b'\n' => {
                 let line = text[line_start..i].trim();
@@ -529,6 +590,7 @@ pub fn statement_ranges(text: &str) -> Vec<(usize, usize, String)> {
                         out.push((start, i + 1, stmt));
                     }
                     start = i + 1;
+                    saw_dollar_quote = false;
                 }
                 line_start = i + 1;
             }
@@ -545,7 +607,9 @@ pub fn statement_ranges(text: &str) -> Vec<(usize, usize, String)> {
             b';' => {
                 let acc = text[start..i].trim();
                 let upper = acc.to_uppercase();
-                let is_block = is_plsql_block_start(&upper);
+                // Postgres routines (`CREATE FUNCTION ... AS $$ ... $$ LANGUAGE plpgsql;`)
+                // wrap internal semicolons in dollar quotes and terminate at the outer `;`.
+                let is_block = !saw_dollar_quote && is_plsql_block_start(&upper);
                 if is_block && !ends_with_end_block(&upper) {
                     // Internal `;` inside a PL/SQL block — keep collecting.
                 } else {
@@ -555,6 +619,7 @@ pub fn statement_ranges(text: &str) -> Vec<(usize, usize, String)> {
                     }
                     start = i + 1;
                     line_start = i + 1;
+                    saw_dollar_quote = false;
                 }
             }
             _ => {}
@@ -631,5 +696,25 @@ mod tests {
     fn statement_ranges_still_splits() {
         let ranges = statement_ranges("select 1; select 2;");
         assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn statement_ranges_respects_q_quotes_and_dollar_quotes() {
+        // Oracle q'[...]' containing single quotes and semicolons stays intact.
+        let q = statement_ranges("SELECT q'[it's; still; one]' FROM dual; SELECT 2;");
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].2, "SELECT q'[it's; still; one]' FROM dual");
+
+        // Postgres dollar-quoted function + subsequent query splits cleanly at outer `;`.
+        let pg = statement_ranges(
+            "CREATE OR REPLACE FUNCTION f() RETURNS int AS $fn$\nBEGIN\n  RETURN 1;\nEND;\n$fn$ LANGUAGE plpgsql;\nSELECT f();",
+        );
+        assert_eq!(pg.len(), 2);
+        assert!(pg[0].2.ends_with("LANGUAGE plpgsql"));
+        assert_eq!(pg[1].2, "SELECT f()");
+
+        // Oracle identifiers with `$` (`v$session`, `BIN$abc$0`) are never misread as dollar quotes.
+        let ora = statement_ranges("SELECT * FROM v$session WHERE name = 'BIN$1$0'; SELECT 1;");
+        assert_eq!(ora.len(), 2);
     }
 }

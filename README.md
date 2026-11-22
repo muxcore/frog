@@ -76,17 +76,30 @@ glibc 2.34 servers.
 Requires [Docker](https://docs.docker.com/get-docker/).
 
 ```bash
-# Build dist/frog (glibc <= 2.34 compatible)
+# Build dist/frog-x86_64 (glibc <= 2.34 compatible, host arch by default)
 ./scripts/build-old-glibc.sh
+./scripts/build-old-glibc.sh x86_64    # explicit
+./scripts/build-old-glibc.sh aarch64   # ARM64 server build
 
-# Remove everything the build created (image, volumes, dist/)
+# Remove everything the builds created (images, volumes, dist/)
 ./scripts/clean-old-glibc.sh
 ```
 
 `build-old-glibc.sh` builds the binary, verifies with `objdump` that the highest
 required GLIBC symbol is ≤ `2.34` (fail-fast otherwise), and writes the result to
-`dist/frog`. The produced binary is still dynamically linked, so the server still
-needs Oracle Instant Client (`libclntsh.so`, via `LD_LIBRARY_PATH`) and `libgcc_s`.
+`dist/frog-<arch>` (`frog-x86_64`, `frog-aarch64`). The produced binary is still
+dynamically linked, so the server still needs Oracle Instant Client (`libclntsh.so`,
+via `LD_LIBRARY_PATH`) and `libgcc_s` — in the **matching architecture** (ARM
+servers need the ARM64 Instant Client).
+
+`./scripts/release.sh` builds both architectures and publishes them as
+`frog-x86_64.gz` + `frog-aarch64.gz` on the GitHub release
+(`FROG_ARCHES="x86_64"` limits it to one arch).
+
+> **ARM builds on an x86_64 host** run the build container under QEMU emulation
+> (slower, same result). The script probes for this and fails fast with setup
+> instructions if emulation is missing (`tonistiigi/binfmt`); Docker Desktop
+> includes it out of the box.
 
 The scripts are opinionated (base image, target glibc, Rust toolchain) but easy to
 tune — see the variables at the top of each script and `scripts/Dockerfile.oldglibc`.

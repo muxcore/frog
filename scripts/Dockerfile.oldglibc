@@ -1,6 +1,10 @@
 # Build frog against an old glibc so the resulting binary runs on servers
 # whose glibc is older than the build host's.
 #
+# Used for both target architectures (x86_64 and aarch64): the build script
+# picks the matching platform via `docker --platform`, and everything below is
+# architecture-neutral (rustup installs the container's native toolchain).
+#
 # Ubuntu 20.04 ships glibc 2.31 (>= the glibc 2.28 minimum required by Oracle
 # Instant Client 23, and < glibc 2.34 used on the target servers). See
 # README.md -> "Building for older glibc (containers)".

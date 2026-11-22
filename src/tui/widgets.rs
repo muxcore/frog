@@ -2170,6 +2170,22 @@ pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
                         .bg(Color::Rgb(60, 60, 90))
                         .fg(Color::Yellow),
                 )
+            } else if i == 5 {
+                // `masked_pw` uses one ASCII `*` per char, while `dlg.cursor`
+                // is a byte offset into `dlg.password`: map bytes -> char count
+                // so multibyte passwords position `▏` accurately and never slice
+                // out of bounds.
+                let mut byte_pos = dlg.cursor.min(dlg.password.len());
+                while byte_pos > 0 && !dlg.password.is_char_boundary(byte_pos) {
+                    byte_pos -= 1;
+                }
+                let p = dlg.password[..byte_pos].chars().count().min(value.len());
+                Span::styled(
+                    format!("{}▏{}", &value[..p], &value[p..]),
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 90))
+                        .fg(Color::Yellow),
+                )
             } else {
                 let pos = dlg.cursor.min(value.len());
                 let mut p = pos;

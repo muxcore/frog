@@ -162,15 +162,15 @@ impl PgConnection {
     fn run_query(&self, sql: &str, max_rows: usize) -> QueryRow {
         let start = std::time::Instant::now();
         let elapsed = || start.elapsed().as_millis() as u64;
-        let trimmed = sql.trim();
+        let cmd = super::connection::clean_command_word(sql);
 
-        if trimmed.eq_ignore_ascii_case("commit") || trimmed.eq_ignore_ascii_case("end") {
+        if cmd.eq_ignore_ascii_case("commit") || cmd.eq_ignore_ascii_case("end") {
             return match self.do_simple("COMMIT", 1) {
                 Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
             };
         }
-        if trimmed.eq_ignore_ascii_case("rollback") || trimmed.eq_ignore_ascii_case("abort") {
+        if cmd.eq_ignore_ascii_case("rollback") || cmd.eq_ignore_ascii_case("abort") {
             return match self.do_simple("ROLLBACK", 1) {
                 Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
