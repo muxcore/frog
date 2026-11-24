@@ -2077,6 +2077,8 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+Y              Contextual copy: table selection (else full table) in Results, drag-selection (else statement) in Editor"),
         Line::from("  Alt+Y               Copy SQL statement explicitly (never with line numbers)"),
         Line::from("  Mouse drag table    Select result cells — release copies in the view's format (TSV / Markdown with pipes / ASCII grid). Drag from the header row to copy column names"),
+        Line::from("  Shift+drag          Terminal-native select+copy — works in Git Bash/mintty with no setup"),
+        Line::from("                      (frog also copies via OS clipboard/helpers/OSC52; the status line names which worked)"),
         Line::from("  Ctrl+D              Cycle result format: Table → Markdown → ASCII"),
         Line::from("  Arrow keys / PgUp/PgDn  Scroll results"),
         Line::from(""),

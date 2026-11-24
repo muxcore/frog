@@ -13,7 +13,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io::{self, Stdout};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Restore terminal modes unconditionally (normal exit, early `?`, or panic).
@@ -41,16 +41,14 @@ impl Drop for TerminalGuard {
         restore_terminal_state(self.keyboard_enhanced);
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopyOutcome {
-    /// Remote/local OS clipboard via arboard (X11/Wayland/macOS/Windows).
-    Os,
+#[derive(Debug, Clone, Default)]
+struct CopyOutcome {
+    /// arboard reached the OS clipboard (X11/Wayland/macOS/Windows).
+    os: bool,
+    /// An external helper reached the clipboard; its name when it did.
+    command: Option<String>,
     /// Terminal emulator clipboard via OSC52 (works over SSH).
-    Osc52,
-    /// Both channels landed.
-    Both,
-    /// Nothing worked.
-    Failed,
+    osc52: bool,
 }
 
 /// Max bytes offered via OSC52 (terminals cap it, often ~700KB).
@@ -115,6 +113,38 @@ fn normalize_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// The character a plain text key contributes, or `None` for anything else
+/// (shortcuts, cursor keys, function keys, key releases).
+fn text_of_key(key: event::KeyEvent) -> Option<char> {
+    if key.kind == event::KeyEventKind::Release {
+        return None;
+    }
+    match (key.modifiers, key.code) {
+        (m, KeyCode::Char(c)) if (m.is_empty() || m == KeyModifiers::SHIFT) && !c.is_control() => {
+            Some(c)
+        }
+        (m, KeyCode::Enter) if m.is_empty() => Some('\n'),
+        (m, KeyCode::Tab) if m.is_empty() => Some('\t'),
+        _ => None,
+    }
+}
+
+/// Reassemble a burst of key events into pasted text. Returns `None` as soon
+/// as the burst contains anything that isn't plain text, so real shortcuts
+/// and non-text input are never swallowed by the paste path.
+fn text_from_key_burst(events: &[Event]) -> Option<String> {
+    let mut text = String::new();
+    for ev in events {
+        let Event::Key(key) = ev else { return None };
+        text.push(text_of_key(*key)?);
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Build the raw OSC52 (or tmux-wrapped) escape sequence for `text`.
 /// Pure (no I/O) so it can be unit-tested. Returns None for empty/oversize.
 fn build_osc52_sequence(text: &str, in_tmux: bool) -> Option<String> {
@@ -161,25 +191,178 @@ fn write_osc52(text: &str) -> bool {
     }
 }
 
-/// Copy `text` to the clipboard, preferring the OS clipboard and falling
-/// back to OSC52 so `Ctrl+Y`/`Alt+Y` keep working over SSH/headless.
-fn copy_to_clipboard(text: &str) -> CopyOutcome {
-    let os_ok = arboard::Clipboard::new()
-        .and_then(|mut cb| {
-            cb.set_text(text.to_string())
-                .map_err(|_| arboard::Error::ClipboardOccupied)
-        })
-        .is_ok();
+/// Whether frog runs inside WSL (where `clip.exe` reaches the Windows
+/// clipboard even without an X/Wayland display). Cached after first check so
+/// plain Linux doesn't re-read `/proc/sys/kernel/osrelease` on every copy.
+#[cfg(target_os = "linux")]
+fn is_wsl() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| {
+        std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::env::var_os("WSL_INTEROP").is_some()
+            || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map(|s| {
+                    let s = s.to_ascii_lowercase();
+                    s.contains("microsoft") || s.contains("wsl")
+                })
+                .unwrap_or(false)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_wsl() -> bool {
+    false
+}
+
+/// Whether this process is attached to a remote SSH session (the OS clipboard
+/// then belongs to the *remote* host, so OSC52 is what reaches the user).
+fn is_ssh_session() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Run one clipboard helper, feeding `text` on stdin.
+///
+/// Stdin is written on a short-lived thread so a large (>64 KB) copy to a
+/// hung helper can never deadlock the TUI loop. When `allow_detach` is true
+/// (for a user-configured `FROG_CLIPBOARD_CMD` such as a reverse SSH bridge),
+/// a still-running helper after the 400 ms grace period is reaped in the
+/// background and treated as success. For built-in local helpers, timing out
+/// kills the child and returns `false` so the next fallback runs.
+fn run_clipboard_command(program: &str, args: &[&str], text: &str, allow_detach: bool) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = text.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_millis(400);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) if allow_detach => {
+                // Slow custom bridge: let it finish in the background and reap
+                // it so it doesn't linger as a zombie for the life of the TUI.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return true;
+            }
+            _ => {
+                // Killing closes the pipe read end, unblocking the writer
+                // thread immediately if it was stalled on a full pipe.
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Put `text` on the clipboard through an external helper and return the
+/// helper's name on success.
+///
+/// This covers the places `arboard` cannot reach: WSL (`win32yank.exe` /
+/// `clip.exe` talk to the Windows clipboard), a headless Linux box with an
+/// X/Wayland helper installed, and user-supplied bridges (`FROG_CLIPBOARD_CMD`
+/// or `defaults.clipboard_command`) such as a reverse SSH tunnel back to the
+/// local machine.
+fn write_via_command(custom_cmd: Option<&str>, text: &str) -> Option<String> {
+    // Explicit override wins: a user-provided bridge can reach the real
+    // clipboard in setups we cannot detect. If it fails, keep going so a
+    // working built-in helper can still land the text.
+    if let Some(custom) = custom_cmd.map(str::trim).filter(|s| !s.is_empty()) {
+        #[cfg(windows)]
+        let ok = run_clipboard_command("cmd", &["/C", custom], text, true);
+        #[cfg(not(windows))]
+        let ok = run_clipboard_command("sh", &["-c", custom], text, true);
+        if ok {
+            return Some("FROG_CLIPBOARD_CMD".to_string());
+        }
+    }
+
+    // WSL/Windows interop: this reaches the Windows clipboard directly, even
+    // when no display exists and mintty blocks OSC52. Prefer `win32yank.exe`
+    // because it preserves UTF-8 (box-drawing chars, non-ASCII text), whereas
+    // `clip.exe` decodes stdin using the Windows OEM/ANSI codepage.
+    if cfg!(windows) || is_wsl() {
+        let win_helpers: &[(&str, &[&str])] =
+            &[("win32yank.exe", &["-i", "--crlf"]), ("clip.exe", &[])];
+        for (program, args) in win_helpers {
+            if run_clipboard_command(program, args, text, false) {
+                return Some((*program).to_string());
+            }
+        }
+    }
+
+    // Desktop helpers, used when arboard cannot reach the display. Without a
+    // display they can only fail, so don't pay for three doomed spawns.
+    #[cfg(target_os = "linux")]
+    let have_display =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    #[cfg(not(target_os = "linux"))]
+    let have_display = true;
+    if !have_display {
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(target_os = "linux")]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let candidates: &[(&str, &[&str])] = &[];
+    for (program, args) in candidates {
+        if run_clipboard_command(program, args, text, false) {
+            return Some((*program).to_string());
+        }
+    }
+    None
+}
+
+/// Copy `text` to the clipboard through every channel we have: the OS
+/// clipboard, an external helper, and OSC52 (so it can reach the local
+/// terminal over SSH).
+fn copy_to_clipboard(
+    clipboard: Option<&mut arboard::Clipboard>,
+    custom_cmd: Option<&str>,
+    text: &str,
+) -> CopyOutcome {
+    let os = clipboard
+        .map(|cb| cb.set_text(text.to_string()).is_ok())
+        .unwrap_or(false);
+    // On WSL arboard may hit an X server while the real clipboard is the
+    // Windows one, so prefer the helper there. Otherwise only fall back to a
+    // helper when arboard failed (or when the user configured one).
+    let explicit_command = custom_cmd.map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let command = if os && !is_wsl() && !explicit_command {
+        None
+    } else {
+        write_via_command(custom_cmd, text)
+    };
     // Always offer OSC52 as well: when arboard targets a *remote* X server
     // (X forwarding) it won't reach the local Windows clipboard, while OSC52
     // will. Harmless locally.
-    let osc_ok = write_osc52(text);
-    match (os_ok, osc_ok) {
-        (true, true) => CopyOutcome::Both,
-        (true, false) => CopyOutcome::Os,
-        (false, true) => CopyOutcome::Osc52,
-        (false, false) => CopyOutcome::Failed,
-    }
+    let osc52 = write_osc52(text);
+    CopyOutcome { os, command, osc52 }
 }
 
 /// Convert a screen-column offset into a byte offset on `line`, walking chars
@@ -279,6 +462,11 @@ pub struct App {
     /// read the *remote* clipboard — without this fallback, a table just
     /// copied could never be pasted back.
     copy_buffer: String,
+    /// Long-lived arboard handle. On X11/Wayland the clipboard content is
+    /// served by a background thread owned by this instance; dropping it
+    /// right after `set_text` makes the selection vanish (unless a clipboard
+    /// manager happens to save it), so keep it alive for the whole session.
+    clipboard: Option<arboard::Clipboard>,
     /// Table geometry from the last render (for mouse hit-testing).
     results_layout: ResultsLayout,
     /// Whether frog captures mouse events. Toggled with Ctrl+M / Alt+M
@@ -428,6 +616,7 @@ impl App {
             selecting_editor: false,
             selecting_table: false,
             copy_buffer: String::new(),
+            clipboard: arboard::Clipboard::new().ok(),
             results_layout: ResultsLayout::default(),
             mouse_capture: true,
             keyboard_enhanced: false,
@@ -516,14 +705,23 @@ impl App {
             terminal.draw(|f| self.ui(f))?;
 
             // git-bash/mintty doesn't emit bracketed paste — pastes arrive as
-            // a burst of individual key events. Handle the first event after a
-            // 50ms wait, then drain everything already queued so a multi-KB
-            // paste doesn't take N frames (one draw per char over SSH).
-            if event::poll(std::time::Duration::from_millis(50))? {
-                self.handle_event(event::read()?);
-                while event::poll(std::time::Duration::from_millis(0))? {
-                    self.handle_event(event::read()?);
+            // a burst of individual key events. When a text key lands, collect
+            // everything queued plus a short 2ms tail (SSH may split the write)
+            // so the batch handler can reassemble it into one paste. Non-text
+            // events (mouse drags/moves, shortcuts) drain immediately with 0ms
+            // wait so a high-polling-rate mouse can never starve rendering.
+            if event::poll(Duration::from_millis(50))? {
+                let first = event::read()?;
+                let tail = match first {
+                    Event::Key(k) if text_of_key(k).is_some() => Duration::from_millis(2),
+                    _ => Duration::from_millis(0),
+                };
+                let mut batch = vec![first];
+                let deadline = Instant::now() + Duration::from_millis(50);
+                while batch.len() < 4096 && Instant::now() < deadline && event::poll(tail)? {
+                    batch.push(event::read()?);
                 }
+                self.handle_events(batch);
             }
         }
         Ok(())
@@ -536,6 +734,40 @@ impl App {
             Event::Paste(text) => self.paste_text(&text),
             _ => {}
         }
+    }
+
+    /// Handle all events read in one loop tick. When a terminal (or a proxy)
+    /// lacks bracketed paste, a paste arrives as a burst of plain key events.
+    /// Reassemble that burst and run it through the normal paste path, so a
+    /// multi-line paste can't execute a statement line by line and a pasted
+    /// tab can't cycle focus. Anything that isn't plain text (a shortcut,
+    /// mouse event, key release, ...) falls back to per-event handling.
+    fn handle_events(&mut self, events: Vec<Event>) {
+        if events.len() > 1 && self.paste_target_is_text() {
+            if let Some(text) = text_from_key_burst(&events) {
+                self.paste_text(&text);
+                return;
+            }
+        }
+        for ev in events {
+            self.handle_event(ev);
+        }
+    }
+
+    /// Whether the current focus can receive pasted text (command bar, SQL
+    /// editor or connection dialog). Other fullscreen views and confirmation
+    /// prompts are not text-input targets.
+    fn paste_target_is_text(&self) -> bool {
+        if self.show_startup_help {
+            return false;
+        }
+        if self.command_mode {
+            return self.command_confirm.is_none();
+        }
+        matches!(
+            self.session_manager.active_session().mode,
+            SessionMode::Query | SessionMode::ConnectionPickerDialog
+        )
     }
 
     /// Insert pasted text into the active target (command bar, connection
@@ -582,6 +814,10 @@ impl App {
                 session.conn_dialog.insert_char(c);
             }
         } else {
+            // A paste always lands in the editor: move focus there so the
+            // caret is visible and following keystrokes aren't dropped by a
+            // read-only pane (e.g. pasting while the results table has focus).
+            self.active_window = ActiveWindow::Editor;
             // Pasting replaces the drag-selection, like a GUI editor.
             session.delete_selection();
             for c in normalized.chars() {
@@ -656,30 +892,49 @@ impl App {
         s.col_scroll_offset = col;
     }
 
-    /// Copy `text` to every clipboard we have (OS + OSC52) and remember it
-    /// in the internal buffer so Ctrl+V works even when the OS clipboard
-    /// is unreachable (typical over SSH).
+    /// Copy `text` to every clipboard we have (OS + helpers + OSC52) and
+    /// remember it in the internal buffer so Ctrl+V works even when the OS
+    /// clipboard is unreachable (typical over SSH).
     fn copy_and_remember(&mut self, text: &str) -> CopyOutcome {
-        let outcome = copy_to_clipboard(text);
+        let outcome = copy_to_clipboard(
+            self.clipboard.as_mut(),
+            self.config.clipboard_command.as_deref(),
+            text,
+        );
         self.copy_buffer = text.to_string();
         outcome
     }
 
     /// Status text for a clipboard copy outcome (shared by Ctrl+Y / Alt+Y).
     fn copy_status(outcome: CopyOutcome, chars: usize, what: &str) -> String {
-        match outcome {
-            CopyOutcome::Os | CopyOutcome::Both => {
-                format!("Copied {} ({} chars) to clipboard", what, chars)
-            }
-            CopyOutcome::Osc52 => format!(
-                "Copied {} ({} chars) via OSC52 — if paste is empty, set AllowSetSelection=true in mintty / enable set-clipboard in tmux",
-                what, chars
-            ),
-            CopyOutcome::Failed => format!(
-                "Copy failed ({} chars): no OS clipboard and OSC52 refused — use Mouse:OFF (Alt+M) + terminal selection",
-                chars
-            ),
+        Self::copy_status_for(outcome, chars, what, is_ssh_session())
+    }
+
+    fn copy_status_for(outcome: CopyOutcome, chars: usize, what: &str, ssh: bool) -> String {
+        if let Some(helper) = outcome.command.as_deref() {
+            return format!(
+                "Copied {} ({} chars) to clipboard via {}",
+                what, chars, helper
+            );
         }
+        // Over SSH the OS clipboard belongs to the remote host; OSC52 is the
+        // channel that can reach the user's terminal, so report OSC52 first
+        // over SSH (and whenever no OS clipboard succeeded locally).
+        if outcome.osc52 && (ssh || !outcome.os) {
+            let hint = if ssh {
+                "if paste is empty, Shift+drag to copy natively (mintty: AllowSetSelection)"
+            } else {
+                "if paste is empty, Shift+drag or enable OSC52 (mintty: AllowSetSelection; tmux: set-clipboard on)"
+            };
+            return format!("Copied {} ({} chars) via OSC52 — {}", what, chars, hint);
+        }
+        if outcome.os {
+            return format!("Copied {} ({} chars) to clipboard", what, chars);
+        }
+        format!(
+            "Copy failed ({} chars): no OS clipboard, helper or OSC52 — use Alt+M (Mouse:OFF) + terminal selection",
+            chars
+        )
     }
 
     /// Ctrl+Y: copy the last result set (no line numbers involved — the text
@@ -755,9 +1010,9 @@ impl App {
     /// Read the Linux primary selection (middle-click clipboard), falling back
     /// to the regular clipboard.
     #[cfg(target_os = "linux")]
-    fn read_primary_selection() -> Option<String> {
+    fn read_primary_selection(clipboard: Option<&mut arboard::Clipboard>) -> Option<String> {
         use arboard::{GetExtLinux, LinuxClipboardKind};
-        let mut cb = arboard::Clipboard::new().ok()?;
+        let cb = clipboard?;
         if let Ok(text) = cb.get().clipboard(LinuxClipboardKind::Primary).text() {
             if !text.is_empty() {
                 return Some(text);
@@ -767,13 +1022,8 @@ impl App {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn read_primary_selection() -> Option<String> {
-        arboard::Clipboard::new()
-            .ok()?
-            .get()
-            .text()
-            .ok()
-            .filter(|t| !t.is_empty())
+    fn read_primary_selection(clipboard: Option<&mut arboard::Clipboard>) -> Option<String> {
+        clipboard?.get().text().ok().filter(|t| !t.is_empty())
     }
 
     /// Whether `key` toggles mouse capture. Ctrl+M needs the Kitty CSI-u
@@ -805,9 +1055,10 @@ impl App {
     /// (OSC52 → local terminal) could never be pasted back, because
     /// arboard only sees the *remote* clipboard there.
     fn paste_from_clipboard(&mut self) {
-        let text = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut cb| cb.get().text().ok())
+        let text = self
+            .clipboard
+            .as_mut()
+            .and_then(|cb| cb.get().text().ok())
             .filter(|t| !t.is_empty())
             .or_else(|| {
                 if self.copy_buffer.is_empty() {
@@ -914,7 +1165,7 @@ impl App {
                     .contains(Position::new(mouse.column, mouse.row))
                 {
                     self.click_editor(mouse.column, mouse.row);
-                    if let Some(text) = Self::read_primary_selection() {
+                    if let Some(text) = Self::read_primary_selection(self.clipboard.as_mut()) {
                         self.paste_text(&text);
                     } else {
                         self.session_manager.active_session_mut().set_status(
@@ -1469,6 +1720,28 @@ impl App {
                 return;
             }
             _ => {}
+        }
+
+        // Typing a printable character (or a single-character paste) while a
+        // read-only pane has focus starts editing SQL instead of being
+        // silently dropped. Bare Enter/Tab are intentionally excluded so
+        // browsing Results/Sidebar never accidentally inserts newlines.
+        // Multi-key paste bursts are reassembled earlier in `handle_events`.
+        if mode == SessionMode::Query
+            && matches!(
+                self.active_window,
+                ActiveWindow::Results | ActiveWindow::Sidebar
+            )
+        {
+            if let (m, KeyCode::Char(c)) = (key.modifiers, key.code) {
+                if (m.is_empty() || m == KeyModifiers::SHIFT) && !c.is_control() {
+                    self.active_window = ActiveWindow::Editor;
+                    let session = self.session_manager.active_session_mut();
+                    session.delete_selection();
+                    session.editor.insert_char(c);
+                    return;
+                }
+            }
         }
 
         let session = self.session_manager.active_session_mut();
@@ -2924,6 +3197,196 @@ mod tests {
     }
 
     #[test]
+    fn key_burst_reassembles_into_pasted_text() {
+        // git-bash/mintty pastes arrive as plain key events; Enter/Tab must
+        // become text (not execute/cycle focus) and Shift still types caps.
+        let burst = vec![
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('s'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('e'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('l'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Enter)),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Tab)),
+            Event::Key(key(KeyModifiers::SHIFT, KeyCode::Char('X'))),
+        ];
+        assert_eq!(text_from_key_burst(&burst).as_deref(), Some("sel\n\tX"));
+    }
+
+    #[test]
+    fn paste_burst_while_results_focused_lands_in_editor() {
+        // Regression: in git-bash/mintty a paste is a key burst, and while
+        // the results table had focus every character was dropped. The burst
+        // must land in the editor, with tabs/newlines as text.
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.active_window = ActiveWindow::Results;
+        let burst = vec![
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('s'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('e'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('l'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Enter)),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Tab)),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('x'))),
+        ];
+        app.handle_events(burst);
+        assert_eq!(app.active_window, ActiveWindow::Editor);
+        assert_eq!(
+            app.session_manager.active_session().editor.text(),
+            "sel\n    x"
+        );
+    }
+
+    #[test]
+    fn single_key_while_results_focused_edits_sql() {
+        // A one-character paste (or plain typing) arrives as a lone key
+        // event; it must focus the editor and insert instead of vanishing.
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.active_window = ActiveWindow::Results;
+        app.handle_event(Event::Key(key(KeyModifiers::NONE, KeyCode::Char('x'))));
+        assert_eq!(app.active_window, ActiveWindow::Editor);
+        assert_eq!(app.session_manager.active_session().editor.text(), "x");
+    }
+
+    #[test]
+    fn bare_enter_while_results_focused_does_not_edit_sql() {
+        // Browsing Results and pressing Enter should stay in Results and must
+        // not silently insert a newline into the SQL editor.
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.active_window = ActiveWindow::Results;
+        app.handle_event(Event::Key(key(KeyModifiers::NONE, KeyCode::Enter)));
+        assert_eq!(app.active_window, ActiveWindow::Results);
+        assert_eq!(app.session_manager.active_session().editor.text(), "");
+    }
+
+    #[test]
+    fn command_confirm_prompt_is_not_treated_as_paste_target() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.command_mode = true;
+        assert!(app.paste_target_is_text());
+        app.command_confirm = Some("quit".into());
+        assert!(!app.paste_target_is_text());
+    }
+
+    #[test]
+    fn key_burst_rejects_shortcuts_and_non_text() {
+        // A real shortcut in the batch means it isn't a paste: handle the
+        // events one by one instead of swallowing them as text.
+        let shortcut = vec![
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('a'))),
+            Event::Key(key(KeyModifiers::CONTROL, KeyCode::Char('c'))),
+        ];
+        assert!(text_from_key_burst(&shortcut).is_none());
+
+        let cursor = vec![
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('a'))),
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Left)),
+        ];
+        assert!(text_from_key_burst(&cursor).is_none());
+
+        // Key releases (Kitty protocol) are not text.
+        let mut release = key(KeyModifiers::NONE, KeyCode::Char('a'));
+        release.kind = KeyEventKind::Release;
+        assert!(text_from_key_burst(&[Event::Key(release)]).is_none());
+
+        // Mouse events can be queued in the same drain.
+        let mixed = vec![
+            Event::Key(key(KeyModifiers::NONE, KeyCode::Char('a'))),
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        ];
+        assert!(text_from_key_burst(&mixed).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_helper_receives_text_and_reports_exit() {
+        // Exercises the external-helper path without touching a real clipboard.
+        assert!(run_clipboard_command(
+            "sh",
+            &["-c", "cat >/dev/null"],
+            "hello",
+            false,
+        ));
+        assert!(!run_clipboard_command(
+            "sh",
+            &["-c", "exit 3"],
+            "hello",
+            false,
+        ));
+        assert!(!run_clipboard_command(
+            "frog-no-such-clipboard-helper",
+            &[],
+            "hello",
+            false,
+        ));
+        // A hung built-in helper must time out and return false (so the next
+        // fallback can run) rather than hanging or falsely claiming success.
+        assert!(!run_clipboard_command(
+            "sh",
+            &["-c", "sleep 10"],
+            "hello",
+            false,
+        ));
+    }
+
+    #[test]
+    fn copy_status_names_the_backend_and_failure() {
+        let os = CopyOutcome {
+            os: true,
+            command: None,
+            osc52: false,
+        };
+        assert_eq!(
+            App::copy_status_for(os.clone(), 3, "table", false),
+            "Copied table (3 chars) to clipboard"
+        );
+
+        let helper = CopyOutcome {
+            os: false,
+            command: Some("clip.exe".into()),
+            osc52: false,
+        };
+        assert_eq!(
+            App::copy_status_for(helper, 3, "table", false),
+            "Copied table (3 chars) to clipboard via clip.exe"
+        );
+
+        let osc = CopyOutcome {
+            os: false,
+            command: None,
+            osc52: true,
+        };
+        let msg = App::copy_status_for(osc, 3, "table", false);
+        assert!(msg.starts_with("Copied table (3 chars) via OSC52"), "{msg}");
+        assert!(msg.contains("Shift"), "{msg}");
+
+        // Over SSH, OSC52 is reported even when a remote OS clipboard also succeeded.
+        let both = CopyOutcome {
+            os: true,
+            command: None,
+            osc52: true,
+        };
+        let ssh_msg = App::copy_status_for(both.clone(), 3, "table", true);
+        assert!(
+            ssh_msg.starts_with("Copied table (3 chars) via OSC52"),
+            "{ssh_msg}"
+        );
+        assert_eq!(
+            App::copy_status_for(both, 3, "table", false),
+            "Copied table (3 chars) to clipboard"
+        );
+
+        let failed = CopyOutcome::default();
+        assert!(App::copy_status_for(failed, 3, "table", false).starts_with("Copy failed"));
+    }
+
+    #[test]
     fn contextual_copy_dispatch_follows_focus() {
         use CopyTarget::*;
         // Editor: selection wins, else the statement at the cursor.
@@ -3053,6 +3516,7 @@ mod tests {
             autocommit: true,
             max_history: 1000,
             session_refresh_secs: 60,
+            clipboard_command: None,
             saved_connections: Vec::new(),
         };
         App::new(config, SessionManager::new()).expect("app")

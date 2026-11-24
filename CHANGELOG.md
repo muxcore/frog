@@ -2,6 +2,35 @@
 
 All notable changes to frog are documented here.
 
+## [Unreleased]
+
+### Added
+- Layered clipboard copy (drag-release, `Ctrl+C`, `Ctrl+Y`, `Alt+Y`):
+  arboard first, then an external helper when the OS clipboard is not
+  reachable — `win32yank.exe` / `clip.exe` on WSL/Windows, `wl-copy` /
+  `xclip` / `xsel` / `pbcopy` on desktops — and OSC52 for SSH. A custom
+  bridge can be plugged in with `FROG_CLIPBOARD_CMD` (env or `.env`) or
+  `defaults.clipboard_command` in `config.yml` (text on stdin). The
+  status line now names the backend that worked.
+- Clearer copy hint over SSH: when only OSC52 was available, point at
+  Shift+drag (the terminal's own copy-on-select) and at mintty's
+  `AllowSetSelection` / Git Bash's `ssh` (Windows `ssh.exe` blocks OSC52).
+
+### Fixed
+- The OS clipboard handle is now created once and kept for the whole
+  session. On X11/Wayland the clipboard content is served by a background
+  thread owned by that handle, so creating it, setting the text and
+  dropping it immediately could leave the clipboard empty (unless a
+  clipboard manager grabbed the text first). Pasting and middle-click
+  reads reuse the same handle instead of reconnecting.
+- Pasting into the result table over git-bash/mintty (or any terminal or
+  proxy that doesn't emit bracketed paste): a paste arrives as a burst of
+  key events, and those were handled one by one, so text was silently
+  dropped while the table/sidebar had focus, pasted tabs cycled focus and
+  pasted newlines could run a statement. Bursts are now reassembled into a
+  single paste, and typing or pasting while a read-only pane is focused
+  moves focus to the SQL editor.
+
 ## [0.8.1] - 2026-11-22
 
 ### Fixed

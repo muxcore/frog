@@ -47,6 +47,7 @@ descriptor belongs to its backend (switching backend drops its host/port).\n\
   Other:\n\
     FROG_CONFIG=~/.config/frog/prod.yml  FROG_MAX_ROWS=10000  FROG_NO_AUTOCOMMIT=true\n\
     FROG_SESSION_REFRESH_SECS=60 (F2 auto-refresh, seconds; 0 = manual only)\n\
+    FROG_CLIPBOARD_CMD='clip.exe' (custom copy helper; auto-detected on WSL/Windows)\n\
 \n\
   A .env file in the startup directory is read as a fallback for all of the above.\n"
 )]
@@ -134,6 +135,9 @@ pub struct DefaultsConfig {
     /// Accepts `session_refresh` as a YAML alias for convenience.
     #[serde(default, alias = "session_refresh")]
     pub session_refresh_secs: Option<u64>,
+    /// Custom clipboard copy helper (reads text on stdin), e.g. `clip.exe`.
+    #[serde(default)]
+    pub clipboard_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,7 @@ pub struct Config {
     pub autocommit: bool,
     pub max_history: usize,
     pub session_refresh_secs: u64,
+    pub clipboard_command: Option<String>,
     pub saved_connections: Vec<ConnectionEntry>,
 }
 
@@ -271,6 +276,19 @@ impl Config {
             })
             .unwrap_or(60);
 
+        // Custom clipboard copy helper (reads text on stdin).
+        // Precedence: FROG_CLIPBOARD_CMD env > .env > config.yml defaults.clipboard_command.
+        let clipboard_command = env_get("FROG_CLIPBOARD_CMD")
+            .or_else(|| dotenv_map.get("FROG_CLIPBOARD_CMD").cloned())
+            .or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.defaults.as_ref())
+                    .and_then(|d| d.clipboard_command.clone())
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let mut saved_connections = config_file
             .as_ref()
             .and_then(|c| c.connections.clone())
@@ -284,6 +302,7 @@ impl Config {
             autocommit,
             max_history,
             session_refresh_secs,
+            clipboard_command,
             saved_connections,
         }
     }
