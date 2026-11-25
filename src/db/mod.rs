@@ -1,6 +1,8 @@
 pub mod completion;
 pub mod connection;
+pub mod ddl;
 pub mod metadata;
+pub mod perf;
 pub mod postgres;
 pub mod session_manager;
 pub mod sql_scan;

@@ -2,7 +2,64 @@
 
 All notable changes to frog are documented here.
 
-## [Unreleased]
+## [0.9.0] - 2026-11-24
+
+### Added
+- **Toad-style `F4` Object Describe / DDL viewer**: press `F4` with the cursor
+  on any object name in the SQL editor (table, index, view, materialized view,
+  sequence, package, procedure, function, trigger, type, or synonym) — or on
+  any object in the `F12` DB explorer — to inspect its resolved metadata and
+  full DDL script in a syntax-highlighted viewer.
+  - Context-aware SQL target extraction: resolves `schema.object`, aliases and
+    `alias.column` / `table.column` references back to their base relation,
+    Oracle optimizer hints (`/*+ INDEX(e idx_name) */`), `package.member`
+    calls, private/`PUBLIC` synonyms (emitting both the `CREATE SYNONYM` and
+    underlying object DDL), and `search_path` objects on Postgres.
+  - Rich Toad-grade table & object DDL on both Oracle and Postgres: column-aligned
+    `CREATE TABLE` with exact lengths/precision/scale, `DEFAULT` / `IDENTITY`
+    clauses, `PRIMARY KEY` / `UNIQUE` / `FOREIGN KEY` / `CHECK` constraints,
+    partition keys, secondary/bitmap/function-based `CREATE INDEX` statements,
+    table/column `COMMENT`s, full `PACKAGE` + `PACKAGE BODY` source, and all
+    overloads for Postgres routines.
+  - Actions inside `F4`: `Ctrl+C` / `Ctrl+Y` / `c` copies the DDL, `Enter` /
+    `i` loads it into the SQL editor, `n` opens it in a new session tab, `r`
+    reloads from the catalog, `Alt+M` (`Mouse:OFF`) hides borders and line
+    numbers for clean terminal drag-copy, and `F4` / `Esc` returns to your
+    prior view (`Query` or `F12` Explorer).
+- **`F6` Performance & DBA Dashboard (`btop` + Toad style)**: dedicated
+  database health and diagnostics view with lightweight terminal graphics for
+  both Oracle and Postgres:
+  - Top 4-card live telemetry strip with rolling `Sparkline`s (`▁▂▃▅▇`),
+    sub-character smooth Unicode fractional bars (`█████▋░░`), active/total
+    session load, blocking lock alerts, proportional multi-color CPU/Wait
+    Class stacked bars, and SGA+PGA / Buffer Cache Hit gauges.
+  - 10 curated DBA diagnostic queries per backend: blocking & waiting locks,
+    top CPU consuming sessions, top SQL by CPU/elapsed time (`v$sql` /
+    `pg_stat_statements` with automatic live-activity fallback), memory
+    overview (SGA/PGA & `pg_settings`/buffer cache), top PGA memory sessions /
+    idle-in-transaction sessions, wait event bottlenecks, long operations /
+    storage & tablespace usage (with `USER_*` privilege fallback), I/O heavy
+    SQL / sequential scan analysis, and active transactions / dead-tuple
+    autovacuum health.
+  - Inline high-resolution Unicode bar graphics inside percentage and resource
+    metric cells (`SHARE_PCT`, `USED_PCT`, `CACHE_HIT_PCT`, `CPU_SEC`,
+    `PGA_MB`, `WAIT_SECS`, …).
+  - Controls inside `F6`: `1`–`0` or `↑`/`↓` picks a query (rapid cursor moves
+    skip superseded DB executions), `Enter`/`r` runs, `R`/`F5` refreshes
+    telemetry + query, `a` toggles 5-second live `btop` auto-refresh, `v`
+    toggles the underlying diagnostic SQL preview, `s`/`i` sends the SQL to
+    the editor, `n` opens it in a new session tab, `Tab` switches panes, and
+    `Ctrl+Z`/`F11` zooms the focused pane.
+- **Emacs-style incremental search (`Ctrl+S`)**: I-search in the current
+  view — SQL editor, result table, `F12` explorer (tree + detail
+  preview/DDL), `F2` sessions (list/SQL/plan), `F4` DDL, `F6` perf
+  (queries/results/SQL), history and help. Type to jump live,
+  `Ctrl+S` / `Ctrl+R` steps next/previous (with wrap notice), `Enter` /
+  `Esc` keeps the match, `Ctrl+G` aborts back to the pre-search cursor.
+  Smart-case (all-lowercase queries match case-insensitively), editor
+  substring and result-cell highlighting, paste lands in the query.
+
+## [0.8.2] - 2026-11-23
 
 ### Added
 - Layered clipboard copy (drag-release, `Ctrl+C`, `Ctrl+Y`, `Alt+Y`):

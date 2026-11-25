@@ -12,6 +12,8 @@ Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust
 - **Multi-session tabs** — tmux-style windows with hover-to-focus and per-tab connections.
 - **Embedded SQL editor** — real cursor movement, line numbers, statement-at-cursor highlighting, vertical scroll.
 - **Toad-style completion** — `Ctrl+Space` popup resolves aliases (`e.` → columns), schemas (`sc.` → tables/views), and tables; catalog metadata is cached and loaded in the background so typing never waits on the database.
+- **Toad-style Object DDL (`F4`)** — press `F4` on any object under the cursor in the SQL editor (tables, indexes, views, matviews, packages, procedures, functions, sequences, triggers, synonyms — even `alias.column` or index names inside `/*+ INDEX(...) */` hints!) or in `F12` Explorer to inspect its full syntax-highlighted DDL (`Ctrl+C`/`Y` copies, `Enter`/`i` loads into editor, `n` opens in a new tab).
+- **Performance & DBA Dashboard (`F6`)** — `btop`-inspired live health gauges, rolling activity sparklines, CPU/wait-class stacked bars, and 10 curated DBA diagnostic queries for Oracle & Postgres (blocking locks, top CPU sessions, top SQL, SGA/PGA & buffer cache memory, wait bottlenecks, tablespaces/storage, transactions/autovacuum) with inline `█████▋░░` cell graphics and one-key `s` to edit any diagnostic query in the SQL editor.
 - **Result viewer** — pretty-printed tables (Table / Markdown / ASCII), 2D scrolling, clipboard copy, pagination.
 - **(experimental)sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
@@ -202,11 +204,14 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
 | `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
 | `Ctrl+Space` | SQL completion popup (`Ctrl+.` also accepted). `↑`/`↓`/`PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` close |
+| `Ctrl+S` | Emacs-style incremental search in the current view (Editor, Results, Explorer, F2 List/SQL/Plan, DDL, Perf, History, Help). Type to find, `Ctrl+S` next, `Ctrl+R` prev, `Enter`/`Esc` done, `Ctrl+G` cancel. Smart-case (lowercase = case-insensitive) |
 | `Ctrl+F` | Fetch next page of results (next page also auto-loads when scrolling near the end) |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left/Right` | Switch session tabs |
 | `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+↑`/`↓` = grow/shrink focused pane, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL/plan) / History |
-| `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), paged preview in result style (`Ctrl+D` switches format; scroll to the end or `Ctrl+F` for the next 20 rows), DDL/source. `Tab` switches focus Objects/Detail, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, `↑`/`↓`/`PgUp`/`PgDn` and `←`/`→` scroll the detail pane, wheel scrolls (Shift+wheel or horizontal wheel scrolls columns) |
+| `F4` | Toad-style Object Describe / DDL under cursor (table, index, view, mview, sequence, package, routine, trigger, synonym; also works in `F12`). `Ctrl+C`/`Ctrl+Y`/`c` copies DDL, `Enter`/`i` loads into SQL editor, `n` opens in a new tab, `r` reloads, `F4`/`Esc` closes |
+| `F6` | Performance & DBA dashboard — live `btop`-style telemetry cards (active/total sessions + sparkline, blocking locks, CPU/wait stacked bar, SGA+PGA / cache hit) + 10 curated DBA queries with inline `████░░` bars. `1`–`0`/`↑`/`↓` pick query, `Enter`/`r` run, `R`/`F5` refresh all, `a` toggle 5s live auto-refresh, `v` show/hide SQL, `s`/`i` load SQL into editor, `n` open SQL in new tab, `Tab` cycle pane, `Ctrl+Z`/`F11` zoom |
+| `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), paged preview in result style (`Ctrl+D` switches format; scroll to the end or `Ctrl+F` for the next 20 rows), DDL/source (`F4` opens full DDL script). `Tab` switches focus Objects/Detail, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, `↑`/`↓`/`PgUp`/`PgDn` and `←`/`→` scroll the detail pane, wheel scrolls (Shift+wheel or horizontal wheel scrolls columns) |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` / `Alt+M` | Toggle mouse capture (tmux-style copy/paste mode) |
 | Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |

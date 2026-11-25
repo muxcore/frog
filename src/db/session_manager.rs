@@ -3,11 +3,13 @@ use crate::db::completion::{self, Clause, CompletionContext, CompletionPopup};
 use crate::db::connection::{
     ColumnInfo, DbConnection, DbSessionInfo, DbType, OracleConnection, QueryRow, TableRef,
 };
+use crate::db::ddl::{self, DdlTarget, DescribedObject};
 use crate::db::metadata::{self, MetaKind, MetaMsg, MetaRequest, MetadataStore};
+use crate::db::perf::{self, PerfHistory, PerfSnapshot};
 use crate::db::postgres::{pg_quote_ident, PgConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -686,6 +688,48 @@ pub struct Session {
     pub metadata: MetadataStore,
     /// Open completion popup, if any.
     pub completion: Option<CompletionPopup>,
+    /// F4 Toad-style Object Describe / DDL target currently requested.
+    pub ddl_target: Option<DdlTarget>,
+    /// F4 resolved object + generated DDL script.
+    pub ddl_object: Option<DescribedObject>,
+    /// True while a background worker is resolving/generating F4 DDL.
+    pub ddl_loading: bool,
+    /// Last F4 lookup/DDL error.
+    pub ddl_error: Option<String>,
+    /// Vertical line scroll in the F4 DDL viewer.
+    pub ddl_scroll: usize,
+    /// Horizontal column scroll in the F4 DDL viewer.
+    pub ddl_hscroll: usize,
+    /// Mode to return to when closing F4 (`Query` or `DbExplorer`).
+    pub ddl_return_mode: SessionMode,
+    /// Monotonic request id for F4 DDL loads (stale responses dropped).
+    pub ddl_req_seq: u64,
+    /// F6 Performance dashboard: selected DBA query index.
+    pub perf_cursor: usize,
+    /// Vertical scroll in the F6 result table.
+    pub perf_scroll: usize,
+    /// Horizontal column scroll in the F6 result table.
+    pub perf_col_scroll: usize,
+    /// Vertical scroll in the F6 SQL query preview box.
+    pub perf_sql_scroll: usize,
+    /// Whether the underlying DBA SQL text pane is visible in F6 (`v` toggles).
+    pub perf_show_sql: bool,
+    /// Live 5-second `btop`-style auto-refresh in F6 (`a` toggles).
+    pub perf_auto_refresh: bool,
+    /// When the F6 telemetry/query was last refreshed.
+    pub perf_last_refresh: Option<std::time::Instant>,
+    /// Latest F6 top-bar health snapshot.
+    pub perf_snapshot: Option<PerfSnapshot>,
+    /// Error from the latest F6 snapshot attempt, if any.
+    pub perf_snapshot_error: Option<String>,
+    /// Rolling time-series history for F6 sparklines.
+    pub perf_history: PerfHistory,
+    /// Cached F6 query results keyed by query index.
+    pub perf_results: HashMap<usize, QueryRow>,
+    /// True while an F6 background refresh/query is running.
+    pub perf_loading: bool,
+    /// Shared latest request sequence so superseded rapid F6 cursor moves skip DB work.
+    pub perf_latest_seq: Arc<AtomicU64>,
 }
 
 /// One schema/user node in the F12 explorer tree.
@@ -1160,6 +1204,8 @@ pub enum SessionMode {
     Help,
     History,
     DbExplorer,
+    ObjectDdl,
+    Performance,
     ConnectionPickerDialog,
 }
 
@@ -1327,8 +1373,47 @@ impl Session {
             explorer_error: None,
             metadata: MetadataStore::default(),
             completion: None,
+            ddl_target: None,
+            ddl_object: None,
+            ddl_loading: false,
+            ddl_error: None,
+            ddl_scroll: 0,
+            ddl_hscroll: 0,
+            ddl_return_mode: SessionMode::Query,
+            ddl_req_seq: 0,
+            perf_cursor: 0,
+            perf_scroll: 0,
+            perf_col_scroll: 0,
+            perf_sql_scroll: 0,
+            perf_show_sql: false,
+            perf_auto_refresh: false,
+            perf_last_refresh: None,
+            perf_snapshot: None,
+            perf_snapshot_error: None,
+            perf_history: PerfHistory::default(),
+            perf_results: HashMap::new(),
+            perf_loading: false,
+            perf_latest_seq: Arc::new(AtomicU64::new(0)),
         }
     }
+}
+
+/// Background F4 Object Describe / DDL result.
+#[derive(Debug)]
+pub struct DdlMsg {
+    pub sid: usize,
+    pub req: u64,
+    pub result: Result<DescribedObject, String>,
+}
+
+/// Background F6 Performance snapshot + DBA query result.
+#[derive(Debug)]
+pub struct PerfMsg {
+    pub sid: usize,
+    pub req: u64,
+    pub query_idx: usize,
+    pub snapshot: Option<Result<PerfSnapshot, String>>,
+    pub query_result: Option<QueryRow>,
 }
 
 /// `(session_id, job_seq, result_row, is_final_for_job)`
@@ -1348,6 +1433,10 @@ pub struct SessionManager {
     explorer_tx: Sender<ExplorerMsg>,
     meta_rx: Receiver<MetaMsg>,
     meta_tx: Sender<MetaMsg>,
+    ddl_rx: Receiver<DdlMsg>,
+    ddl_tx: Sender<DdlMsg>,
+    perf_rx: Receiver<PerfMsg>,
+    perf_tx: Sender<PerfMsg>,
     conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
     /// Maximum number of query-history entries kept per session.
     pub max_history: usize,
@@ -1427,11 +1516,12 @@ fn explorer_row_label(sess: &Session, row: &ExplorerRow) -> String {
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn new() -> Self {        let (tx, rx) = mpsc::channel();
         let (ctx, crx) = mpsc::channel();
         let (etx, erx) = mpsc::channel();
         let (mtx, mrx) = mpsc::channel();
+        let (dtx, drx) = mpsc::channel();
+        let (ptx, prx) = mpsc::channel();
         let sessions = vec![Session::new(1)];
         Self {
             sessions,
@@ -1445,6 +1535,10 @@ impl SessionManager {
             explorer_tx: etx,
             meta_rx: mrx,
             meta_tx: mtx,
+            ddl_rx: drx,
+            ddl_tx: dtx,
+            perf_rx: prx,
+            perf_tx: ptx,
             conn_map: Arc::new(Mutex::new(HashMap::new())),
             max_history: 1000,
             max_results_per_session: 200,
@@ -1916,7 +2010,11 @@ impl SessionManager {
     pub fn cancel_query(&mut self) {
         let id = self.sessions[self.active_idx].id;
 
-        if !self.sessions[self.active_idx].pending_query && !self.sessions[self.active_idx].paging {
+        if !self.sessions[self.active_idx].pending_query
+            && !self.sessions[self.active_idx].paging
+            && !self.sessions[self.active_idx].ddl_loading
+            && !self.sessions[self.active_idx].perf_loading
+        {
             return;
         }
 
@@ -1990,12 +2088,22 @@ impl SessionManager {
                     sess.is_connected = true;
                     sess.connect_error = None;
                     sess.name = name;
-                    // Fresh connection: drop any metadata/explorer state from a previous one.
+                    // Fresh connection: drop any metadata/explorer/perf state from a previous one.
                     sess.metadata = MetadataStore::default();
                     sess.metadata.set_dialect(dialect);
                     sess.completion = None;
                     sess.explorer_loaded = false;
                     sess.explorer_schemas.clear();
+                    sess.ddl_object = None;
+                    sess.ddl_error = None;
+                    sess.ddl_loading = false;
+                    sess.perf_cursor = 0;
+                    sess.perf_results.clear();
+                    sess.perf_snapshot = None;
+                    sess.perf_snapshot_error = None;
+                    sess.perf_history = PerfHistory::default();
+                    sess.perf_loading = false;
+                    sess.perf_last_refresh = None;
                     self.request_bootstrap(idx);
                 }
                 Err(err) => {
@@ -3310,9 +3418,14 @@ impl SessionManager {
         sess.explorer_cursor = sess.explorer_cursor.min(len - 1);
     }
 
+    /// Search label for one explorer row (same text as the filter uses).
+    pub fn explorer_row_search_label(&self, row: &ExplorerRow) -> String {
+        let sess = &self.sessions[self.active_idx];
+        explorer_row_label(sess, row)
+    }
+
     /// Move the highlight; auto-scrolls handled at render time.
-    pub fn move_explorer_cursor(&mut self, delta: isize) {
-        let len = self.explorer_visible_rows().len() as isize;
+    pub fn move_explorer_cursor(&mut self, delta: isize) {        let len = self.explorer_visible_rows().len() as isize;
         if len == 0 {
             return;
         }
@@ -3955,6 +4068,390 @@ impl SessionManager {
         let id = self.sessions[self.active_idx].id;
         let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
         map.get(&id).cloned()
+    }
+
+    // ---------------- F4 Toad-style Object Describe / DDL ----------------
+
+    /// Open the F4 DDL viewer for the identifier under the SQL editor cursor
+    /// (or active single-identifier selection). Returns true when opened.
+    pub fn open_ddl_at_cursor(&mut self) -> bool {
+        let idx = self.active_idx;
+        let dialect = self.active_db_type();
+        let target_opt = {
+            let sess = &self.sessions[idx];
+            let text = sess.editor.text();
+            let off = sess.editor.cursor_char_offset();
+            let sel = sess.selected_text();
+            ddl::extract_ddl_target(&text, off, sel.as_deref(), dialect)
+        };
+        let Some(target) = target_opt else {
+            self.sessions[idx].set_status(
+                "Put the cursor on an object name (table, index, view, package, …) and press F4",
+            );
+            return false;
+        };
+        if !self.sessions[idx].is_connected {
+            self.sessions[idx].set_status("Not connected — press Ctrl+O to connect first");
+            return false;
+        }
+        self.start_ddl_load(target, SessionMode::Query);
+        true
+    }
+
+    /// Open the F4 DDL viewer for the object highlighted in the F12 DB explorer.
+    pub fn open_ddl_from_explorer(&mut self) -> bool {
+        let Some((sidx, gidx, tidx)) = self.cursor_object_idx() else {
+            self.sessions[self.active_idx]
+                .set_status("Select an object (table, index, view, routine, …) first");
+            return false;
+        };
+        let (schema, name, kind) = {
+            let sess = &self.sessions[self.active_idx];
+            let Some(s) = sess.explorer_schemas.get(sidx) else {
+                return false;
+            };
+            let Some(obj) = self.object_ref(sidx, gidx, tidx) else {
+                return false;
+            };
+            (s.name.clone(), obj.name.clone(), obj.kind.clone())
+        };
+        let target = DdlTarget {
+            schema: Some(schema),
+            schema_quoted: true,
+            name,
+            name_quoted: true,
+            kind_hint: Some(kind),
+        };
+        self.start_ddl_load(target, SessionMode::DbExplorer);
+        true
+    }
+
+    /// Reload the currently open F4 DDL target from the database.
+    pub fn reload_ddl(&mut self) {
+        let idx = self.active_idx;
+        let Some(target) = self.sessions[idx].ddl_target.clone() else {
+            return;
+        };
+        let ret = self.sessions[idx].ddl_return_mode.clone();
+        self.start_ddl_load(target, ret);
+    }
+
+    fn start_ddl_load(&mut self, target: DdlTarget, return_mode: SessionMode) {
+        let idx = self.active_idx;
+        let conn = self.active_connection();
+        let (sid, req, exec_lock) = {
+            let sess = &mut self.sessions[idx];
+            sess.ddl_req_seq = sess.ddl_req_seq.wrapping_add(1);
+            sess.ddl_target = Some(target.clone());
+            sess.ddl_object = None;
+            sess.ddl_error = None;
+            sess.ddl_loading = true;
+            sess.ddl_scroll = 0;
+            sess.ddl_hscroll = 0;
+            if sess.mode != SessionMode::ObjectDdl {
+                sess.ddl_return_mode = return_mode;
+            }
+            sess.mode = SessionMode::ObjectDdl;
+            (sess.id, sess.ddl_req_seq, sess.exec_lock.clone())
+        };
+        let tx = self.ddl_tx.clone();
+        thread::spawn(move || {
+            let result = match conn {
+                Some(c) => {
+                    let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    c.describe_object(&target)
+                        .map_err(|e| explorer_error_hint(&format!("{:#}", e)))
+                }
+                None => Err("Not connected. Use Ctrl+O to connect.".into()),
+            };
+            let _ = tx.send(DdlMsg { sid, req, result });
+        });
+    }
+
+    /// Drain finished F4 DDL lookups onto their sessions.
+    pub fn poll_ddl(&mut self) {
+        while let Ok(msg) = self.ddl_rx.try_recv() {
+            let Some(sess) = self.sessions.iter_mut().find(|s| s.id == msg.sid) else {
+                continue;
+            };
+            if sess.ddl_req_seq != msg.req {
+                continue;
+            }
+            sess.ddl_loading = false;
+            match msg.result {
+                Ok(obj) => {
+                    sess.ddl_object = Some(obj);
+                    sess.ddl_error = None;
+                }
+                Err(err) => {
+                    if Self::is_cancelled_msg(&err) {
+                        sess.ddl_error = Some("DDL lookup cancelled.".into());
+                    } else {
+                        sess.ddl_error = Some(err);
+                    }
+                    sess.ddl_object = None;
+                }
+            }
+        }
+    }
+
+    // ---------------- F6 Performance & DBA Dashboard ----------------
+
+    /// Auto-refresh cadence when live `a` mode is enabled in F6.
+    pub const PERF_AUTO_REFRESH_SECS: u64 = 5;
+
+    /// Enter the F6 Performance dashboard and kick off an initial snapshot +
+    /// query run if connected.
+    pub fn enter_performance(&mut self) {
+        let idx = self.active_idx;
+        let query_count = perf::perf_queries_for(self.active_db_type()).len();
+        {
+            let sess = &mut self.sessions[idx];
+            sess.mode = SessionMode::Performance;
+            if query_count > 0 && sess.perf_cursor >= query_count {
+                sess.perf_cursor = 0;
+            }
+            sess.perf_scroll = 0;
+            sess.perf_col_scroll = 0;
+            sess.perf_sql_scroll = 0;
+        }
+        if self.sessions[idx].is_connected {
+            self.refresh_performance(true);
+        }
+    }
+
+    /// Move the F6 DBA query selection by `delta` and load/run the query if not
+    /// already cached (rapid moves supersede earlier queued requests).
+    pub fn move_perf_cursor(&mut self, delta: isize) {
+        let count = perf::perf_queries_for(self.active_db_type()).len();
+        if count == 0 {
+            return;
+        }
+        let idx = self.active_idx;
+        let cur = self.sessions[idx].perf_cursor as isize;
+        let next = cur.saturating_add(delta).clamp(0, count as isize - 1) as usize;
+        self.select_perf_query(next, false);
+    }
+
+    /// Jump directly to DBA query `query_idx`. When `force_run` is true (e.g.
+    /// `1`..`0` keys or `Enter`), always re-executes against the DB; otherwise
+    /// reuses a cached result if present.
+    pub fn select_perf_query(&mut self, query_idx: usize, force_run: bool) {
+        let count = perf::perf_queries_for(self.active_db_type()).len();
+        if count == 0 {
+            return;
+        }
+        let clamped = query_idx.min(count - 1);
+        let idx = self.active_idx;
+        let changed = self.sessions[idx].perf_cursor != clamped;
+        {
+            let sess = &mut self.sessions[idx];
+            sess.perf_cursor = clamped;
+            if changed {
+                sess.perf_scroll = 0;
+                sess.perf_col_scroll = 0;
+                sess.perf_sql_scroll = 0;
+            }
+        }
+        let cached = self.sessions[idx].perf_results.contains_key(&clamped);
+        if force_run || !cached {
+            self.refresh_performance(false);
+        }
+    }
+
+    /// Toggle 5-second live `btop`-style auto-refresh (`a` in F6).
+    pub fn toggle_perf_auto_refresh(&mut self) {
+        let idx = self.active_idx;
+        let on = {
+            let sess = &mut self.sessions[idx];
+            sess.perf_auto_refresh = !sess.perf_auto_refresh;
+            let msg = if sess.perf_auto_refresh {
+                format!(
+                    "Performance live auto-refresh ON (every {}s — press a to pause)",
+                    Self::PERF_AUTO_REFRESH_SECS
+                )
+            } else {
+                "Performance live auto-refresh OFF (press R/Enter to refresh)".to_string()
+            };
+            sess.set_status(msg);
+            sess.perf_auto_refresh
+        };
+        if on {
+            self.refresh_performance(true);
+        }
+    }
+
+    /// Periodic tick called from the main TUI loop: runs an auto-refresh when
+    /// F6 is open, `perf_auto_refresh` is enabled, and the connection is idle.
+    pub fn tick_perf(&mut self) {
+        let idx = self.active_idx;
+        let sess = &self.sessions[idx];
+        if sess.mode != SessionMode::Performance
+            || !sess.perf_auto_refresh
+            || !sess.is_connected
+            || sess.perf_loading
+            || sess.pending_query
+            || sess.paging
+        {
+            return;
+        }
+        let due = match sess.perf_last_refresh {
+            None => true,
+            Some(since) => {
+                since.elapsed() >= std::time::Duration::from_secs(Self::PERF_AUTO_REFRESH_SECS)
+            }
+        };
+        if due {
+            self.refresh_performance(true);
+        }
+    }
+
+    /// SQL text of the currently highlighted F6 DBA query.
+    pub fn active_perf_query_sql(&self) -> Option<String> {
+        let specs = perf::perf_queries_for(self.active_db_type());
+        let cursor = self.sessions[self.active_idx].perf_cursor;
+        specs.get(cursor).map(|q| format!("{};", q.sql.trim_end_matches(';')))
+    }
+
+    /// Spawn a background worker to run the selected F6 DBA query and
+    /// optionally refresh the top health snapshot.
+    pub fn refresh_performance(&mut self, include_snapshot: bool) {
+        let idx = self.active_idx;
+        let db_type = self.active_db_type();
+        let specs = perf::perf_queries_for(db_type);
+        if specs.is_empty() {
+            return;
+        }
+        let query_idx = self.sessions[idx].perf_cursor.min(specs.len() - 1);
+        let spec = specs[query_idx];
+        let conn = self.active_connection();
+
+        let (sid, req, latest_seq, exec_lock) = {
+            let sess = &mut self.sessions[idx];
+            let next_req = sess.perf_latest_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            sess.perf_loading = true;
+            sess.perf_last_refresh = Some(std::time::Instant::now());
+            (
+                sess.id,
+                next_req,
+                sess.perf_latest_seq.clone(),
+                sess.exec_lock.clone(),
+            )
+        };
+        let tx = self.perf_tx.clone();
+
+        thread::spawn(move || {
+            let Some(c) = conn else {
+                let _ = tx.send(PerfMsg {
+                    sid,
+                    req,
+                    query_idx,
+                    snapshot: include_snapshot
+                        .then(|| Err("Not connected. Use Ctrl+O to connect.".into())),
+                    query_result: Some(QueryRow::error(
+                        "Not connected. Use Ctrl+O to connect.".into(),
+                        0,
+                        0,
+                        200,
+                    )),
+                });
+                return;
+            };
+
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            // If the user already navigated to another query while we waited on
+            // `exec_lock`, skip running the superseded query on the database.
+            if latest_seq.load(Ordering::SeqCst) != req {
+                return;
+            }
+
+            let snapshot = if include_snapshot {
+                Some(c.collect_perf_snapshot().map_err(|e| format!("{:#}", e)))
+            } else {
+                None
+            };
+
+            let mut qr = c.execute_query(spec.sql, 200);
+            if qr.is_error {
+                let err_txt = qr.error_msg.as_deref().unwrap_or("");
+                let missing_obj_or_priv = err_txt.contains("ORA-00942")
+                    || err_txt.contains("ORA-01031")
+                    || err_txt.contains("42P01")
+                    || err_txt.contains("42501")
+                    || err_txt.to_ascii_lowercase().contains("does not exist")
+                    || err_txt.to_ascii_lowercase().contains("permission denied");
+                if missing_obj_or_priv {
+                    if let Some(fb) = spec.fallback_sql {
+                        qr = c.execute_query(fb, 200);
+                    }
+                }
+                if qr.is_error && c.db_type() == DbType::Oracle {
+                    if let Some(msg) = qr.error_msg.take() {
+                        qr.error_msg = Some(perf_oracle_error_hint(&msg));
+                    }
+                }
+            }
+
+            let _ = tx.send(PerfMsg {
+                sid,
+                req,
+                query_idx,
+                snapshot,
+                query_result: Some(qr),
+            });
+        });
+    }
+
+    /// Drain finished F6 snapshot + DBA query results.
+    pub fn poll_perf(&mut self) {
+        while let Ok(msg) = self.perf_rx.try_recv() {
+            let Some(sess) = self.sessions.iter_mut().find(|s| s.id == msg.sid) else {
+                continue;
+            };
+            let current_latest = sess.perf_latest_seq.load(Ordering::SeqCst);
+            if msg.req == current_latest {
+                sess.perf_loading = false;
+            }
+            if let Some(snap_res) = msg.snapshot {
+                match snap_res {
+                    Ok(snap) => {
+                        sess.perf_history.record(&snap);
+                        sess.perf_snapshot = Some(snap);
+                        sess.perf_snapshot_error = None;
+                    }
+                    Err(err) => {
+                        if !Self::is_cancelled_msg(&err) {
+                            sess.perf_snapshot_error = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(qr) = msg.query_result {
+                let cancelled = qr.is_error
+                    && qr
+                        .error_msg
+                        .as_deref()
+                        .is_some_and(Self::is_cancelled_msg);
+                if cancelled {
+                    sess.set_status("Performance query cancelled");
+                } else {
+                    sess.perf_results.insert(msg.query_idx, qr);
+                }
+            }
+        }
+    }
+}
+
+fn perf_oracle_error_hint(msg: &str) -> String {
+    if msg.contains("ORA-00942") || msg.contains("ORA-01031") {
+        format!(
+            "{}\n\nHint: Performance queries read V$ dynamic views (V$SESSION, V$SQL, \
+             V$SESSTAT, V$PROCESS, V$SGAINFO). Ask your DBA for:\n  \
+             GRANT SELECT_CATALOG_ROLE TO <your_user>;",
+            msg
+        )
+    } else {
+        msg.to_string()
     }
 }
 

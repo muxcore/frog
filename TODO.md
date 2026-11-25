@@ -38,11 +38,14 @@ Requires Oracle Instant Client (`libclntsh.so`) — install via AUR `oracle-inst
 | `Ctrl+F` | Fetch next page of results (also auto-loads when scrolling near the end) |
 | `Ctrl+O` | Connection dialog |
 | `Ctrl+Space` | SQL completion popup (`Ctrl+.` fallback): alias → columns, schema → objects, table → columns. `↑`/`↓`/`PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` close |
+| `Ctrl+S` | Emacs-style incremental search in the current view (type to find, `Ctrl+S` next, `Ctrl+R` prev, `Enter`/`Esc` done, `Ctrl+G` cancel) |
 | `Ctrl+C` / `Esc` | Cancel running query |
 | `Ctrl+T` / `Ctrl+W` | New / close session tab |
 | `Ctrl+Left` / `Ctrl+Right` | Switch session tabs |
 | `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain, `r` = reload SQL, `R`/`F5` = refresh, `a` = ACTIVE filter, `s`/`S` = sort col / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+Up`/`Down` = grow/shrink focused pane, `Ctrl+Up`/`Down` = SQL size, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` = scroll focused SQL/plan) / History |
-| `F12` | DB explorer (schema → type folders → objects, paged preview/DDL). `Tab` switches Objects/Detail focus, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, arrows/PgUp/PgDn scroll the detail (next page auto-loads near the end, or `Ctrl+F`); wheel scrolls, Shift+wheel/horizontal wheel scrolls columns |
+| `F4` | Toad-style Object Describe / DDL under cursor (`Ctrl+C`/`Y` copy, `Enter`/`i` → editor, `n` → new tab, `r` reload, `F4`/`Esc` close) |
+| `F6` | Performance & DBA dashboard (gauges/sparklines + 10 DBA queries: locks, CPU, top SQL, memory, waits, storage; `1`–`0` pick, `a` 5s auto-refresh, `v` SQL preview, `s` → editor, `n` → new tab) |
+| `F12` | DB explorer (schema → type folders → objects, paged preview/DDL, `F4` full DDL). `Tab` switches Objects/Detail focus, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, arrows/PgUp/PgDn scroll the detail (next page auto-loads near the end, or `Ctrl+F`); wheel scrolls, Shift+wheel/horizontal wheel scrolls columns |
 | `Ctrl+M` | Toggle mouse capture |
 | `Ctrl+Q` | Quit |
 | Mouse | Hover tabs to focus, drag splitter to resize, click panel to focus, scroll in results; in F2: click focuses List/SQL/Plan, drag horizontal splitter resizes, wheel scrolls the pane under the mouse (including SQL/plan), Shift+wheel or horizontal wheel scrolls the plan sideways; in F12: click focuses Objects/Detail, wheel scrolls, Shift+wheel scrolls preview columns |

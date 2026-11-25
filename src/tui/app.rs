@@ -3,6 +3,11 @@ use crate::db::connection::QueryRow;
 use crate::db::session_manager::{
     EditorSelection, SessionManager, SessionMode, TableSelection,
 };
+use crate::tui::perf_view::{render_object_ddl, render_performance, PerfLayout, PerfPane};
+use crate::tui::search::{
+    find_editor_matches, find_line_matches, find_list_matches, find_table_matches,
+    SearchDirection, SearchMatch, SearchOrigin, SearchState, SearchTarget,
+};
 use crate::tui::widgets::*;
 
 use crate::db::session_manager::ConnectionDialog;
@@ -447,6 +452,18 @@ pub struct App {
     session_resizing: Option<SessionResize>,
     /// Last explorer tree click (visible row, time) for double-click detect.
     last_explorer_click: Option<(usize, Instant)>,
+    /// F6 Performance dashboard: focused pane (`Queries`, `Results`, `Sql`).
+    perf_focus: PerfPane,
+    /// F6 Performance dashboard: whether the focused pane is maximized (`Ctrl+Z`/`F11`).
+    perf_maximized: bool,
+    /// F6 Performance dashboard: left query list width share as % (22..65).
+    perf_split_pct: u16,
+    /// Last rendered F6 pane rectangles (for mouse click-to-focus / wheel scroll).
+    perf_queries_area: Rect,
+    perf_results_area: Rect,
+    perf_sql_area: Rect,
+    /// Last rendered F4 DDL area.
+    ddl_area: Rect,
     command_mode: bool,
     command_input: String,
     command_error: Option<String>,
@@ -478,6 +495,11 @@ pub struct App {
     /// when the terminal reports enhancement support — otherwise Ctrl+M /
     /// Ctrl+Enter stay ambiguous with Enter and need their Alt- fallbacks.
     keyboard_enhanced: bool,
+    /// Emacs-style incremental search (Ctrl-S). `None` when inactive.
+    search: Option<SearchState>,
+    /// Last non-empty search query, reused when starting a search and
+    /// immediately pressing Ctrl-S again with an empty query.
+    last_search_query: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -609,6 +631,13 @@ impl App {
             session_plan_area: Rect::default(),
             session_resizing: None,
             last_explorer_click: None,
+            perf_focus: PerfPane::Queries,
+            perf_maximized: false,
+            perf_split_pct: 32,
+            perf_queries_area: Rect::default(),
+            perf_results_area: Rect::default(),
+            perf_sql_area: Rect::default(),
+            ddl_area: Rect::default(),
             command_mode: false,
             command_input: String::new(),
             command_error: None,
@@ -620,6 +649,8 @@ impl App {
             results_layout: ResultsLayout::default(),
             mouse_capture: true,
             keyboard_enhanced: false,
+            search: None,
+            last_search_query: String::new(),
         })
     }
 
@@ -696,11 +727,14 @@ impl App {
         while !self.should_quit {
             self.session_manager.poll_result();
             self.session_manager.poll_explorer();
+            self.session_manager.poll_ddl();
+            self.session_manager.poll_perf();
             self.session_manager.poll_conn_result();
             self.session_manager.poll_metadata();
             self.session_manager.check_connections();
             self.session_manager.tick_statuses();
             self.session_manager.tick_session_view();
+            self.session_manager.tick_perf();
 
             terminal.draw(|f| self.ui(f))?;
 
@@ -731,7 +765,13 @@ impl App {
         match ev {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Paste(text) => self.paste_text(&text),
+            Event::Paste(text) => {
+                if self.search.is_some() {
+                    self.search_push_text(&text);
+                } else {
+                    self.paste_text(&text)
+                }
+            }
             _ => {}
         }
     }
@@ -743,6 +783,13 @@ impl App {
     /// tab can't cycle focus. Anything that isn't plain text (a shortcut,
     /// mouse event, key release, ...) falls back to per-event handling.
     fn handle_events(&mut self, events: Vec<Event>) {
+        // While searching, a key burst is query text, not an editor paste.
+        if self.search.is_some() && events.len() > 1 {
+            if let Some(text) = text_from_key_burst(&events) {
+                self.search_push_text(&text);
+                return;
+            }
+        }
         if events.len() > 1 && self.paste_target_is_text() {
             if let Some(text) = text_from_key_burst(&events) {
                 self.paste_text(&text);
@@ -1055,6 +1102,30 @@ impl App {
     /// (OSC52 → local terminal) could never be pasted back, because
     /// arboard only sees the *remote* clipboard there.
     fn paste_from_clipboard(&mut self) {
+        // While incremental search is active the clipboard lands in the
+        // search query, not the editor.
+        if self.search.is_some() {
+            let text = self
+                .clipboard
+                .as_mut()
+                .and_then(|cb| cb.get().text().ok())
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    if self.copy_buffer.is_empty() {
+                        None
+                    } else {
+                        Some(self.copy_buffer.clone())
+                    }
+                });
+            match text {
+                Some(t) => self.search_push_text(&t),
+                None => self
+                    .session_manager
+                    .active_session_mut()
+                    .set_status("Clipboard empty/unavailable"),
+            }
+            return;
+        }
         let text = self
             .clipboard
             .as_mut()
@@ -1081,13 +1152,765 @@ impl App {
         }
     }
 
+    // ================= Incremental search (Emacs Ctrl-S) =================
+
+    /// Which buffer the search applies to, from the current mode + focus.
+    fn search_target_for_current_view(&self) -> SearchTarget {
+        let session = self.session_manager.active_session();
+        match session.mode {
+            SessionMode::Query => match self.active_window {
+                ActiveWindow::Editor => SearchTarget::Editor,
+                ActiveWindow::Results => SearchTarget::Results,
+                ActiveWindow::Sidebar => SearchTarget::Sidebar,
+            },
+            SessionMode::SessionView => match self.session_view_focus {
+                SessionViewPane::List => SearchTarget::SessionList,
+                SessionViewPane::Sql => SearchTarget::SessionSql,
+                SessionViewPane::Plan => SearchTarget::SessionPlan,
+            },
+            SessionMode::DbExplorer => match self.explorer_focus {
+                ExplorerPane::Tree => SearchTarget::ExplorerTree,
+                ExplorerPane::Detail => SearchTarget::ExplorerDetail,
+            },
+            SessionMode::ObjectDdl => SearchTarget::Ddl,
+            SessionMode::Performance => match self.perf_focus {
+                PerfPane::Queries => SearchTarget::PerfQueries,
+                PerfPane::Results => SearchTarget::PerfResults,
+                PerfPane::Sql => SearchTarget::PerfSql,
+            },
+            SessionMode::History => SearchTarget::History,
+            SessionMode::Help => SearchTarget::Help,
+            SessionMode::ConnectionPickerDialog => SearchTarget::None,
+        }
+    }
+
+    fn search_origin_snapshot(&self) -> SearchOrigin {
+        let s = self.session_manager.active_session();
+        SearchOrigin {
+            editor_row: s.editor.cursor_row,
+            editor_col: s.editor.cursor_col,
+            editor_scroll: s.editor.scroll_offset,
+            results_scroll: s.scroll_offset,
+            results_col_scroll: s.col_scroll_offset,
+            explorer_cursor: s.explorer_cursor,
+            explorer_scroll: s.explorer_scroll,
+            explorer_detail_scroll: s.explorer_detail_scroll,
+            explorer_detail_col_scroll: s.explorer_detail_col_scroll,
+            session_cursor: s.session_view_cursor,
+            sql_scroll: s.sql_scroll,
+            plan_scroll: s.plan_scroll,
+            plan_hscroll: s.plan_hscroll,
+            ddl_scroll: s.ddl_scroll,
+            ddl_hscroll: s.ddl_hscroll,
+            perf_cursor: s.perf_cursor,
+            perf_scroll: s.perf_scroll,
+            perf_col_scroll: s.perf_col_scroll,
+            perf_sql_scroll: s.perf_sql_scroll,
+            history_cursor: s.history_cursor,
+        }
+    }
+
+    fn restore_search_origin(&mut self, origin: &SearchOrigin) {
+        let s = self.session_manager.active_session_mut();
+        s.editor.cursor_row = origin.editor_row.min(s.editor.lines.len().saturating_sub(1));
+        s.editor.cursor_col = origin.editor_col;
+        s.editor.snap_cursor_to_char_boundary();
+        s.editor.scroll_offset = origin.editor_scroll;
+        s.scroll_offset = origin.results_scroll;
+        s.col_scroll_offset = origin.results_col_scroll;
+        s.explorer_cursor = origin.explorer_cursor;
+        s.explorer_scroll = origin.explorer_scroll;
+        s.explorer_detail_scroll = origin.explorer_detail_scroll;
+        s.explorer_detail_col_scroll = origin.explorer_detail_col_scroll;
+        s.session_view_cursor = origin.session_cursor;
+        s.sql_scroll = origin.sql_scroll;
+        s.plan_scroll = origin.plan_scroll;
+        s.plan_hscroll = origin.plan_hscroll;
+        s.ddl_scroll = origin.ddl_scroll;
+        s.ddl_hscroll = origin.ddl_hscroll;
+        s.perf_cursor = origin.perf_cursor;
+        s.perf_scroll = origin.perf_scroll;
+        s.perf_col_scroll = origin.perf_col_scroll;
+        s.perf_sql_scroll = origin.perf_sql_scroll;
+        s.history_cursor = origin.history_cursor;
+    }
+
+    /// Start Emacs-style incremental search in the current view.
+    /// Any in-progress completion popup is closed so typing goes to the query.
+    fn search_start(&mut self) {
+        let target = self.search_target_for_current_view();
+        if target == SearchTarget::None {
+            self.session_manager
+                .active_session_mut()
+                .set_status("Search not available in this dialog");
+            return;
+        }
+        self.session_manager.close_completion();
+        // Any keystroke exits command-bar confirmations; search takes over.
+        self.command_mode = false;
+        self.command_confirm = None;
+        let origin = self.search_origin_snapshot();
+        let mut st = SearchState::new(target, origin);
+        // Emacs nicety: a bare `Ctrl-S Ctrl-S` repeats the last query.
+        if self.last_search_query.is_empty() {
+            st.query.clear();
+        } else {
+            // Start empty; `search_next` with an empty query restores it.
+            st.query.clear();
+        }
+        st.direction = SearchDirection::Forward;
+        self.search = Some(st);
+        self.search_recompute(true);
+    }
+
+    /// Rebuild the match list for the current query and jump to the
+    /// appropriate match. `from_origin` jumps from the saved cursor
+    /// position (first keystroke); otherwise keeps the current index
+    /// clamped into the new list.
+    fn search_recompute(&mut self, from_origin: bool) {
+        let (target, query, direction, origin_editor) = match self.search.as_ref() {
+            Some(st) => (
+                st.target,
+                st.query.clone(),
+                st.direction,
+                (st.origin.editor_row, st.origin.editor_col),
+            ),
+            None => return,
+        };
+        if query.is_empty() {
+            if let Some(st) = self.search.as_mut() {
+                st.matches.clear();
+                st.current = 0;
+                st.failing = false;
+                st.wrapped = false;
+            }
+            return;
+        }
+        let matches = self.search_compute_matches(target, &query);
+        let failing = matches.is_empty();
+        // Compute the anchor index without holding the mutable borrow.
+        let anchor = Self::search_anchor_index_static(&matches, target, direction, origin_editor);
+        if let Some(st) = self.search.as_mut() {
+            st.matches = matches;
+            st.failing = failing;
+            if failing {
+                st.current = 0;
+                st.wrapped = false;
+            } else if from_origin {
+                // Jump to the first match at/after the origin position for
+                // the editor (true Emacs semantics); other views jump to
+                // the first (forward) or last (backward) match.
+                st.current = anchor;
+                st.wrapped = false;
+            } else {
+                st.current = st.current.min(st.matches.len().saturating_sub(1));
+            }
+            if !self.search.as_ref().unwrap().query.is_empty() {
+                self.last_search_query = self.search.as_ref().unwrap().query.clone();
+            }
+        }
+        if !failing {
+            let idx = self.search.as_ref().map(|s| s.current).unwrap_or(0);
+            self.search_goto(idx);
+        }
+    }
+
+    /// Index to jump to on the first keystroke: editor honors the origin
+    /// cursor (next match forward / previous backward), every other view
+    /// starts at the first (forward) or last (backward) match.
+    fn search_anchor_index_static(
+        matches: &[SearchMatch],
+        target: SearchTarget,
+        direction: SearchDirection,
+        origin_editor: (usize, usize),
+    ) -> usize {
+        if matches.is_empty() {
+            return 0;
+        }
+        let forward = direction == SearchDirection::Forward;
+        match target {
+            SearchTarget::Editor => {
+                crate::tui::search::anchor_index_editor(
+                    matches,
+                    origin_editor.0,
+                    origin_editor.1,
+                    forward,
+                )
+                .unwrap_or(0)
+            }
+            _ => {
+                if forward {
+                    0
+                } else {
+                    matches.len() - 1
+                }
+            }
+        }
+    }
+
+    /// Build the match list for `target` + `query` from live session data.
+    fn search_compute_matches(
+        &self,
+        target: SearchTarget,
+        query: &str,
+    ) -> Vec<SearchMatch> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let session = self.session_manager.active_session();
+        match target {
+            SearchTarget::Editor => find_editor_matches(&session.editor.lines, query),
+            SearchTarget::Results => match session.results.last() {
+                Some(qr) if !qr.is_error => {
+                    find_table_matches(&qr.columns, &qr.rows, query)
+                }
+                _ => Vec::new(),
+            },
+            SearchTarget::Sidebar => {
+                let labels = vec![
+                    format!("{:?}", session.conn_dialog.db_type),
+                    session.conn_dialog.host.clone(),
+                    session.conn_dialog.service.clone(),
+                    session.conn_dialog.database.clone(),
+                    session.conn_dialog.user.clone(),
+                    if session.is_connected {
+                        "Connected".to_string()
+                    } else {
+                        "Disconnected".to_string()
+                    },
+                ];
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::ExplorerTree => {
+                let rows = self.session_manager.explorer_visible_rows();
+                let labels: Vec<String> = rows
+                    .iter()
+                    .map(|r| self.session_manager.explorer_row_search_label(r))
+                    .collect();
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::ExplorerDetail => self.search_explorer_detail_matches(query),
+            SearchTarget::SessionList => {
+                let list = self.session_manager.visible_session_list();
+                let labels: Vec<String> = list
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "{} {} {} {} {} {} {} {}",
+                            d.sid,
+                            d.serial,
+                            d.username,
+                            d.status,
+                            d.machine,
+                            d.program,
+                            d.sql_id,
+                            d.logon_time
+                        )
+                    })
+                    .collect();
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::SessionSql => {
+                let text = session
+                    .plan_sql_text
+                    .as_deref()
+                    .unwrap_or_default();
+                let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+                let lines = if lines.is_empty() {
+                    vec![String::new()]
+                } else {
+                    lines
+                };
+                find_line_matches(&lines, query)
+            }
+            SearchTarget::SessionPlan => {
+                let mut lines: Vec<String> = Vec::new();
+                if let Some(qr) = session.plan_result.as_ref() {
+                    if !qr.is_error {
+                        if !qr.columns.is_empty() {
+                            lines.push(qr.columns.join(" | "));
+                        }
+                        for row in &qr.rows {
+                            lines.push(row.join(" | "));
+                        }
+                    } else if let Some(e) = qr.error_msg.as_deref() {
+                        lines.extend(e.lines().map(|s| s.to_string()));
+                    }
+                }
+                if lines.is_empty() {
+                    return Vec::new();
+                }
+                find_line_matches(&lines, query)
+            }
+            SearchTarget::Ddl => match session.ddl_object.as_ref() {
+                Some(obj) => {
+                    let lines: Vec<String> =
+                        obj.ddl.lines().map(|s| s.to_string()).collect();
+                    find_line_matches(&lines, query)
+                }
+                None => Vec::new(),
+            },
+            SearchTarget::PerfQueries => {
+                let specs = crate::db::perf::perf_queries_for(
+                    self.session_manager.active_db_type(),
+                );
+                let labels: Vec<String> = specs
+                    .iter()
+                    .map(|q| format!("{} {}", q.title, q.sql))
+                    .collect();
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::PerfResults => match session.perf_results.get(&session.perf_cursor) {
+                Some(qr) if !qr.is_error => {
+                    find_table_matches(&qr.columns, &qr.rows, query)
+                }
+                _ => Vec::new(),
+            },
+            SearchTarget::PerfSql => {
+                let specs = crate::db::perf::perf_queries_for(
+                    self.session_manager.active_db_type(),
+                );
+                let sql = specs
+                    .get(session.perf_cursor)
+                    .map(|q| q.sql)
+                    .unwrap_or_default();
+                let lines: Vec<String> = sql.lines().map(|s| s.to_string()).collect();
+                find_line_matches(&lines, query)
+            }
+            SearchTarget::History => {
+                let labels = session.query_history.clone();
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::Help => {
+                let labels = crate::tui::widgets::help_search_lines();
+                find_list_matches(&labels, query)
+            }
+            SearchTarget::None => Vec::new(),
+        }
+    }
+
+    fn search_explorer_detail_matches(&self, query: &str) -> Vec<SearchMatch> {
+        let session = self.session_manager.active_session();
+        let rows = self.session_manager.explorer_visible_rows();
+        let row = match rows.get(session.explorer_cursor) {
+            Some(r) => r.clone(),
+            None => return Vec::new(),
+        };
+        // Row-bearing object with a loaded preview: search its table.
+        if let crate::db::session_manager::ExplorerRow::Table { sidx, gidx, tidx } = row {
+            let preview = session
+                .explorer_schemas
+                .get(sidx)
+                .and_then(|s| s.groups.as_ref())
+                .and_then(|g| g.get(gidx))
+                .and_then(|g| g.objects.as_ref())
+                .and_then(|o| o.get(tidx))
+                .and_then(|t| t.preview.as_ref());
+            if let Some(qr) = preview {
+                if !qr.is_error {
+                    return find_table_matches(&qr.columns, &qr.rows, query);
+                }
+            }
+            // Code object with loaded DDL/source: search its lines.
+            let ddl = session
+                .explorer_schemas
+                .get(sidx)
+                .and_then(|s| s.groups.as_ref())
+                .and_then(|g| g.get(gidx))
+                .and_then(|g| g.objects.as_ref())
+                .and_then(|o| o.get(tidx))
+                .and_then(|t| t.ddl.as_ref());
+            if let Some(text) = ddl {
+                let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+                return find_line_matches(&lines, query);
+            }
+        }
+        // Fallback: search the detail pane's text lines (schema/group info).
+        let labels = vec![self.session_manager.explorer_row_search_label(&row)];
+        find_list_matches(&labels, query)
+    }
+
+    /// Move the view to match `idx` (with wrapping handled by callers).
+    fn search_goto(&mut self, idx: usize) {
+        let (target, m) = match self.search.as_ref() {
+            Some(st) if !st.matches.is_empty() => {
+                let i = idx.min(st.matches.len() - 1);
+                (st.target, st.matches[i])
+            }
+            _ => return,
+        };
+        // Update current first so highlight follows even if scroll clamps.
+        if let Some(st) = self.search.as_mut() {
+            st.current = idx.min(st.matches.len().saturating_sub(1));
+        }
+        let session = self.session_manager.active_session_mut();
+        match (target, m) {
+            (SearchTarget::Editor, SearchMatch::Editor { row, col, .. }) => {
+                session.editor.cursor_row = row.min(session.editor.lines.len().saturating_sub(1));
+                session.editor.cursor_col = col;
+                session.editor.snap_cursor_to_char_boundary();
+                session.editor_selection = None;
+            }
+            (SearchTarget::Results, SearchMatch::TableCell { row, col }) => {
+                match row {
+                    None => {
+                        session.scroll_offset = 0;
+                        session.col_scroll_offset = col;
+                    }
+                    Some(r) => {
+                        session.scroll_offset = r;
+                        session.col_scroll_offset = col;
+                    }
+                }
+                // Keep an old table drag-selection from hiding the match.
+                session.table_selection = None;
+            }
+            (SearchTarget::ExplorerTree, SearchMatch::ListRow { row }) => {
+                session.explorer_cursor = row;
+            }
+            (SearchTarget::ExplorerDetail, SearchMatch::TableCell { row, col }) => {
+                match row {
+                    None => {
+                        session.explorer_detail_scroll = 0;
+                        session.explorer_detail_col_scroll = col;
+                    }
+                    Some(r) => {
+                        session.explorer_detail_scroll = r;
+                        session.explorer_detail_col_scroll = col;
+                    }
+                }
+            }
+            (SearchTarget::ExplorerDetail, SearchMatch::ListRow { .. }) => {
+                // Single-label detail: nothing to scroll, match shown in bar.
+            }
+            (SearchTarget::ExplorerDetail, SearchMatch::Line { line, col, .. }) => {
+                session.explorer_detail_scroll = line;
+                session.explorer_detail_col_scroll = col / 8;
+            }
+            (SearchTarget::SessionList, SearchMatch::ListRow { row }) => {
+                // `visible_session_list` order matches cursor order.
+                session.session_view_cursor = row;
+                self.session_view_focus = SessionViewPane::List;
+            }
+            (SearchTarget::SessionSql, SearchMatch::Line { line, .. }) => {
+                session.sql_scroll = line;
+                self.session_view_focus = SessionViewPane::Sql;
+            }
+            (SearchTarget::SessionPlan, SearchMatch::Line { line, col, .. }) => {
+                session.plan_scroll = line;
+                session.plan_hscroll = col / 2;
+                self.session_view_focus = SessionViewPane::Plan;
+            }
+            (SearchTarget::Ddl, SearchMatch::Line { line, col, .. }) => {
+                session.ddl_scroll = line;
+                session.ddl_hscroll = col / 2;
+            }
+            (SearchTarget::PerfQueries, SearchMatch::ListRow { row }) => {
+                session.perf_cursor = row;
+                self.perf_focus = PerfPane::Queries;
+            }
+            (SearchTarget::PerfResults, SearchMatch::TableCell { row, col }) => {
+                match row {
+                    None => {
+                        session.perf_scroll = 0;
+                        session.perf_col_scroll = col;
+                    }
+                    Some(r) => {
+                        session.perf_scroll = r;
+                        session.perf_col_scroll = col;
+                    }
+                }
+                self.perf_focus = PerfPane::Results;
+            }
+            (SearchTarget::PerfSql, SearchMatch::Line { line, .. }) => {
+                session.perf_sql_scroll = line;
+                self.perf_focus = PerfPane::Sql;
+            }
+            (SearchTarget::History, SearchMatch::ListRow { row }) => {
+                session.history_cursor = row;
+            }
+            // Sidebar / Help / fallback: count only, nothing to move.
+            _ => {}
+        }
+    }
+
+    fn search_next(&mut self, forward: bool) {
+        // Empty query + repeated Ctrl-S reuses the last search (Emacs-style).
+        if self
+            .search
+            .as_ref()
+            .map(|s| s.query.is_empty())
+            .unwrap_or(false)
+        {
+            if self.last_search_query.is_empty() {
+                return;
+            }
+            let q = self.last_search_query.clone();
+            if let Some(st) = self.search.as_mut() {
+                st.query = q;
+                st.direction = if forward {
+                    SearchDirection::Forward
+                } else {
+                    SearchDirection::Backward
+                };
+            }
+            self.search_recompute(true);
+            return;
+        }
+        let len = self.search.as_ref().map(|s| s.matches.len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        let cur = match self.search.as_ref() {
+            Some(st) => st.current,
+            None => return,
+        };
+        let want_forward = forward;
+        let mut next = if want_forward {
+            cur + 1
+        } else if cur == 0 {
+            len - 1
+        } else {
+            cur - 1
+        };
+        let mut wrapped = false;
+        if want_forward {
+            if next >= len {
+                next = 0;
+                wrapped = true;
+            }
+        } else if cur == 0 {
+            wrapped = true;
+        }
+        if let Some(st) = self.search.as_mut() {
+            st.direction = if want_forward {
+                SearchDirection::Forward
+            } else {
+                SearchDirection::Backward
+            };
+            if wrapped {
+                st.wrapped = true;
+            }
+        }
+        self.search_goto(next);
+        if wrapped {
+            let msg = if len == 1 {
+                "1 match".to_string()
+            } else {
+                format!("Wrapped ({} matches)", len)
+            };
+            self.session_manager.active_session_mut().set_status(msg);
+        }
+    }
+
+    fn search_push_text(&mut self, text: &str) {
+        let normalized = normalize_paste(text);
+        let mut added = false;
+        if let Some(st) = self.search.as_mut() {
+            for c in normalized.chars() {
+                if c == '\n' || c == '\t' {
+                    continue;
+                }
+                if c.is_control() {
+                    continue;
+                }
+                st.query.push(c);
+                added = true;
+            }
+            if added {
+                st.wrapped = false;
+            }
+        }
+        if added {
+            // Typing re-anchors to the first match at/after the origin
+            // (Emacs forward semantics) instead of keeping a stale index.
+            self.search_recompute(true);
+        }
+    }
+
+    fn search_backspace(&mut self) {
+        if let Some(st) = self.search.as_mut() {
+            st.query.pop();
+            st.wrapped = false;
+        }
+        self.search_recompute(true);
+    }
+
+    fn search_exit(&mut self, abort: bool) {
+        if abort {
+            if let Some(st) = self.search.take() {
+                self.restore_search_origin(&st.origin);
+            }
+            self.session_manager
+                .active_session_mut()
+                .set_status("Search cancelled (Ctrl-G)");
+        } else {
+            if let Some(st) = self.search.take() {
+                if !st.query.is_empty() {
+                    self.last_search_query = st.query.clone();
+                    let msg = if st.matches.is_empty() {
+                        format!("Search: '{}' not found", st.query)
+                    } else {
+                        format!(
+                            "Search: '{}' ({}/{})",
+                            st.query,
+                            st.current + 1,
+                            st.matches.len()
+                        )
+                    };
+                    self.session_manager.active_session_mut().set_status(msg);
+                }
+            }
+        }
+    }
+
+    /// Handle a key while incremental search is active.
+    /// Returns `true` when the key was consumed by the search.
+    fn handle_search_key(&mut self, key: event::KeyEvent) -> bool {
+        // Ctrl-S: next match forward. Ctrl-R: previous match backward
+        // (hijacked from "run script" while searching).
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.search_next(true);
+            return true;
+        }
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+        {
+            self.search_next(false);
+            return true;
+        }
+        // Ctrl-G: abort back to the pre-search cursor/scroll position.
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+        {
+            self.search_exit(true);
+            return true;
+        }
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Enter) | (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.search_exit(false);
+                true
+            }
+            (m, KeyCode::Backspace) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                self.search_backspace();
+                true
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) | (KeyModifiers::CONTROL, KeyCode::Char('U')) => {
+                if let Some(st) = self.search.as_mut() {
+                    st.query.clear();
+                    st.wrapped = false;
+                }
+                self.search_recompute(true);
+                true
+            }
+            (m, KeyCode::Char(c))
+                if (m.is_empty() || m == KeyModifiers::SHIFT) && !c.is_control() =>
+            {
+                if let Some(st) = self.search.as_mut() {
+                    st.query.push(c);
+                    st.wrapped = false;
+                }
+                // Typing re-anchors from the origin (Emacs semantics).
+                self.search_recompute(true);
+                true
+            }
+            _ => {
+                // Any other key exits the search (keeping the match) and is
+                // then processed normally (e.g. F2/F12/Enter on a found row).
+                self.search_exit(false);
+                false
+            }
+        }
+    }
+
+    fn search_target_label(target: SearchTarget) -> &'static str {
+        match target {
+            SearchTarget::Editor => "SQL editor",
+            SearchTarget::Results => "results",
+            SearchTarget::Sidebar => "sidebar",
+            SearchTarget::ExplorerTree => "explorer",
+            SearchTarget::ExplorerDetail => "detail",
+            SearchTarget::SessionList => "sessions",
+            SearchTarget::SessionSql => "SQL",
+            SearchTarget::SessionPlan => "plan",
+            SearchTarget::Ddl => "DDL",
+            SearchTarget::PerfQueries => "queries",
+            SearchTarget::PerfResults => "results",
+            SearchTarget::PerfSql => "SQL",
+            SearchTarget::History => "history",
+            SearchTarget::Help => "help",
+            SearchTarget::None => "view",
+        }
+    }
+
+    fn editor_search_highlight(&self) -> Option<crate::tui::widgets::EditorSearchHighlight> {
+        let st = self.search.as_ref()?;
+        if st.target != SearchTarget::Editor || st.query.is_empty() {
+            return None;
+        }
+        let (row, col, len) = match st.matches.get(st.current) {
+            Some(SearchMatch::Editor { row, col, len }) => (*row, *col, *len),
+            _ => (0, 0, 0),
+        };
+        Some(crate::tui::widgets::EditorSearchHighlight {
+            query: st.query.clone(),
+            case_sensitive: st.case_sensitive(),
+            current_row: row,
+            current_col: col,
+            current_len: len,
+            has_current: !st.matches.is_empty(),
+        })
+    }
+
+    fn table_search_highlight(&self) -> Option<crate::tui::widgets::TableSearchHighlight> {
+        let st = self.search.as_ref()?;
+        if st.target != SearchTarget::Results || st.query.is_empty() {
+            return None;
+        }
+        let (r, c) = match st.matches.get(st.current) {
+            Some(SearchMatch::TableCell { row, col }) => (*row, *col),
+            _ => (None, 0),
+        };
+        Some(crate::tui::widgets::TableSearchHighlight {
+            query: st.query.clone(),
+            case_sensitive: st.case_sensitive(),
+            current_row: r,
+            current_col: c,
+            has_current: !st.matches.is_empty(),
+        })
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // A click exits incremental search (keeping the match) so the
+        // click can relocate focus/cursor normally.
+        if self.search.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Drag(_)
+            )
+        {
+            self.search_exit(false);
+        }
         // Clicking anywhere relocates focus/cursor; a completion popup anchored
         // to the old position must not accept into the wrong range.
         if self.session_manager.active_session().completion.is_some()
             && matches!(mouse.kind, MouseEventKind::Down(_))
         {
             self.session_manager.close_completion();
+        }
+        // F4 Object DDL viewer owns its area fullscreen.
+        if self.session_manager.active_session().mode == SessionMode::ObjectDdl
+            && self.handle_object_ddl_mouse(mouse)
+        {
+            return;
+        }
+        // F6 Performance dashboard owns its area fullscreen.
+        if self.session_manager.active_session().mode == SessionMode::Performance
+            && self.handle_performance_mouse(mouse)
+        {
+            return;
         }
         // F12 explorer owns its area fullscreen: clicks select, gutter /
         // double-click toggles, wheel scrolls the pane under the cursor.
@@ -1465,6 +2288,21 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Incremental search (Emacs I-search) takes over the key stream
+        // while active: Ctrl-S / Ctrl-R step, printable chars extend the
+        // query, Enter/Esc keep the match, Ctrl-G aborts. Paste lands in
+        // the query, not the editor.
+        if self.search.is_some() {
+            if Self::is_paste_key(key) {
+                self.paste_from_clipboard();
+                return;
+            }
+            if self.handle_search_key(key) {
+                return;
+            }
+            // `handle_search_key` exited the search (keeping the match);
+            // fall through so the key works normally (e.g. Enter on a row).
+        }
         // Explicit keyboard paste (Ctrl+V / Shift+Ins) works in the command
         // bar, the connection dialog and the SQL editor — both with mouse
         // capture ON and OFF.
@@ -1475,6 +2313,15 @@ impl App {
 
         if self.command_mode {
             self.handle_command_key(key);
+            return;
+        }
+
+        // Ctrl-S starts incremental search in the current view (editor,
+        // results, explorer, F2 panes, DDL, perf, history, help).
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            self.search_start();
             return;
         }
 
@@ -1494,6 +2341,14 @@ impl App {
         }
         if mode == SessionMode::DbExplorer {
             self.handle_db_explorer(key);
+            return;
+        }
+        if mode == SessionMode::ObjectDdl {
+            self.handle_object_ddl(key);
+            return;
+        }
+        if mode == SessionMode::Performance {
+            self.handle_performance(key);
             return;
         }
 
@@ -1707,6 +2562,18 @@ impl App {
                 self.session_manager.active_session_mut().mode = SessionMode::History;
                 return;
             }
+            (KeyModifiers::NONE, KeyCode::F(4)) => {
+                self.session_manager.close_completion();
+                self.session_manager.open_ddl_at_cursor();
+                return;
+            }
+            (KeyModifiers::NONE, KeyCode::F(6)) => {
+                self.session_manager.close_completion();
+                self.perf_focus = PerfPane::Queries;
+                self.perf_maximized = false;
+                self.session_manager.enter_performance();
+                return;
+            }
             (KeyModifiers::NONE, KeyCode::F(12)) => {
                 self.session_manager.close_completion();
                 // Toggle the DB explorer like a fullscreen browser (cf. F2).
@@ -1876,6 +2743,8 @@ impl App {
             | SessionMode::Help
             | SessionMode::History
             | SessionMode::DbExplorer
+            | SessionMode::ObjectDdl
+            | SessionMode::Performance
             | SessionMode::ConnectionPickerDialog => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     session.mode = SessionMode::Query;
@@ -2140,6 +3009,11 @@ impl App {
             KeyCode::F(5) => {
                 self.session_manager.refresh_session_list();
                 self.session_manager.load_selected_sql();
+            }
+            KeyCode::F(6) => {
+                self.perf_focus = PerfPane::Queries;
+                self.perf_maximized = false;
+                self.session_manager.enter_performance();
             }
             KeyCode::PageUp => match self.session_view_focus {
                 SessionViewPane::List => self.session_manager.move_session_cursor(-10),
@@ -2463,6 +3337,15 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 self.session_manager.reload_explorer_detail()
             }
+            // Toad-style F4 inside F12: open full DDL script for the highlighted object.
+            KeyCode::F(4) => {
+                self.session_manager.open_ddl_from_explorer();
+            }
+            KeyCode::F(6) => {
+                self.perf_focus = PerfPane::Queries;
+                self.perf_maximized = false;
+                self.session_manager.enter_performance();
+            }
             // Copy SELECT * FROM <object> into the editor and go back.
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 if let Some(sql) = self.session_manager.explorer_sql_for_cursor() {
@@ -2590,6 +3473,562 @@ impl App {
         }
         // In explorer mode clicks/wheel elsewhere are swallowed so the
         // underlying editor layout doesn't steal focus mid-browse.
+        true
+    }
+
+    // ---------------- F4 Toad-style Object DDL Handlers ----------------
+
+    fn ddl_max_scroll(&self) -> usize {
+        let sess = self.session_manager.active_session();
+        let total_lines = sess
+            .ddl_object
+            .as_ref()
+            .map(|o| o.ddl.lines().count())
+            .unwrap_or(0);
+        let view_h = self.ddl_area.height.saturating_sub(5).max(1) as usize;
+        total_lines.saturating_sub(view_h)
+    }
+
+    fn copy_ddl_to_clipboard(&mut self) {
+        let info_opt = {
+            let sess = self.session_manager.active_session();
+            sess.ddl_object
+                .as_ref()
+                .map(|o| (format!("{}.{}", o.schema, o.name), o.ddl.clone()))
+        };
+        let Some((qual, ddl)) = info_opt else {
+            self.session_manager
+                .active_session_mut()
+                .set_status("No DDL loaded yet to copy");
+            return;
+        };
+        let chars = ddl.chars().count();
+        let outcome = self.copy_and_remember(&ddl);
+        let msg = Self::copy_status(outcome, chars, &format!("{} DDL", qual));
+        self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    fn handle_object_ddl(&mut self, key: event::KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if self.session_manager.active_session().ddl_loading {
+                        self.session_manager.cancel_query();
+                    } else {
+                        self.copy_ddl_to_clipboard();
+                    }
+                    return;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.copy_ddl_to_clipboard();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::F(4) | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                if self.session_manager.active_session().ddl_loading {
+                    self.session_manager.cancel_query();
+                }
+                let sess = self.session_manager.active_session_mut();
+                let ret = sess.ddl_return_mode.clone();
+                sess.mode = if matches!(ret, SessionMode::DbExplorer) {
+                    SessionMode::DbExplorer
+                } else {
+                    SessionMode::Query
+                };
+                if sess.mode == SessionMode::Query {
+                    self.active_window = ActiveWindow::Editor;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.copy_ddl_to_clipboard();
+            }
+            KeyCode::Enter
+            | KeyCode::Char('i')
+            | KeyCode::Char('I')
+            | KeyCode::Char('s')
+            | KeyCode::Char('S') => {
+                let ddl_opt = self
+                    .session_manager
+                    .active_session()
+                    .ddl_object
+                    .as_ref()
+                    .map(|o| (format!("{}.{}", o.schema, o.name), o.ddl.clone()));
+                if let Some((qual, ddl)) = ddl_opt {
+                    let sess = self.session_manager.active_session_mut();
+                    sess.editor.set_text(&ddl);
+                    sess.mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                    sess.set_status(format!("Loaded {} DDL into SQL editor", qual));
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let ddl_opt = self
+                    .session_manager
+                    .active_session()
+                    .ddl_object
+                    .as_ref()
+                    .map(|o| (format!("{}.{}", o.schema, o.name), o.ddl.clone()));
+                if let Some((qual, ddl)) = ddl_opt {
+                    // Return the origin tab to its prior mode first, then open the new tab.
+                    {
+                        let origin = self.session_manager.active_session_mut();
+                        origin.mode = origin.ddl_return_mode.clone();
+                    }
+                    self.session_manager.add_session();
+                    let new_sess = self.session_manager.active_session_mut();
+                    new_sess.editor.set_text(&ddl);
+                    new_sess.mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                    new_sess.set_status(format!("Opened {} DDL in new session tab", qual));
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(5) => {
+                self.session_manager.reload_ddl();
+            }
+            KeyCode::F(2) => {
+                self.session_manager.enter_session_view();
+            }
+            KeyCode::F(6) => {
+                self.perf_focus = PerfPane::Queries;
+                self.perf_maximized = false;
+                self.session_manager.enter_performance();
+            }
+            KeyCode::F(12) => {
+                self.session_manager.enter_db_explorer();
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_scroll = s.ddl_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                let max = self.ddl_max_scroll();
+                let s = self.session_manager.active_session_mut();
+                s.ddl_scroll = scroll_by(s.ddl_scroll, 1, max);
+            }
+            KeyCode::PageUp => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_scroll = s.ddl_scroll.saturating_sub(20);
+            }
+            KeyCode::PageDown => {
+                let max = self.ddl_max_scroll();
+                let s = self.session_manager.active_session_mut();
+                s.ddl_scroll = scroll_by(s.ddl_scroll, 20, max);
+            }
+            KeyCode::Home => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_scroll = 0;
+                s.ddl_hscroll = 0;
+            }
+            KeyCode::End => {
+                let max = self.ddl_max_scroll();
+                self.session_manager.active_session_mut().ddl_scroll = max;
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_hscroll = s.ddl_hscroll.saturating_sub(8);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_hscroll = s.ddl_hscroll.saturating_add(8);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_object_ddl_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let max = self.ddl_max_scroll();
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let s = self.session_manager.active_session_mut();
+                if shift {
+                    s.ddl_hscroll = s.ddl_hscroll.saturating_add(6);
+                } else {
+                    s.ddl_scroll = scroll_by(s.ddl_scroll, 3, max);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let s = self.session_manager.active_session_mut();
+                if shift {
+                    s.ddl_hscroll = s.ddl_hscroll.saturating_sub(6);
+                } else {
+                    s.ddl_scroll = s.ddl_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_hscroll = s.ddl_hscroll.saturating_sub(6);
+            }
+            MouseEventKind::ScrollRight => {
+                let s = self.session_manager.active_session_mut();
+                s.ddl_hscroll = s.ddl_hscroll.saturating_add(6);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    // ---------------- F6 Performance & DBA Dashboard Handlers ----------------
+
+    fn perf_result_bounds(&self) -> (usize, usize) {
+        let sess = self.session_manager.active_session();
+        match sess.perf_results.get(&sess.perf_cursor) {
+            Some(qr) if !qr.is_error => (
+                qr.rows.len().saturating_sub(1),
+                qr.columns.len().saturating_sub(1),
+            ),
+            _ => (0, 0),
+        }
+    }
+
+    fn copy_perf_to_clipboard(&mut self) {
+        if self.perf_focus == PerfPane::Sql {
+            if let Some(sql) = self.session_manager.active_perf_query_sql() {
+                let chars = sql.chars().count();
+                let outcome = self.copy_and_remember(&sql);
+                let msg = Self::copy_status(outcome, chars, "diagnostic SQL");
+                self.session_manager.active_session_mut().set_status(msg);
+            }
+            return;
+        }
+
+        let text_opt = {
+            let sess = self.session_manager.active_session();
+            sess.perf_results.get(&sess.perf_cursor).and_then(|qr| {
+                if qr.is_error || qr.columns.is_empty() {
+                    return None;
+                }
+                let text = match self.result_format {
+                    ResultFormat::Markdown => {
+                        let refs: Vec<&[String]> = qr.rows.iter().map(|r| r.as_slice()).collect();
+                        markdown_table(&qr.columns, &refs)
+                    }
+                    ResultFormat::Ascii => {
+                        format_ascii_table(qr, 0..qr.columns.len(), 0, qr.rows.len())
+                    }
+                    ResultFormat::Table => {
+                        let mut out = qr.columns.join("\t");
+                        out.push('\n');
+                        for row in &qr.rows {
+                            out.push_str(&row.join("\t"));
+                            out.push('\n');
+                        }
+                        out
+                    }
+                };
+                Some(text)
+            })
+        };
+        let Some(text) = text_opt else {
+            self.session_manager
+                .active_session_mut()
+                .set_status("No performance results to copy yet");
+            return;
+        };
+        let chars = text.chars().count();
+        let outcome = self.copy_and_remember(&text);
+        let msg = Self::copy_status(outcome, chars, "performance results");
+        self.session_manager.active_session_mut().set_status(msg);
+    }
+
+    fn handle_performance(&mut self, key: event::KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    self.result_format = self.result_format.cycle();
+                    return;
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    self.perf_maximized = !self.perf_maximized;
+                    return;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    if self.session_manager.active_session().perf_loading {
+                        self.session_manager.cancel_query();
+                    } else {
+                        self.copy_perf_to_clipboard();
+                    }
+                    return;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.copy_perf_to_clipboard();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                let show_sql = self.session_manager.active_session().perf_show_sql;
+                self.perf_focus = self.perf_focus.next(show_sql);
+                return;
+            }
+            (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::NONE, KeyCode::BackTab) => {
+                let show_sql = self.session_manager.active_session().perf_show_sql;
+                self.perf_focus = self.perf_focus.prev(show_sql);
+                return;
+            }
+            (KeyModifiers::NONE, KeyCode::F(11)) => {
+                self.perf_maximized = !self.perf_maximized;
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Up) => {
+                self.perf_split_pct = (self.perf_split_pct + 4).min(65);
+                return;
+            }
+            (KeyModifiers::ALT, KeyCode::Down) => {
+                self.perf_split_pct = self.perf_split_pct.saturating_sub(4).max(22);
+                return;
+            }
+            _ => {}
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::F(6) | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.session_manager.active_session_mut().mode = SessionMode::Query;
+                self.active_window = ActiveWindow::Editor;
+            }
+            KeyCode::F(1) => {
+                self.session_manager.active_session_mut().mode = SessionMode::Help;
+            }
+            KeyCode::F(2) => {
+                self.session_manager.enter_session_view();
+            }
+            KeyCode::F(12) => {
+                self.session_manager.enter_db_explorer();
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                self.session_manager.select_perf_query(idx, true);
+            }
+            KeyCode::Char('0') => {
+                self.session_manager.select_perf_query(9, true);
+            }
+            KeyCode::Enter | KeyCode::Char('r') => {
+                self.session_manager.refresh_performance(false);
+            }
+            KeyCode::Char('R') | KeyCode::F(5) => {
+                self.session_manager.refresh_performance(true);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.session_manager.toggle_perf_auto_refresh();
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let show = {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_show_sql = !s.perf_show_sql;
+                    s.perf_sql_scroll = 0;
+                    s.perf_show_sql
+                };
+                if !show && self.perf_focus == PerfPane::Sql {
+                    self.perf_focus = PerfPane::Results;
+                }
+            }
+            KeyCode::Char('s')
+            | KeyCode::Char('S')
+            | KeyCode::Char('i')
+            | KeyCode::Char('I') => {
+                if let Some(sql) = self.session_manager.active_perf_query_sql() {
+                    let sess = self.session_manager.active_session_mut();
+                    sess.editor.set_text(&sql);
+                    sess.mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                    sess.set_status("Loaded diagnostic SQL into editor");
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(sql) = self.session_manager.active_perf_query_sql() {
+                    self.session_manager.active_session_mut().mode = SessionMode::Query;
+                    self.session_manager.add_session();
+                    let new_sess = self.session_manager.active_session_mut();
+                    new_sess.editor.set_text(&sql);
+                    new_sess.mode = SessionMode::Query;
+                    self.active_window = ActiveWindow::Editor;
+                    new_sess.set_status("Opened diagnostic SQL in new session tab");
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => match self.perf_focus {
+                PerfPane::Queries => self.session_manager.move_perf_cursor(-1),
+                PerfPane::Results => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_scroll = s.perf_scroll.saturating_sub(1);
+                }
+                PerfPane::Sql => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_sub(1);
+                }
+            },
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => match self.perf_focus {
+                PerfPane::Queries => self.session_manager.move_perf_cursor(1),
+                PerfPane::Results => {
+                    let (max_r, _) = self.perf_result_bounds();
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_scroll = scroll_by(s.perf_scroll, 1, max_r);
+                }
+                PerfPane::Sql => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_add(1);
+                }
+            },
+            KeyCode::PageUp => match self.perf_focus {
+                PerfPane::Queries => self.session_manager.move_perf_cursor(-5),
+                PerfPane::Results => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_scroll = s.perf_scroll.saturating_sub(15);
+                }
+                PerfPane::Sql => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_sub(5);
+                }
+            },
+            KeyCode::PageDown => match self.perf_focus {
+                PerfPane::Queries => self.session_manager.move_perf_cursor(5),
+                PerfPane::Results => {
+                    let (max_r, _) = self.perf_result_bounds();
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_scroll = scroll_by(s.perf_scroll, 15, max_r);
+                }
+                PerfPane::Sql => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_add(5);
+                }
+            },
+            KeyCode::Home => match self.perf_focus {
+                PerfPane::Queries => self.session_manager.select_perf_query(0, false),
+                PerfPane::Results => {
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_scroll = 0;
+                    s.perf_col_scroll = 0;
+                }
+                PerfPane::Sql => {
+                    self.session_manager.active_session_mut().perf_sql_scroll = 0;
+                }
+            },
+            KeyCode::End => match self.perf_focus {
+                PerfPane::Queries => {
+                    let total =
+                        crate::db::perf::perf_queries_for(self.session_manager.active_db_type())
+                            .len();
+                    if total > 0 {
+                        self.session_manager.select_perf_query(total - 1, false);
+                    }
+                }
+                PerfPane::Results => {
+                    let (max_r, _) = self.perf_result_bounds();
+                    self.session_manager.active_session_mut().perf_scroll = max_r;
+                }
+                PerfPane::Sql => {}
+            },
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H')
+                if self.perf_focus == PerfPane::Results =>
+            {
+                let s = self.session_manager.active_session_mut();
+                s.perf_col_scroll = s.perf_col_scroll.saturating_sub(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L')
+                if self.perf_focus == PerfPane::Results =>
+            {
+                let (_, max_c) = self.perf_result_bounds();
+                let s = self.session_manager.active_session_mut();
+                s.perf_col_scroll = scroll_by(s.perf_col_scroll, 1, max_c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_performance_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let pos = Position::new(mouse.column, mouse.row);
+        let in_q = self.perf_queries_area.width > 0
+            && self.perf_queries_area.height > 0
+            && self.perf_queries_area.contains(pos);
+        let in_r = self.perf_results_area.width > 0
+            && self.perf_results_area.height > 0
+            && self.perf_results_area.contains(pos);
+        let in_s = self.perf_sql_area.width > 0
+            && self.perf_sql_area.height > 0
+            && self.perf_sql_area.contains(pos);
+
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if in_q {
+                    self.perf_focus = PerfPane::Queries;
+                    let rel = mouse.row.saturating_sub(self.perf_queries_area.y + 1) as usize;
+                    let count =
+                        crate::db::perf::perf_queries_for(self.session_manager.active_db_type())
+                            .len();
+                    let inner_h = self.perf_queries_area.height.saturating_sub(2) as usize;
+                    let list_h = if inner_h >= 8 { inner_h - 2 } else { inner_h };
+                    if rel < list_h && count > 0 {
+                        let cursor = self.session_manager.active_session().perf_cursor;
+                        let start = if list_h == 0 || cursor < list_h {
+                            0
+                        } else {
+                            cursor + 1 - list_h
+                        };
+                        let idx = (start + rel).min(count - 1);
+                        self.session_manager.select_perf_query(idx, false);
+                    }
+                } else if in_r {
+                    self.perf_focus = PerfPane::Results;
+                } else if in_s {
+                    self.perf_focus = PerfPane::Sql;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if in_q {
+                    self.perf_focus = PerfPane::Queries;
+                    self.session_manager.move_perf_cursor(1);
+                } else if in_r {
+                    self.perf_focus = PerfPane::Results;
+                    let (max_r, max_c) = self.perf_result_bounds();
+                    let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                    let s = self.session_manager.active_session_mut();
+                    if shift {
+                        s.perf_col_scroll = scroll_by(s.perf_col_scroll, 2, max_c);
+                    } else {
+                        s.perf_scroll = scroll_by(s.perf_scroll, 3, max_r);
+                    }
+                } else if in_s {
+                    self.perf_focus = PerfPane::Sql;
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_add(2);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if in_q {
+                    self.perf_focus = PerfPane::Queries;
+                    self.session_manager.move_perf_cursor(-1);
+                } else if in_r {
+                    self.perf_focus = PerfPane::Results;
+                    let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                    let s = self.session_manager.active_session_mut();
+                    if shift {
+                        s.perf_col_scroll = s.perf_col_scroll.saturating_sub(2);
+                    } else {
+                        s.perf_scroll = s.perf_scroll.saturating_sub(3);
+                    }
+                } else if in_s {
+                    self.perf_focus = PerfPane::Sql;
+                    let s = self.session_manager.active_session_mut();
+                    s.perf_sql_scroll = s.perf_sql_scroll.saturating_sub(2);
+                }
+            }
+            _ => {}
+        }
         true
     }
 
@@ -2932,6 +4371,28 @@ impl App {
                 self.explorer_area = tree;
                 self.explorer_detail_area = detail;
             }
+            SessionMode::ObjectDdl => {
+                let session = self.session_manager.active_session();
+                render_object_ddl(session, self.mouse_capture, f, chunks[1]);
+                self.ddl_area = chunks[1];
+            }
+            SessionMode::Performance => {
+                let layout = PerfLayout {
+                    split_pct: self.perf_split_pct,
+                    focus: self.perf_focus,
+                    maximized: self.perf_maximized,
+                };
+                let (qa, ra, sa) = render_performance(
+                    &self.session_manager,
+                    self.result_format,
+                    layout,
+                    f,
+                    chunks[1],
+                );
+                self.perf_queries_area = qa;
+                self.perf_results_area = ra;
+                self.perf_sql_area = sa;
+            }
             SessionMode::Help => {
                 render_help(f, chunks[1]);
             }
@@ -3014,6 +4475,8 @@ impl App {
                 }
 
                 let session = self.session_manager.active_session();
+                let editor_hl = self.editor_search_highlight();
+                let table_hl = self.table_search_highlight();
 
                 match self.maximized_box {
                     Some(MaximizedBox::Editor) => {
@@ -3021,6 +4484,7 @@ impl App {
                             session,
                             self.active_window == ActiveWindow::Editor,
                             self.mouse_capture,
+                            editor_hl.as_ref(),
                             f,
                             self.editor_area,
                         );
@@ -3047,6 +4511,7 @@ impl App {
                                 result_format: self.result_format,
                                 focused: self.active_window == ActiveWindow::Results,
                             },
+                            table_hl.as_ref(),
                             f,
                             self.results_area,
                         ));
@@ -3059,6 +4524,7 @@ impl App {
                             session,
                             self.active_window == ActiveWindow::Editor,
                             self.mouse_capture,
+                            editor_hl.as_ref(),
                             f,
                             self.editor_area,
                         );
@@ -3083,6 +4549,7 @@ impl App {
                                 result_format: self.result_format,
                                 focused: self.active_window == ActiveWindow::Results,
                             },
+                            table_hl.as_ref(),
                             f,
                             self.results_area,
                         ));
@@ -3134,7 +4601,40 @@ impl App {
         }
 
         let session = self.session_manager.active_session();
-        if self.command_mode {
+        if self.search.is_some() {
+            let (query, forward, current, total, failing, wrapped, target) = match self
+                .search
+                .as_ref()
+            {
+                Some(st) => (
+                    st.query.clone(),
+                    st.direction == SearchDirection::Forward,
+                    st.current,
+                    st.matches.len(),
+                    st.failing,
+                    st.wrapped,
+                    st.target,
+                ),
+                None => (String::new(), true, 0, 0, false, false, SearchTarget::None),
+            };
+            render_search_bar(
+                &query,
+                forward,
+                current,
+                total,
+                failing,
+                wrapped,
+                Self::search_target_label(target),
+                f,
+                chunks[2],
+            );
+            // Put the terminal cursor at the end of the query.
+            let bar = chunks[2];
+            let prefix_w = format!(" I-search {} [{}]: ", if forward { "forward" } else { "backward" }, Self::search_target_label(target)).chars().count() as u16;
+            let cx = (bar.x + prefix_w + query.chars().count() as u16 + 1)
+                .min(bar.right().saturating_sub(1));
+            f.set_cursor_position(Position::new(cx, bar.y));
+        } else if self.command_mode {
             render_command_bar(
                 &self.command_input,
                 self.command_error.as_deref(),
@@ -3155,6 +4655,8 @@ impl App {
                 self.session_view_maximized,
                 self.explorer_focus,
                 self.explorer_maximized,
+                self.perf_focus,
+                self.perf_maximized,
                 self.mouse_capture,
                 f,
                 chunks[2],
@@ -3787,5 +5289,136 @@ mod tests {
         app.explorer_split_pct = 25;
         app.handle_db_explorer(key(KeyModifiers::ALT, KeyCode::Down));
         assert_eq!(app.explorer_split_pct, 25);
+    }
+
+    #[test]
+    fn f4_object_ddl_viewer_loads_into_editor_and_new_tab() {
+        use crate::db::ddl::DescribedObject;
+
+        let mut app = test_app();
+        app.show_startup_help = false;
+        {
+            let sess = app.session_manager.active_session_mut();
+            sess.mode = SessionMode::ObjectDdl;
+            sess.ddl_return_mode = SessionMode::DbExplorer;
+            sess.ddl_object = Some(DescribedObject {
+                schema: "SCOTT".into(),
+                name: "IDX_EMP_DEPT".into(),
+                kind: "INDEX".into(),
+                ddl: "CREATE INDEX SCOTT.IDX_EMP_DEPT ON SCOTT.EMP (DEPTNO);".into(),
+                summary: None,
+                elapsed_ms: 4,
+            });
+        }
+
+        // Pressing `n` opens the DDL in a brand-new session tab and restores origin's mode.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('n')));
+        assert_eq!(app.session_manager.sessions.len(), 2);
+        assert_eq!(app.session_manager.active_idx, 1);
+        assert_eq!(
+            app.session_manager.sessions[0].mode,
+            SessionMode::DbExplorer
+        );
+        assert_eq!(
+            app.session_manager.active_session().editor.text(),
+            "CREATE INDEX SCOTT.IDX_EMP_DEPT ON SCOTT.EMP (DEPTNO);"
+        );
+
+        // Switch back to tab 0, reopen DDL, and press `i` to insert into current editor.
+        app.session_manager.switch_to(0);
+        app.session_manager.active_session_mut().mode = SessionMode::ObjectDdl;
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('i')));
+        assert_eq!(app.session_manager.active_session().mode, SessionMode::Query);
+        assert_eq!(
+            app.session_manager.active_session().editor.text(),
+            "CREATE INDEX SCOTT.IDX_EMP_DEPT ON SCOTT.EMP (DEPTNO);"
+        );
+    }
+
+    #[test]
+    fn f6_performance_dashboard_navigates_toggles_and_sends_sql_to_editor() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+
+        // F6 enters Performance mode.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::F(6)));
+        assert_eq!(
+            app.session_manager.active_session().mode,
+            SessionMode::Performance
+        );
+        assert_eq!(app.perf_focus, PerfPane::Queries);
+
+        // Number shortcut `2` selects query #2 (index 1: Top CPU Sessions).
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('2')));
+        assert_eq!(app.session_manager.active_session().perf_cursor, 1);
+
+        // `v` toggles the SQL preview pane; Tab cycles Queries -> Results -> Sql -> Queries.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('v')));
+        assert!(app.session_manager.active_session().perf_show_sql);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.perf_focus, PerfPane::Results);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.perf_focus, PerfPane::Sql);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Tab));
+        assert_eq!(app.perf_focus, PerfPane::Queries);
+
+        // `a` toggles live 5s auto-refresh.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('a')));
+        assert!(app.session_manager.active_session().perf_auto_refresh);
+
+        // `s` sends the diagnostic SQL to the SQL editor and returns to Query mode.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('s')));
+        assert_eq!(app.session_manager.active_session().mode, SessionMode::Query);
+        assert!(app
+            .session_manager
+            .active_session()
+            .editor
+            .text()
+            .contains("CPU"));
+    }
+
+    #[test]
+    fn isearch_finds_in_editor_and_steps() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.session_manager.active_session_mut().editor.set_text("select a\nfrom t\nselect b");
+        app.session_manager.active_session_mut().editor.cursor_row = 0;
+        app.session_manager.active_session_mut().editor.cursor_col = 0;
+        // Ctrl-S starts search in the editor.
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('s')));
+        assert!(app.search.is_some());
+        // Type "select": jumps to first match at/after origin (row 0).
+        for c in "select".chars() {
+            app.handle_key(key(KeyModifiers::NONE, KeyCode::Char(c)));
+        }
+        let st = app.search.as_ref().expect("search");
+        assert_eq!(st.query, "select");
+        assert_eq!(st.matches.len(), 2);
+        assert_eq!(app.session_manager.active_session().editor.cursor_row, 0);
+        // Ctrl-S steps to the second match (row 2).
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('s')));
+        assert_eq!(app.session_manager.active_session().editor.cursor_row, 2);
+        // Ctrl-R steps back to the first match.
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('r')));
+        assert_eq!(app.session_manager.active_session().editor.cursor_row, 0);
+        // Enter keeps the match and exits.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Enter));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn isearch_ctrl_g_aborts_to_origin() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.session_manager.active_session_mut().editor.set_text("select a\nfrom t");
+        app.session_manager.active_session_mut().editor.cursor_row = 1;
+        app.session_manager.active_session_mut().editor.cursor_col = 0;
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('s')));
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('s')));
+        assert_eq!(app.session_manager.active_session().editor.cursor_row, 0);
+        // Ctrl-G restores the pre-search cursor.
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('g')));
+        assert!(app.search.is_none());
+        assert_eq!(app.session_manager.active_session().editor.cursor_row, 1);
     }
 }

@@ -5,6 +5,7 @@ use crate::db::session_manager::{
 };
 use crate::db::DbType;
 use crate::tui::app::{ActiveWindow, ExplorerPane, ResultFormat, SessionViewPane};
+use crate::tui::perf_view::PerfPane;
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -87,6 +88,161 @@ pub fn render_command_bar(
     f.render_widget(bar, area);
 }
 
+/// Emacs I-search prompt (replaces the status bar while searching).
+/// Shows direction, query, match position and the key legend.
+#[allow(clippy::too_many_arguments)]
+pub fn render_search_bar(
+    query: &str,
+    forward: bool,
+    current: usize,
+    total: usize,
+    failing: bool,
+    wrapped: bool,
+    target_label: &str,
+    f: &mut Frame,
+    area: Rect,
+) {
+    let dir = if forward { "forward" } else { "backward" };
+    let pos = if query.is_empty() {
+        "type to search".to_string()
+    } else if failing {
+        "no match".to_string()
+    } else {
+        format!("{}/{}", current + 1, total)
+    };
+    let flags = if failing {
+        " [FAILING]"
+    } else if wrapped {
+        " [WRAPPED]"
+    } else {
+        ""
+    };
+    let prompt = Span::styled(
+        format!(" I-search {} [{}]: ", dir, target_label),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    let spans = vec![
+        prompt,
+        Span::styled(
+            query.to_string(),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+        Span::styled(
+            "▏".to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}{}  (Ctrl-S next · Ctrl-R prev · RET/Esc done · Ctrl-G cancel)", pos, flags),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+    ];
+    let bar =
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Yellow).fg(Color::Black));
+    f.render_widget(bar, area);
+}
+
+/// Highlight info for the SQL editor: all occurrences of `query` get a
+/// tint, the match at (`current_row`, `current_col`) gets the cursor tint.
+#[derive(Debug, Clone)]
+pub struct EditorSearchHighlight {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub current_row: usize,
+    pub current_col: usize,
+    pub current_len: usize,
+    pub has_current: bool,
+}
+
+/// Highlight info for result tables: any cell containing `query` gets a
+/// tint, the match at (`current_row`, `current_col`) gets the cursor tint.
+#[derive(Debug, Clone)]
+pub struct TableSearchHighlight {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub current_row: Option<usize>,
+    pub current_col: usize,
+    pub has_current: bool,
+}
+
+fn cell_contains(haystack: &str, query: &str, case_sensitive: bool) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if case_sensitive {
+        haystack.contains(query)
+    } else {
+        haystack.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
+/// Split `line` into spans: every occurrence of `query` gets `match_style`,
+/// the occurrence at byte `current_col` (on the current row) gets
+/// `current_style` instead. Caller guarantees `query` is non-empty.
+fn highlight_spans(
+    line: &str,
+    query: &str,
+    case_sensitive: bool,
+    current_col: Option<usize>,
+    base: Style,
+    match_style: Style,
+    current_style: Style,
+) -> Vec<Span<'static>> {
+    let idxs: Vec<(usize, usize)> = if case_sensitive {
+        line.match_indices(query)
+            .map(|(o, m)| (o, m.len()))
+            .collect()
+    } else {
+        let lower = line.to_lowercase();
+        let q = query.to_lowercase();
+        lower
+            .match_indices(q.as_str())
+            .map(|(o, m)| (o, m.len()))
+            .collect()
+    };
+    if idxs.is_empty() {
+        return vec![Span::styled(line.to_string(), base)];
+    }
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    for (off, len) in idxs {
+        let off = off.min(line.len());
+        let mut end = off.saturating_add(len).min(line.len());
+        if off > 0 && !line.is_char_boundary(off) {
+            // Lower-casing edge case: fall back to base text.
+            return vec![Span::styled(line.to_string(), base)];
+        }
+        while end < line.len() && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        if off < pos {
+            continue;
+        }
+        if off > pos {
+            spans.push(Span::styled(line[pos..off].to_string(), base));
+        }
+        let st = if Some(off) == current_col {
+            current_style
+        } else {
+            match_style
+        };
+        spans.push(Span::styled(line[off..end.max(off)].to_string(), st));
+        pos = end.max(off);
+    }
+    if pos < line.len() {
+        spans.push(Span::styled(line[pos..].to_string(), base));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(line.to_string(), base));
+    }
+    spans
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_status_bar(
     session: &Session,
@@ -95,6 +251,8 @@ pub fn render_status_bar(
     session_view_maximized: Option<SessionViewPane>,
     explorer_focus: ExplorerPane,
     explorer_maximized: bool,
+    perf_focus: PerfPane,
+    perf_maximized: bool,
     mouse_capture: bool,
     f: &mut Frame,
     area: Rect,
@@ -105,6 +263,8 @@ pub fn render_status_bar(
         SessionMode::Help => "[HELP]",
         SessionMode::History => "[HISTORY]",
         SessionMode::DbExplorer => "[EXPLORER]",
+        SessionMode::ObjectDdl => "[DDL]",
+        SessionMode::Performance => "[PERF]",
         SessionMode::ConnectionPickerDialog => "[CONNECTING...]",
     };
 
@@ -129,6 +289,19 @@ pub fn render_status_bar(
         } else {
             base.to_string()
         }
+    } else if session.mode == SessionMode::Performance {
+        let base = match perf_focus {
+            PerfPane::Queries => "Focus: QUERIES",
+            PerfPane::Results => "Focus: RESULTS",
+            PerfPane::Sql => "Focus: SQL",
+        };
+        if perf_maximized {
+            format!("{} [MAX]", base)
+        } else {
+            base.to_string()
+        }
+    } else if session.mode == SessionMode::ObjectDdl {
+        "Focus: DDL".to_string()
     } else {
         match active_window {
             ActiveWindow::Editor => "Focus: EDITOR".to_string(),
@@ -206,9 +379,13 @@ pub fn render_status_bar(
     let hint = if session.mode == SessionMode::SessionView {
         " | Tab: Focus | ↑↓/PgUp/PgDn: Scroll focused | Home/End: Top/Bottom | Alt+Up/Down: Size | Ctrl+Z: Zoom | Enter: Explain | Esc: Back"
     } else if session.mode == SessionMode::DbExplorer {
-        " | Tab: Pane | Ctrl+Z: Zoom | Alt+Up/Down: Resize | Arrows/PgUp/PgDn: Scroll | Ctrl+F: More | Esc: Back"
+        " | Tab: Pane | F4: DDL | Ctrl+Z: Zoom | Alt+Up/Down: Resize | Arrows/PgUp/PgDn: Scroll | Ctrl+F: More | Esc: Back"
+    } else if session.mode == SessionMode::ObjectDdl {
+        " | Ctrl+C/Y: Copy DDL | Enter/i: →Editor | n: →New Tab | r: Reload | Arrows/PgUp/PgDn: Scroll | F4/Esc: Back"
+    } else if session.mode == SessionMode::Performance {
+        " | 1-0/↑↓: Query | Enter/R: Run | a: Auto-5s | v: SQL | s: →Editor | Tab: Pane | Ctrl+Z: Zoom | F6/Esc: Back"
     } else {
-        " | Tab: Focus | Alt+Up/Down: Resize Editor | F3: History | Ctrl+C: Copy | Ctrl+V: Paste | Alt+M: Mouse"
+        " | Tab: Focus | Ctrl+S: Search | F2: Sessions | F4: DDL | F6: Perf | F12: Explorer | Ctrl+C: Copy | Ctrl+V: Paste"
     };
 
     let status_text = Line::from(vec![
@@ -237,6 +414,7 @@ pub fn render_editor(
     session: &Session,
     focused: bool,
     show_line_numbers: bool,
+    search: Option<&EditorSearchHighlight>,
     f: &mut Frame,
     area: Rect,
 ) {
@@ -255,7 +433,7 @@ pub fn render_editor(
     let title = if session.pending_query {
         " SQL Editor (⟳ EXECUTING QUERY...) "
     } else if show_line_numbers {
-        " SQL Editor (Ctrl+Enter/Alt+Enter/Ctrl+J/F8/F9: run stmt | F5/Ctrl+R: run script | Ctrl+:: run @file | Ctrl+Space: complete | Alt+Up/Down: resize | drag: select+copy) "
+        " SQL Editor (Ctrl+Enter/Alt+Enter/F8/F9: run stmt | F5/Ctrl+R: script | F4: object DDL | F6: perf | Ctrl+Space: complete | drag: select+copy) "
     } else {
         " SQL Editor — Mouse:OFF, gutter hidden for clean copy (Alt+M restores | Ctrl+Y copies SQL) "
     };
@@ -345,6 +523,30 @@ pub fn render_editor(
                         spans.push(Span::styled(ch.to_string(), st));
                     }
                     Line::from(spans)
+                } else if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
+                    let match_style = Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black);
+                    let current_style = Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD);
+                    let cur = if hl.has_current && idx == hl.current_row {
+                        Some(hl.current_col)
+                    } else {
+                        None
+                    };
+                    let mut spans = vec![Span::styled(line_num_str, num_style)];
+                    spans.extend(highlight_spans(
+                        line_str,
+                        &hl.query,
+                        hl.case_sensitive,
+                        cur,
+                        text_style,
+                        match_style,
+                        current_style,
+                    ));
+                    Line::from(spans)
                 } else {
                     Line::from(vec![
                         Span::styled(line_num_str, num_style),
@@ -356,7 +558,31 @@ pub fn render_editor(
                 // drag-select copies clean SQL without `  12 ` prefixes.
                 // (num_style/line_num_str intentionally unused here.)
                 let _ = (&line_num_str, &num_style);
-                Line::from(vec![Span::styled(line_str.to_string(), text_style)])
+                if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
+                    let match_style = Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black);
+                    let current_style = Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD);
+                    let cur = if hl.has_current && idx == hl.current_row {
+                        Some(hl.current_col)
+                    } else {
+                        None
+                    };
+                    Line::from(highlight_spans(
+                        line_str,
+                        &hl.query,
+                        hl.case_sensitive,
+                        cur,
+                        text_style,
+                        match_style,
+                        current_style,
+                    ))
+                } else {
+                    Line::from(vec![Span::styled(line_str.to_string(), text_style)])
+                }
             }
         })
         .collect();
@@ -562,6 +788,7 @@ pub fn render_table(
     session: &Session,
     query_row: &Option<&QueryRow>,
     view: TableViewState,
+    search: Option<&TableSearchHighlight>,
     f: &mut Frame,
     area: Rect,
 ) -> ResultsLayout {
@@ -809,6 +1036,32 @@ pub fn render_table(
             .bg(Color::Cyan)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
+        let search_match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+        let search_current_style = Style::default()
+            .bg(Color::LightCyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let search_hit = |row: Option<usize>, col: usize| -> bool {
+            match search {
+                Some(hl) if !hl.query.is_empty() => match row {
+                    None => {
+                        qr.columns
+                            .get(col)
+                            .is_some_and(|h| cell_contains(h, &hl.query, hl.case_sensitive))
+                    }
+                    Some(r) => qr.rows.get(r).and_then(|rr| rr.get(col)).is_some_and(|c| {
+                        cell_contains(c, &hl.query, hl.case_sensitive)
+                    }),
+                },
+                _ => false,
+            }
+        };
+        let search_is_current = |row: Option<usize>, col: usize| -> bool {
+            match search {
+                Some(hl) if hl.has_current => hl.current_row == row && hl.current_col == col,
+                _ => false,
+            }
+        };
         let cell_selected = |abs_row: usize, abs_col: usize| -> bool {
             sel_rect.is_some_and(|((r0, c0), (r1, c1))| {
                 abs_col >= c0
@@ -829,7 +1082,12 @@ pub fn render_table(
                 .enumerate()
                 .map(|(k, h)| {
                     let cell = Cell::from(h.clone());
-                    if header_selected(start_col + k) {
+                    let abs_col = start_col + k;
+                    if search_is_current(None, abs_col) {
+                        cell.style(search_current_style)
+                    } else if search_hit(None, abs_col) {
+                        cell.style(search_match_style)
+                    } else if header_selected(abs_col) {
                         cell.style(sel_style)
                     } else {
                         cell
@@ -865,7 +1123,12 @@ pub fn render_table(
                     .enumerate()
                     .map(|(k, c)| {
                         let cell = Cell::from(clean_cell(c));
-                        if cell_selected(abs_row, start_col + k) {
+                        let abs_col = start_col + k;
+                        if search_is_current(Some(abs_row), abs_col) {
+                            cell.style(search_current_style)
+                        } else if search_hit(Some(abs_row), abs_col) {
+                            cell.style(search_match_style)
+                        } else if cell_selected(abs_row, abs_col) {
                             cell.style(sel_style)
                         } else {
                             cell
@@ -1012,7 +1275,7 @@ pub fn render_table(
 /// so it is rendered as `⏎`; tabs become two spaces and other control chars
 /// are dropped. Keeps the full value (ratatui truncates to the column width)
 /// instead of breaking rows.
-fn clean_cell(s: &str) -> String {
+pub(crate) fn clean_cell(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.replace('\r', " ").replace('\n', " ⏎ ").replace('\t', "  ").chars() {
         if ch.is_control() {
@@ -1049,7 +1312,7 @@ fn ideal_col_widths(qr: &QueryRow) -> Vec<usize> {
 /// Column window that fits `avail_width` cells, starting at `start_col`.
 /// Guarantees at least one column; on wide screens this shows far more than
 /// the old fixed 10-column window, on narrow screens it shrinks to fit.
-fn visible_col_range_fit(
+pub(crate) fn visible_col_range_fit(
     total_cols: usize,
     start_col: usize,
     ideal: &[usize],
@@ -1151,7 +1414,7 @@ pub fn selection_title_note(
 /// Shared `rows a-b of M / cols c-d of N` title core with `▲▼◀▶` overflow
 /// arrows, used by all three result formats so scrolled-out content is
 /// visible at a glance (not just raw counts).
-fn result_title_counts(
+pub(crate) fn result_title_counts(
     top: usize,
     shown_rows: usize,
     total_rows: usize,
@@ -1186,7 +1449,7 @@ fn result_title_counts(
 /// Thin scrollbars shared by all three result formats: vertical when more
 /// rows sit below the visible window, horizontal when more columns sit to
 /// the right. `row_capacity` is how many data rows fit in the pane.
-fn render_result_scrollbars(
+pub(crate) fn render_result_scrollbars(
     f: &mut Frame,
     area: Rect,
     top: usize,
@@ -1528,7 +1791,7 @@ pub fn format_ascii_table(
     output
 }
 
-fn format_bytes(bytes: usize) -> String {
+pub(crate) fn format_bytes(bytes: usize) -> String {
     if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else if bytes >= 1024 {
@@ -2093,6 +2356,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Ctrl+U              Delete to start of line"),
         Line::from("  Delete / Backspace  Delete character"),
         Line::from("  F3                  Open SQL history"),
+        Line::from("  F4                  Toad-style Object Describe / DDL under cursor (table, index, view, package, …)"),
         Line::from("  Ctrl+Space          SQL completion popup (Ctrl+. fallback) — ↑/↓ select, Enter/Tab insert, Esc close"),
         Line::from(""),
         Line::from(Span::styled(
@@ -2105,10 +2369,14 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
         Line::from("    panes: Tab focus (List/SQL/Plan) · Ctrl+Z/F11 zoom · Alt+↑/↓ grow/shrink focused pane · Ctrl+↑/↓ SQL size"),
         Line::from("    scroll: focus SQL/Plan then ↑↓/PgUp/PgDn · Home/End top/bottom · ←→ plan sideways · wheel scrolls pane under mouse"),
-        Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL"),
+        Line::from("  F4                  Object DDL viewer — Ctrl+C/Y copy DDL · Enter/i load into editor · n new tab · r reload"),
+        Line::from("  F6                  Performance & DBA dashboard — gauges/sparklines + curated DBA queries (locks, CPU, memory, waits)"),
+        Line::from("    in perf: 1-0/↑↓ pick query · Enter/R refresh · a 5s live auto-refresh · v toggle SQL · s load SQL→editor · n→new tab"),
+        Line::from("  F12                 DB explorer — schema/type folders, result-style preview, DDL (F4 opens full DDL)"),
         Line::from("    panes: Tab focus (Objects/Detail) · Ctrl+Z/F11 zoom · Alt+↑/↓ resize · ↑↓/PgUp/PgDn + ←→ scroll detail · Ctrl+F more rows · wheel scrolls"),
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
+        Line::from("  Ctrl+S              Incremental search (Emacs I-search) — type to find, Ctrl-S next, Ctrl-R prev, Enter/Esc done, Ctrl-G cancel"),
     ];
     let p = Paragraph::new(help_text).block(
         Block::default()
@@ -2117,6 +2385,40 @@ pub fn render_help(f: &mut Frame, area: Rect) {
             .border_style(Style::default().fg(Color::Yellow)),
     );
     f.render_widget(p, area);
+}
+
+/// Plain-text help lines for incremental search (same content as `render_help`).
+pub fn help_search_lines() -> Vec<String> {
+    vec![
+        " Frog DB Client — Welcome & Usability Overview ".to_string(),
+        " ─ Window & Panels ─ ".to_string(),
+        "  Ctrl+T              Open new session tab".to_string(),
+        "  Ctrl+W              Close current tab".to_string(),
+        "  Ctrl+Right / Alt+Right  Next session tab".to_string(),
+        "  Ctrl+Left / Alt+Left   Previous session tab".to_string(),
+        "  Alt+1..9            Switch to session tab 1-9".to_string(),
+        "  Tab                 Switch active window (Editor / Results / Sidebar)".to_string(),
+        "  Ctrl+Z / F11        Zoom / Maximize active panel".to_string(),
+        "  Ctrl+S              Incremental search (Emacs I-search)".to_string(),
+        " ─ SQL Execution ─ ".to_string(),
+        "  Ctrl+Enter / Alt+Enter / Ctrl+J / F8 / F9  Execute statement under cursor".to_string(),
+        "  F5 / Ctrl+R         Execute all statements as script".to_string(),
+        " ─ Results ─ ".to_string(),
+        "  Ctrl+F              Fetch next page of results".to_string(),
+        "  Ctrl+D              Cycle result format: Table → Markdown → ASCII".to_string(),
+        " ─ SQL Editor ─ ".to_string(),
+        "  F3                  Open SQL history".to_string(),
+        "  F4                  Toad-style Object Describe / DDL".to_string(),
+        " ─ Connection & Views ─ ".to_string(),
+        "  Ctrl+O              Open connection dialog".to_string(),
+        "  F1                  This help screen".to_string(),
+        "  F2                  Session browser".to_string(),
+        "  F4                  Object DDL viewer".to_string(),
+        "  F6                  Performance & DBA dashboard".to_string(),
+        "  F12                 DB explorer".to_string(),
+        "  Esc / q             Return to query editor".to_string(),
+        "  Ctrl+Q              Quit application".to_string(),
+    ]
 }
 
 pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
@@ -2433,7 +2735,7 @@ fn render_explorer_tree(
             )
         } else {
             format!(
-                " DB Explorer — ↑↓ move · →/Enter expand · s SELECT→editor · d reload · / filter · r refresh · Tab pane · Ctrl+Z zoom · Alt+↑↓ resize · Esc back{} ",
+                " DB Explorer — ↑↓ move · →/Enter expand · F4 DDL · s SELECT→editor · d reload · / filter · r refresh · Tab pane · Ctrl+Z zoom · Esc back{} ",
                 filter_note
             )
         }
@@ -2795,6 +3097,7 @@ fn render_explorer_detail(
                         result_format,
                         focused,
                     },
+                    None,
                     f,
                     chunks[1],
                 );
@@ -3178,7 +3481,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|f| {
-                render_table(&session, &Some(&qr), view, f, f.area());
+                render_table(&session, &Some(&qr), view, None, f, f.area());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -3296,7 +3599,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|f| {
-                render_table(&session, &session.results.last(), view, f, f.area());
+                render_table(&session, &session.results.last(), view, None, f, f.area());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

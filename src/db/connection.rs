@@ -1,3 +1,8 @@
+use crate::db::ddl::{
+    format_oracle_col_type, format_rich_create_table, DdlTarget, DescribedObject, RichColumn,
+    TableConstraintDdl,
+};
+use crate::db::perf::PerfSnapshot;
 use oracle::Connection;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -187,6 +192,13 @@ pub trait DbConnection: Send + Sync {
     /// F12 DB explorer: DDL/source text for any object (tables synthesize
     /// CREATE TABLE from columns; views/procedures read the dictionary).
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String>;
+    /// F4 Toad-style Describe: resolve `[schema.]object` across tables, indexes,
+    /// views, mviews, sequences, packages, routines, triggers, types and synonyms,
+    /// returning its resolved metadata and full DDL script.
+    fn describe_object(&self, target: &DdlTarget) -> anyhow::Result<DescribedObject>;
+    /// F6 Performance dashboard: lightweight health snapshot (sessions, locks,
+    /// wait breakdown, memory & cache hit ratio).
+    fn collect_perf_snapshot(&self) -> anyhow::Result<PerfSnapshot>;
 
     // -- Completion metadata (cached by MetadataStore; never called on the
     // -- keystroke path) ----------------------------------------------------
@@ -301,6 +313,7 @@ pub(crate) type QueryData = (Vec<String>, Vec<Vec<String>>, bool, usize, usize);
 
 /// Assemble `CREATE TABLE <qualified> (...)` from column metadata. `quote`
 /// wraps identifiers (identity on Oracle, double quotes on Postgres).
+#[allow(dead_code)]
 pub(crate) fn format_create_table(
     qualified: &str,
     cols: &[ColumnInfo],
@@ -865,25 +878,12 @@ impl OracleConnection {
         Ok(out)
     }
 
-    /// F12 explorer: DDL/source for one object. Tables synthesize CREATE TABLE
-    /// from ALL_TAB_COLUMNS; views read ALL_VIEWS; code reads ALL_SOURCE.
+    /// F12 explorer & F4 Describe: DDL/source for one object. Tables synthesize
+    /// a rich CREATE TABLE (columns with precision/length/defaults, constraints,
+    /// indexes & comments); views read ALL_VIEWS; code reads ALL_SOURCE.
     pub fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
-        match kind {
-            "TABLE" | "FOREIGN TABLE" => {
-                let cols = self.list_columns(schema, name, kind)?;
-                if cols.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "no columns visible for {}.{} (no access?)",
-                        schema,
-                        name
-                    ));
-                }
-                Ok(format_create_table(
-                    &format!("{}.{}", schema, name),
-                    &cols,
-                    |s| s.to_string(),
-                ))
-            }
+        match kind.to_ascii_uppercase().as_str() {
+            "TABLE" | "FOREIGN TABLE" => self.table_ddl_rich(schema, name),
             "VIEW" => {
                 let sql = "SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2";
                 let mut stmt = self
@@ -900,9 +900,21 @@ impl OracleConnection {
                     let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
                     let text: String = row.get(0).unwrap_or_default();
                     if !text.trim().is_empty() {
+                        let cols = self.list_columns(schema, name, "VIEW").unwrap_or_default();
+                        let col_list = if cols.is_empty() {
+                            String::new()
+                        } else {
+                            let names: Vec<String> =
+                                cols.iter().map(|c| ora_ident(&c.name)).collect();
+                            format!(" ({})", names.join(", "))
+                        };
+                        let clean_body = text.trim_end().trim_end_matches(';');
                         return Ok(format!(
-                            "CREATE OR REPLACE VIEW {}.{} AS\n{}",
-                            schema, name, text
+                            "CREATE OR REPLACE FORCE VIEW {}.{}{}\nAS\n{};",
+                            ora_ident(schema),
+                            ora_ident(name),
+                            col_list,
+                            clean_body
                         ));
                     }
                 }
@@ -914,8 +926,10 @@ impl OracleConnection {
             }
             "INDEX" => self.index_ddl(schema, name),
             "SEQUENCE" => self.sequence_ddl(schema, name),
-            "MVIEW" => {
-                let sql = "SELECT QUERY FROM ALL_MVIEWS WHERE OWNER = :1 AND MVIEW_NAME = :2";
+            "SYNONYM" => self.synonym_ddl(schema, name),
+            "MVIEW" | "MATERIALIZED VIEW" => {
+                let sql = "SELECT BUILD_MODE, REFRESH_MODE, REFRESH_METHOD, QUERY \
+                           FROM ALL_MVIEWS WHERE OWNER = :1 AND MVIEW_NAME = :2";
                 let mut stmt = self
                     .conn
                     .statement(sql)
@@ -928,12 +942,27 @@ impl OracleConnection {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 for row_result in rows {
                     let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let text: String = row.get(0).unwrap_or_default();
+                    let build: String = row.get(0).unwrap_or_default();
+                    let rmode: String = row.get(1).unwrap_or_default();
+                    let rmethod: String = row.get(2).unwrap_or_default();
+                    let text: String = row.get(3).unwrap_or_default();
                     if !text.trim().is_empty() {
-                        return Ok(format!(
-                            "CREATE MATERIALIZED VIEW {}.{} AS\n{}",
-                            schema, name, text
-                        ));
+                        let clean_body = text.trim_end().trim_end_matches(';');
+                        let mut ddl = format!(
+                            "CREATE MATERIALIZED VIEW {}.{}\n  BUILD {}\n  REFRESH {} ON {}\nAS\n{};",
+                            ora_ident(schema),
+                            ora_ident(name),
+                            if build.is_empty() { "IMMEDIATE" } else { &build },
+                            if rmethod.is_empty() { "FORCE" } else { &rmethod },
+                            if rmode.is_empty() { "DEMAND" } else { &rmode },
+                            clean_body
+                        );
+                        let idx_stmts = self.table_indexes_ddl(&owned, &tname, &[]).unwrap_or_default();
+                        if !idx_stmts.is_empty() {
+                            ddl.push_str("\n\n-- Indexes\n");
+                            ddl.push_str(&idx_stmts.join("\n"));
+                        }
+                        return Ok(ddl);
                     }
                 }
                 Err(anyhow::anyhow!(
@@ -942,49 +971,419 @@ impl OracleConnection {
                     name
                 ))
             }
-            _ => {
-                // Code objects: ALL_SOURCE holds one row per line.
-                // TYPE must match OBJECT_TYPE ('PACKAGE' = spec, 'PACKAGE BODY'
-                // would be a separate row in ALL_OBJECTS).
-                let sql = "SELECT TEXT FROM ALL_SOURCE WHERE OWNER = :1 AND NAME = :2 \
-                           AND TYPE = :3 ORDER BY LINE";
-                let mut stmt = self
-                    .conn
-                    .statement(sql)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let owned = schema.to_uppercase();
-                let oname = name.to_uppercase();
-                let otype = kind.to_uppercase();
-                let rows = stmt
-                    .query(&[&owned, &oname, &otype])
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let mut out = String::new();
-                let mut lines = 0usize;
-                for row_result in rows {
-                    let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let text: String = row.get(0).unwrap_or_default();
-                    out.push_str(&text);
-                    if !text.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    lines += 1;
-                    if lines >= 500 {
-                        out.push_str("-- ... truncated at 500 lines ...\n");
-                        break;
-                    }
+            "PACKAGE" => {
+                let spec = self.source_ddl(schema, name, "PACKAGE")?;
+                match self.source_ddl(schema, name, "PACKAGE BODY") {
+                    Ok(body) => Ok(format!("{}\n\n{}", spec, body)),
+                    Err(_) => Ok(spec),
                 }
-                if out.trim().is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "no source for {} {}.{} (need SELECT on ALL_SOURCE?)",
-                        kind,
-                        schema,
-                        name
-                    ));
-                }
-                Ok(out)
+            }
+            other => self.source_ddl(schema, name, other),
+        }
+    }
+
+    fn source_ddl(&self, schema: &str, name: &str, otype: &str) -> anyhow::Result<String> {
+        let sql = "SELECT TEXT FROM ALL_SOURCE WHERE OWNER = :1 AND NAME = :2 \
+                   AND TYPE = :3 ORDER BY LINE";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let oname = name.to_uppercase();
+        let otype_up = otype.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &oname, &otype_up])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = String::new();
+        let mut lines = 0usize;
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let text: String = row.get(0).unwrap_or_default();
+            out.push_str(&text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+            lines += 1;
+            if lines >= 10_000 {
+                out.push_str("-- ... truncated at 10000 lines ...\n");
+                break;
             }
         }
+        if out.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "no source for {} {}.{} (need SELECT on ALL_SOURCE?)",
+                otype,
+                schema,
+                name
+            ));
+        }
+        let trimmed = out.trim_start();
+        let upper_head = trimmed.to_ascii_uppercase();
+        let full = if upper_head.starts_with("CREATE") {
+            trimmed.to_string()
+        } else {
+            format!("CREATE OR REPLACE {}", trimmed)
+        };
+        let mut clean = full.trim_end().to_string();
+        if !clean.ends_with("\n/") {
+            clean.push_str("\n/");
+        }
+        Ok(clean)
+    }
+
+    fn table_ddl_rich(&self, schema: &str, name: &str) -> anyhow::Result<String> {
+        let sql = "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH, CHAR_LENGTH, CHAR_USED, \
+                          DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT \
+                   FROM ALL_TAB_COLUMNS \
+                   WHERE OWNER = :1 AND TABLE_NAME = :2 ORDER BY COLUMN_ID";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let tname = name.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &tname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut cols = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cname: String = row.get(0).unwrap_or_default();
+            if cname.trim().is_empty() {
+                continue;
+            }
+            let dtype: String = row.get(1).unwrap_or_default();
+            let dlen: Option<i64> = row.get(2).unwrap_or(None);
+            let clen: Option<i64> = row.get(3).unwrap_or(None);
+            let cused: Option<String> = row.get(4).unwrap_or(None);
+            let prec: Option<i64> = row.get(5).unwrap_or(None);
+            let scale: Option<i64> = row.get(6).unwrap_or(None);
+            let nullable: String = row.get(7).unwrap_or_default();
+            let ddefault: Option<String> = row.get(8).unwrap_or(None);
+
+            cols.push(RichColumn {
+                name: cname,
+                full_type: format_oracle_col_type(
+                    &dtype,
+                    dlen,
+                    clen,
+                    cused.as_deref(),
+                    prec,
+                    scale,
+                ),
+                default_expr: ddefault
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                nullable: nullable.trim().eq_ignore_ascii_case("Y"),
+            });
+            if cols.len() >= 1000 {
+                break;
+            }
+        }
+
+        if cols.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no columns visible for {}.{} (no access?)",
+                schema,
+                name
+            ));
+        }
+
+        let (constraints, constraint_indexes) = self
+            .table_constraints_ddl(&owned, &tname)
+            .unwrap_or_default();
+
+        let mut extra = Vec::new();
+        if let Ok(idx_ddls) = self.table_indexes_ddl(&owned, &tname, &constraint_indexes) {
+            if !idx_ddls.is_empty() {
+                extra.push("-- Indexes".to_string());
+                extra.extend(idx_ddls);
+            }
+        }
+        if let Ok(comments) = self.table_comments_ddl(&owned, &tname) {
+            if !comments.is_empty() {
+                extra.push("-- Comments".to_string());
+                extra.extend(comments);
+            }
+        }
+
+        let qualified = format!("{}.{}", ora_ident(&owned), ora_ident(&tname));
+        Ok(format_rich_create_table(
+            "TABLE",
+            &qualified,
+            &cols,
+            &constraints,
+            None,
+            &extra,
+            ora_ident,
+        ))
+    }
+
+    fn table_constraints_ddl(
+        &self,
+        owner: &str,
+        table: &str,
+    ) -> anyhow::Result<(Vec<TableConstraintDdl>, Vec<String>)> {
+        let sql = "\
+            SELECT c.constraint_name, c.constraint_type, c.generated, \
+                   c.r_owner, c.r_constraint_name, c.delete_rule, c.index_name, \
+                   cc.column_name \
+            FROM all_constraints c \
+            JOIN all_cons_columns cc \
+              ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
+            WHERE c.owner = :1 AND c.table_name = :2 \
+              AND c.constraint_type IN ('P', 'U', 'R') \
+            ORDER BY CASE c.constraint_type WHEN 'P' THEN 0 WHEN 'U' THEN 1 ELSE 2 END, \
+                     c.constraint_name, cc.position";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt
+            .query(&[&owner, &table])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        struct RawCon {
+            name: String,
+            ctype: String,
+            generated: bool,
+            r_owner: String,
+            r_con: String,
+            delete_rule: String,
+            cols: Vec<String>,
+        }
+
+        let mut list: Vec<RawCon> = Vec::new();
+        let mut backing_indexes: Vec<String> = Vec::new();
+
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cname: String = row.get(0).unwrap_or_default();
+            let ctype: String = row.get(1).unwrap_or_default();
+            let gen_flag: String = row.get(2).unwrap_or_default();
+            let r_owner: String = row.get(3).unwrap_or_default();
+            let r_con: String = row.get(4).unwrap_or_default();
+            let del_rule: String = row.get(5).unwrap_or_default();
+            let idx_name: String = row.get(6).unwrap_or_default();
+            let col_name: String = row.get(7).unwrap_or_default();
+
+            if !idx_name.trim().is_empty() && !backing_indexes.contains(&idx_name) {
+                backing_indexes.push(idx_name);
+            }
+            if let Some(last) = list.last_mut().filter(|x| x.name == cname) {
+                last.cols.push(ora_ident(&col_name));
+            } else {
+                list.push(RawCon {
+                    name: cname,
+                    ctype,
+                    generated: gen_flag.eq_ignore_ascii_case("GENERATED NAME"),
+                    r_owner,
+                    r_con,
+                    delete_rule: del_rule,
+                    cols: vec![ora_ident(&col_name)],
+                });
+            }
+        }
+
+        let mut out = Vec::new();
+        for c in list {
+            let opt_name = if c.generated || c.name.starts_with("SYS_") {
+                None
+            } else {
+                Some(c.name.clone())
+            };
+            let cols_str = c.cols.join(", ");
+            let def = match c.ctype.as_str() {
+                "P" => format!("PRIMARY KEY ({})", cols_str),
+                "U" => format!("UNIQUE ({})", cols_str),
+                "R" => {
+                    let target = self
+                        .resolve_fk_target(&c.r_owner, &c.r_con)
+                        .unwrap_or_else(|| format!("{}.{}", c.r_owner, c.r_con));
+                    let on_del = match c.delete_rule.to_ascii_uppercase().as_str() {
+                        "CASCADE" => " ON DELETE CASCADE",
+                        "SET NULL" => " ON DELETE SET NULL",
+                        _ => "",
+                    };
+                    format!("FOREIGN KEY ({}) REFERENCES {}{}", cols_str, target, on_del)
+                }
+                _ => continue,
+            };
+            out.push(TableConstraintDdl {
+                name: opt_name,
+                definition: def,
+            });
+        }
+        Ok((out, backing_indexes))
+    }
+
+    fn resolve_fk_target(&self, r_owner: &str, r_con: &str) -> Option<String> {
+        if r_owner.is_empty() || r_con.is_empty() {
+            return None;
+        }
+        let sql = "SELECT TABLE_NAME, COLUMN_NAME FROM ALL_CONS_COLUMNS \
+                   WHERE OWNER = :1 AND CONSTRAINT_NAME = :2 ORDER BY POSITION";
+        let mut stmt = self.conn.statement(sql).build().ok()?;
+        let rows = stmt.query(&[&r_owner, &r_con]).ok()?;
+        let mut tname = String::new();
+        let mut cols = Vec::new();
+        for row in rows.flatten() {
+            let tn: String = row.get(0).unwrap_or_default();
+            let cn: String = row.get(1).unwrap_or_default();
+            if tname.is_empty() {
+                tname = tn;
+            }
+            if !cn.is_empty() {
+                cols.push(ora_ident(&cn));
+            }
+        }
+        if tname.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{}.{} ({})",
+                ora_ident(r_owner),
+                ora_ident(&tname),
+                cols.join(", ")
+            ))
+        }
+    }
+
+    fn table_indexes_ddl(
+        &self,
+        owner: &str,
+        table: &str,
+        skip_names: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = "SELECT OWNER, INDEX_NAME, GENERATED FROM ALL_INDEXES \
+                   WHERE TABLE_OWNER = :1 AND TABLE_NAME = :2 \
+                     AND INDEX_TYPE != 'LOB' \
+                   ORDER BY INDEX_NAME";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = stmt
+            .query(&[&owner, &table])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = Vec::new();
+        for row_result in rows {
+            let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let iowner: String = row.get(0).unwrap_or_default();
+            let iname: String = row.get(1).unwrap_or_default();
+            let generated: String = row.get(2).unwrap_or_default();
+            if skip_names.iter().any(|s| s == &iname) && generated.eq_ignore_ascii_case("Y") {
+                continue;
+            }
+            if skip_names.iter().any(|s| s == &iname) {
+                continue;
+            }
+            if let Ok(ddl) = self.index_ddl(&iowner, &iname) {
+                out.push(ddl);
+            }
+        }
+        Ok(out)
+    }
+
+    fn table_comments_ddl(&self, owner: &str, table: &str) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = self
+            .conn
+            .statement("SELECT COMMENTS FROM ALL_TAB_COMMENTS WHERE OWNER = :1 AND TABLE_NAME = :2")
+            .build()
+        {
+            if let Ok(rows) = stmt.query(&[&owner, &table]) {
+                for row in rows.flatten() {
+                    let c: String = row.get(0).unwrap_or_default();
+                    if !c.trim().is_empty() {
+                        out.push(format!(
+                            "COMMENT ON TABLE {}.{} IS '{}';",
+                            ora_ident(owner),
+                            ora_ident(table),
+                            c.replace('\'', "''")
+                        ));
+                    }
+                }
+            }
+        }
+        if let Ok(mut stmt) = self
+            .conn
+            .statement(
+                "SELECT COLUMN_NAME, COMMENTS FROM ALL_COL_COMMENTS \
+                 WHERE OWNER = :1 AND TABLE_NAME = :2 AND COMMENTS IS NOT NULL \
+                 ORDER BY COLUMN_NAME",
+            )
+            .build()
+        {
+            if let Ok(rows) = stmt.query(&[&owner, &table]) {
+                for row in rows.flatten() {
+                    let col: String = row.get(0).unwrap_or_default();
+                    let c: String = row.get(1).unwrap_or_default();
+                    if !col.trim().is_empty() && !c.trim().is_empty() {
+                        out.push(format!(
+                            "COMMENT ON COLUMN {}.{}.{} IS '{}';",
+                            ora_ident(owner),
+                            ora_ident(table),
+                            ora_ident(&col),
+                            c.replace('\'', "''")
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn synonym_ddl(&self, schema: &str, name: &str) -> anyhow::Result<String> {
+        let sql = "SELECT TABLE_OWNER, TABLE_NAME, DB_LINK FROM ALL_SYNONYMS \
+                   WHERE OWNER = :1 AND SYNONYM_NAME = :2";
+        let mut stmt = self
+            .conn
+            .statement(sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let owned = schema.to_uppercase();
+        let sname = name.to_uppercase();
+        let rows = stmt
+            .query(&[&owned, &sname])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        if let Some(row_res) = rows.into_iter().next() {
+            let row = row_res.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let towner: String = row.get(0).unwrap_or_default();
+            let tname: String = row.get(1).unwrap_or_default();
+            let dblink: String = row.get(2).unwrap_or_default();
+            let pub_kw = if owned == "PUBLIC" { "PUBLIC " } else { "" };
+            let syn_qual = if owned == "PUBLIC" {
+                ora_ident(&sname)
+            } else {
+                format!("{}.{}", ora_ident(&owned), ora_ident(&sname))
+            };
+            let target_qual = if towner.is_empty() {
+                ora_ident(&tname)
+            } else {
+                format!("{}.{}", ora_ident(&towner), ora_ident(&tname))
+            };
+            let link = if dblink.is_empty() {
+                String::new()
+            } else {
+                format!("@{}", dblink)
+            };
+            return Ok(format!(
+                "CREATE OR REPLACE {}SYNONYM {} FOR {}{};",
+                pub_kw, syn_qual, target_qual, link
+            ));
+        }
+        Err(anyhow::anyhow!(
+            "synonym {}.{} not visible",
+            schema,
+            name
+        ))
     }
 
     /// F12 explorer: columns of one table-like object (or the key columns
@@ -1192,11 +1591,12 @@ impl OracleConnection {
         Ok(out)
     }
 
-    /// F12 explorer: CREATE INDEX reconstructed from ALL_INDEXES +
-    /// ALL_IND_COLUMNS (no DBMS_METADATA privileges needed).
+    /// F12 explorer & F4 Describe: CREATE INDEX reconstructed from ALL_INDEXES,
+    /// ALL_IND_COLUMNS and ALL_IND_EXPRESSIONS (handles bitmap & function-based
+    /// indexes with no DBMS_METADATA privileges needed).
     fn index_ddl(&self, schema: &str, index: &str) -> anyhow::Result<String> {
-        let sql = "SELECT TABLE_OWNER, TABLE_NAME, UNIQUENESS FROM ALL_INDEXES \
-                   WHERE OWNER = :1 AND INDEX_NAME = :2";
+        let sql = "SELECT TABLE_OWNER, TABLE_NAME, UNIQUENESS, INDEX_TYPE, TABLESPACE_NAME \
+                   FROM ALL_INDEXES WHERE OWNER = :1 AND INDEX_NAME = :2";
         let mut stmt = self
             .conn
             .statement(sql)
@@ -1207,13 +1607,15 @@ impl OracleConnection {
         let rows = stmt
             .query(&[&owned, &iname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let (towner, tname, unique) = match rows.into_iter().next() {
+        let (towner, tname, unique, idx_type, tbs) = match rows.into_iter().next() {
             Some(row_result) => {
                 let row = row_result.map_err(|e| anyhow::anyhow!("{}", e))?;
                 let to: String = row.get(0).unwrap_or_default();
                 let tn: String = row.get(1).unwrap_or_default();
                 let uq: String = row.get(2).unwrap_or_default();
-                (to, tn, uq.eq_ignore_ascii_case("UNIQUE"))
+                let it: String = row.get(3).unwrap_or_default();
+                let ts: String = row.get(4).unwrap_or_default();
+                (to, tn, uq.eq_ignore_ascii_case("UNIQUE"), it, ts)
             }
             None => {
                 return Err(anyhow::anyhow!(
@@ -1231,25 +1633,66 @@ impl OracleConnection {
                 index
             ));
         }
-        // ColumnInfo.data_type holds "KEY #pos [DESC]"; strip the prefix.
+
+        // Function-based index expressions (SYS_NC...$ synthetic column names).
+        let mut exprs: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        if idx_type.to_ascii_uppercase().contains("FUNCTION") {
+            if let Ok(mut estmt) = self
+                .conn
+                .statement(
+                    "SELECT COLUMN_POSITION, COLUMN_EXPRESSION FROM ALL_IND_EXPRESSIONS \
+                     WHERE INDEX_OWNER = :1 AND INDEX_NAME = :2",
+                )
+                .build()
+            {
+                if let Ok(erows) = estmt.query(&[&owned, &iname]) {
+                    for erow in erows.flatten() {
+                        let pos: i32 = erow.get(0).unwrap_or(0);
+                        let expr: String = erow.get(1).unwrap_or_default();
+                        if pos > 0 && !expr.trim().is_empty() {
+                            exprs.insert(pos as usize, expr.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         let keys: Vec<String> = cols
             .iter()
-            .map(|c| {
+            .enumerate()
+            .map(|(i, c)| {
+                let base = exprs
+                    .get(&(i + 1))
+                    .cloned()
+                    .unwrap_or_else(|| ora_ident(&c.name));
                 if c.data_type.ends_with(" DESC") {
-                    format!("{} DESC", c.name)
+                    format!("{} DESC", base)
                 } else {
-                    c.name.clone()
+                    base
                 }
             })
             .collect();
+        let modifier = if unique {
+            "UNIQUE "
+        } else if idx_type.to_ascii_uppercase().contains("BITMAP") {
+            "BITMAP "
+        } else {
+            ""
+        };
+        let tbs_clause = if tbs.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" TABLESPACE {}", ora_ident(tbs.trim()))
+        };
         Ok(format!(
-            "CREATE {}INDEX {}.{} ON {}.{} ({});",
-            if unique { "UNIQUE " } else { "" },
-            schema,
-            index,
-            towner,
-            tname,
-            keys.join(", ")
+            "CREATE {}INDEX {}.{} ON {}.{} ({}){};",
+            modifier,
+            ora_ident(&owned),
+            ora_ident(&iname),
+            ora_ident(&towner),
+            ora_ident(&tname),
+            keys.join(", "),
+            tbs_clause
         ))
     }
 
@@ -1328,6 +1771,452 @@ impl OracleConnection {
             &[],
         );
         result
+    }
+
+    /// F4 Toad-style Describe: resolve `[schema.]object` (including synonyms,
+    /// cross-schema indexes/views/tables, and `package.member` calls) and
+    /// generate its full DDL script.
+    pub fn describe_object(&self, target: &DdlTarget) -> anyhow::Result<DescribedObject> {
+        let start = std::time::Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
+
+        let cur_schema = self.current_schema().unwrap_or_default();
+        let norm_name = if target.name_quoted {
+            target.name.clone()
+        } else {
+            target.name.to_uppercase()
+        };
+
+        if let (Some(s), Some(k)) = (target.schema.as_deref(), target.kind_hint.as_deref()) {
+            let owner = if target.schema_quoted {
+                s.to_string()
+            } else {
+                s.to_uppercase()
+            };
+            let ddl = self.object_ddl(&owner, &norm_name, k)?;
+            let summary = self.oracle_object_summary(&owner, &norm_name, k);
+            return Ok(DescribedObject {
+                schema: owner,
+                name: norm_name,
+                kind: k.to_uppercase(),
+                ddl,
+                summary,
+                elapsed_ms: elapsed(),
+            });
+        }
+
+        let mut synonym_prefix: Option<String> = None;
+        let resolved: Option<(String, String, String)> = match target.schema.as_deref() {
+            Some(s) => {
+                let owner = if target.schema_quoted {
+                    s.to_string()
+                } else {
+                    s.to_uppercase()
+                };
+                if let Some((kind, _)) = self.find_in_schema(&owner, &norm_name) {
+                    Some((owner, norm_name.clone(), kind))
+                } else if !cur_schema.is_empty() {
+                    // Could be `pkg_name.member_name` in CURRENT_SCHEMA or a synonym to a package.
+                    if let Some((kind, _)) = self
+                        .find_in_schema(&cur_schema, &owner)
+                        .filter(|(k, _)| k == "PACKAGE")
+                    {
+                        Some((cur_schema.clone(), owner, kind))
+                    } else if let Some((syn_owner, t_owner, t_name, dblink)) =
+                        self.resolve_synonym(&cur_schema, &owner)
+                    {
+                        if dblink.is_empty() {
+                            if let Some((kind, _)) = self
+                                .find_in_schema(&t_owner, &t_name)
+                                .filter(|(k, _)| k == "PACKAGE")
+                            {
+                                if let Ok(sddl) = self.synonym_ddl(&syn_owner, &owner) {
+                                    synonym_prefix = Some(format!(
+                                        "-- Synonym {}.{} -> {}.{}\n{}",
+                                        syn_owner, owner, t_owner, t_name, sddl
+                                    ));
+                                }
+                                Some((t_owner, t_name, kind))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => {
+                // 1. Current schema direct object.
+                let direct = if !cur_schema.is_empty() {
+                    self.find_in_schema(&cur_schema, &norm_name)
+                        .map(|(k, _)| (cur_schema.clone(), norm_name.clone(), k))
+                } else {
+                    None
+                };
+
+                match direct {
+                    Some((o, n, k)) if k != "SYNONYM" => Some((o, n, k)),
+                    _ => {
+                        // 2. Private or PUBLIC synonym -> unwrap to target object when local!
+                        if let Some((syn_owner, t_owner, t_name, dblink)) =
+                            self.resolve_synonym(&cur_schema, &norm_name)
+                        {
+                            let sddl = self.synonym_ddl(&syn_owner, &norm_name).ok();
+                            if dblink.is_empty() && !t_owner.is_empty() {
+                                if let Some((tkind, _)) = self.find_in_schema(&t_owner, &t_name) {
+                                    if let Some(s) = sddl {
+                                        synonym_prefix = Some(format!(
+                                            "-- Synonym {}.{} -> {}.{}\n{}",
+                                            syn_owner, norm_name, t_owner, t_name, s
+                                        ));
+                                    }
+                                    Some((t_owner, t_name, tkind))
+                                } else {
+                                    Some((syn_owner, norm_name.clone(), "SYNONYM".into()))
+                                }
+                            } else {
+                                Some((syn_owner, norm_name.clone(), "SYNONYM".into()))
+                            }
+                        } else {
+                            // 3. Cross-schema search across ALL_OBJECTS (e.g. an unqualified index or view).
+                            self.find_anywhere(&norm_name)
+                        }
+                    }
+                }
+            }
+        };
+
+        let Some((owner, obj_name, kind)) = resolved else {
+            return Err(anyhow::anyhow!(
+                "Object '{}' not found in ALL_OBJECTS (check spelling or privileges)",
+                target.display_label()
+            ));
+        };
+
+        let mut ddl = self.object_ddl(&owner, &obj_name, &kind)?;
+        if let Some(prefix) = synonym_prefix {
+            ddl = format!("{}\n\n{}", prefix, ddl);
+        }
+        let summary = self.oracle_object_summary(&owner, &obj_name, &kind);
+
+        Ok(DescribedObject {
+            schema: owner,
+            name: obj_name,
+            kind,
+            ddl,
+            summary,
+            elapsed_ms: elapsed(),
+        })
+    }
+
+    fn find_in_schema(&self, owner: &str, name: &str) -> Option<(String, String)> {
+        let sql = "\
+            SELECT OBJECT_TYPE, STATUS FROM ALL_OBJECTS \
+            WHERE OWNER = :1 AND OBJECT_NAME = :2 \
+              AND OBJECT_TYPE IN ( \
+                'TABLE','VIEW','MATERIALIZED VIEW','INDEX','SEQUENCE', \
+                'PACKAGE','PROCEDURE','FUNCTION','TRIGGER','TYPE','SYNONYM' \
+              ) \
+            ORDER BY CASE OBJECT_TYPE \
+              WHEN 'TABLE' THEN 1 \
+              WHEN 'VIEW' THEN 2 \
+              WHEN 'MATERIALIZED VIEW' THEN 3 \
+              WHEN 'INDEX' THEN 4 \
+              WHEN 'SEQUENCE' THEN 5 \
+              WHEN 'PACKAGE' THEN 6 \
+              WHEN 'PROCEDURE' THEN 7 \
+              WHEN 'FUNCTION' THEN 8 \
+              WHEN 'TRIGGER' THEN 9 \
+              WHEN 'TYPE' THEN 10 \
+              ELSE 11 END";
+        let mut stmt = self.conn.statement(sql).build().ok()?;
+        let rows = stmt.query(&[&owner, &name]).ok()?;
+        let row = rows.into_iter().next()?.ok()?;
+        let otype: String = row.get(0).unwrap_or_default();
+        let status: String = row.get(1).unwrap_or_default();
+        if otype.is_empty() {
+            None
+        } else {
+            Some((otype, status))
+        }
+    }
+
+    fn resolve_synonym(
+        &self,
+        cur_schema: &str,
+        syn_name: &str,
+    ) -> Option<(String, String, String, String)> {
+        let sql = "\
+            SELECT OWNER, TABLE_OWNER, TABLE_NAME, NVL(DB_LINK, '') \
+            FROM ALL_SYNONYMS \
+            WHERE SYNONYM_NAME = :1 AND OWNER IN (:2, 'PUBLIC') \
+            ORDER BY CASE WHEN OWNER = :2 THEN 0 ELSE 1 END";
+        let mut stmt = self.conn.statement(sql).build().ok()?;
+        let rows = stmt.query(&[&syn_name, &cur_schema]).ok()?;
+        let row = rows.into_iter().next()?.ok()?;
+        Some((
+            row.get(0).unwrap_or_default(),
+            row.get(1).unwrap_or_default(),
+            row.get(2).unwrap_or_default(),
+            row.get(3).unwrap_or_default(),
+        ))
+    }
+
+    fn find_anywhere(&self, name: &str) -> Option<(String, String, String)> {
+        let sql = "\
+            SELECT OWNER, OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS \
+            WHERE OBJECT_NAME = :1 \
+              AND OBJECT_TYPE IN ( \
+                'TABLE','VIEW','MATERIALIZED VIEW','INDEX','SEQUENCE', \
+                'PACKAGE','PROCEDURE','FUNCTION','TRIGGER','TYPE','SYNONYM' \
+              ) \
+            ORDER BY CASE WHEN OWNER IN ('SYS','SYSTEM') THEN 1 ELSE 0 END, \
+                     CASE OBJECT_TYPE \
+                       WHEN 'TABLE' THEN 1 WHEN 'VIEW' THEN 2 WHEN 'INDEX' THEN 3 \
+                       WHEN 'PACKAGE' THEN 4 ELSE 5 END, \
+                     OWNER";
+        let mut stmt = self.conn.statement(sql).build().ok()?;
+        let rows = stmt.query(&[&name]).ok()?;
+        let row = rows.into_iter().next()?.ok()?;
+        let owner: String = row.get(0).unwrap_or_default();
+        let oname: String = row.get(1).unwrap_or_default();
+        let otype: String = row.get(2).unwrap_or_default();
+        if owner.is_empty() || otype.is_empty() {
+            None
+        } else {
+            Some((owner, oname, otype))
+        }
+    }
+
+    fn oracle_object_summary(&self, owner: &str, name: &str, kind: &str) -> Option<String> {
+        match kind.to_ascii_uppercase().as_str() {
+            "TABLE" => {
+                let sql = "SELECT TABLESPACE_NAME, NUM_ROWS, PARTITIONED, \
+                           TO_CHAR(LAST_ANALYZED, 'YYYY-MM-DD HH24:MI') \
+                           FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME = :2";
+                let mut stmt = self.conn.statement(sql).build().ok()?;
+                let row = stmt.query(&[&owner, &name]).ok()?.next()?.ok()?;
+                let tbs: String = row.get(0).unwrap_or_default();
+                let nrows: Option<i64> = row.get(1).unwrap_or(None);
+                let part: String = row.get(2).unwrap_or_default();
+                let analyzed: String = row.get(3).unwrap_or_default();
+                let mut parts = Vec::new();
+                if !tbs.is_empty() {
+                    parts.push(format!("Tablespace: {}", tbs));
+                }
+                if let Some(n) = nrows {
+                    parts.push(format!("Est. Rows: {}", n));
+                }
+                if part.eq_ignore_ascii_case("YES") {
+                    parts.push("Partitioned".into());
+                }
+                if !analyzed.is_empty() {
+                    parts.push(format!("Analyzed: {}", analyzed));
+                }
+                (!parts.is_empty()).then(|| parts.join(" · "))
+            }
+            "INDEX" => {
+                let sql = "SELECT TABLE_OWNER, TABLE_NAME, INDEX_TYPE, UNIQUENESS, STATUS, \
+                           NUM_ROWS, LEAF_BLOCKS \
+                           FROM ALL_INDEXES WHERE OWNER = :1 AND INDEX_NAME = :2";
+                let mut stmt = self.conn.statement(sql).build().ok()?;
+                let row = stmt.query(&[&owner, &name]).ok()?.next()?.ok()?;
+                let to: String = row.get(0).unwrap_or_default();
+                let tn: String = row.get(1).unwrap_or_default();
+                let it: String = row.get(2).unwrap_or_default();
+                let uq: String = row.get(3).unwrap_or_default();
+                let st: String = row.get(4).unwrap_or_default();
+                let nr: Option<i64> = row.get(5).unwrap_or(None);
+                let lb: Option<i64> = row.get(6).unwrap_or(None);
+                let mut parts = vec![format!("On {}.{}", to, tn), format!("{} ({})", it, uq)];
+                if !st.is_empty() {
+                    parts.push(format!("Status: {}", st));
+                }
+                if let Some(n) = nr {
+                    parts.push(format!("Rows: {}", n));
+                }
+                if let Some(b) = lb {
+                    parts.push(format!("Leaf Blocks: {}", b));
+                }
+                Some(parts.join(" · "))
+            }
+            _ => {
+                let sql = "SELECT STATUS, TO_CHAR(LAST_DDL_TIME, 'YYYY-MM-DD HH24:MI') \
+                           FROM ALL_OBJECTS WHERE OWNER = :1 AND OBJECT_NAME = :2 AND ROWNUM = 1";
+                let mut stmt = self.conn.statement(sql).build().ok()?;
+                let row = stmt.query(&[&owner, &name]).ok()?.next()?.ok()?;
+                let st: String = row.get(0).unwrap_or_default();
+                let ddl_t: String = row.get(1).unwrap_or_default();
+                let mut parts = Vec::new();
+                if !st.is_empty() {
+                    parts.push(format!("Status: {}", st));
+                }
+                if !ddl_t.is_empty() {
+                    parts.push(format!("Last DDL: {}", ddl_t));
+                }
+                (!parts.is_empty()).then(|| parts.join(" · "))
+            }
+        }
+    }
+
+    /// F6 Performance dashboard: live Oracle session/wait/memory/cache snapshot.
+    pub fn collect_perf_snapshot(&self) -> anyhow::Result<PerfSnapshot> {
+        let start = std::time::Instant::now();
+        let mut snap = PerfSnapshot::default();
+
+        let sess_sql = "\
+            SELECT
+              COUNT(*),
+              NVL(SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END), 0),
+              NVL(SUM(CASE WHEN blocking_session IS NOT NULL THEN 1 ELSE 0 END), 0),
+              COUNT(DISTINCT blocking_session),
+              NVL(MAX(CASE WHEN status = 'ACTIVE' THEN last_call_et ELSE 0 END), 0)
+            FROM v$session
+            WHERE type != 'BACKGROUND'
+              AND sid != SYS_CONTEXT('USERENV', 'SID')";
+        let mut stmt = self
+            .conn
+            .statement(sess_sql)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{}", Self::friendly_session_error(&e.to_string())))?;
+        let rows = stmt
+            .query(&[])
+            .map_err(|e| anyhow::anyhow!("{}", Self::friendly_session_error(&e.to_string())))?;
+        if let Some(row_res) = rows.into_iter().next() {
+            let row = row_res
+                .map_err(|e| anyhow::anyhow!("{}", Self::friendly_session_error(&e.to_string())))?;
+            snap.total_sessions = row.get::<_, i64>(0).unwrap_or(0).max(0) as u64;
+            snap.active_sessions = row.get::<_, i64>(1).unwrap_or(0).max(0) as u64;
+            snap.blocked_sessions = row.get::<_, i64>(2).unwrap_or(0).max(0) as u64;
+            snap.blocking_sessions = row.get::<_, i64>(3).unwrap_or(0).max(0) as u64;
+            snap.max_active_secs = row.get::<_, i64>(4).unwrap_or(0).max(0) as u64;
+        }
+
+        // Wait-class breakdown of active sessions (same V$SESSION privilege).
+        if let Ok(mut wstmt) = self
+            .conn
+            .statement(
+                "SELECT CASE WHEN state != 'WAITING' THEN 'CPU' ELSE wait_class END, COUNT(*) \
+                 FROM v$session \
+                 WHERE type != 'BACKGROUND' AND status = 'ACTIVE' \
+                   AND sid != SYS_CONTEXT('USERENV', 'SID') \
+                 GROUP BY CASE WHEN state != 'WAITING' THEN 'CPU' ELSE wait_class END \
+                 ORDER BY 2 DESC",
+            )
+            .build()
+        {
+            if let Ok(wrows) = wstmt.query(&[]) {
+                for row in wrows.flatten() {
+                    let cls: String = row.get(0).unwrap_or_default();
+                    let cnt: i64 = row.get(1).unwrap_or(0);
+                    if !cls.is_empty() && cnt > 0 {
+                        snap.wait_breakdown.push((cls, cnt as u64));
+                    }
+                }
+            }
+        }
+
+        // Optional: SGA + PGA memory (gracefully skipped if V$SGA / V$PGASTAT not granted).
+        let mut sga_mb: Option<f64> = None;
+        if let Ok(mut mstmt) = self
+            .conn
+            .statement("SELECT ROUND(SUM(value) / 1048576, 1) FROM v$sga")
+            .build()
+        {
+            if let Ok(mrows) = mstmt.query(&[]) {
+                if let Some(Ok(r)) = mrows.into_iter().next() {
+                    sga_mb = r.get::<_, f64>(0).ok();
+                }
+            }
+        }
+        let mut pga_used: Option<f64> = None;
+        let mut pga_target: Option<f64> = None;
+        if let Ok(mut pstmt) = self
+            .conn
+            .statement(
+                "SELECT name, ROUND(value / 1048576, 1) FROM v$pgastat \
+                 WHERE name IN ('total PGA inuse', 'total PGA allocated', 'aggregate PGA target parameter')",
+            )
+            .build()
+        {
+            if let Ok(prows) = pstmt.query(&[]) {
+                let mut alloc = None;
+                for r in prows.flatten() {
+                    let k: String = r.get(0).unwrap_or_default();
+                    let v: f64 = r.get(1).unwrap_or(0.0);
+                    match k.as_str() {
+                        "total PGA inuse" => pga_used = Some(v),
+                        "total PGA allocated" => alloc = Some(v),
+                        "aggregate PGA target parameter" if v > 0.0 => pga_target = Some(v),
+                        _ => {}
+                    }
+                }
+                if pga_used.is_none() {
+                    pga_used = alloc;
+                }
+            }
+        }
+        match (sga_mb, pga_used) {
+            (Some(sga), Some(pga)) => {
+                let pga_cap = pga_target.unwrap_or(pga);
+                snap.mem_used_mb = Some(sga + pga);
+                snap.mem_total_mb = Some(sga + pga_cap.max(pga));
+                snap.mem_detail = format!("SGA {:.0}M · PGA {:.0}M", sga, pga);
+            }
+            (Some(sga), None) => {
+                snap.mem_used_mb = Some(sga);
+                snap.mem_detail = format!("SGA {:.0} MB", sga);
+            }
+            (None, Some(pga)) => {
+                snap.mem_used_mb = Some(pga);
+                snap.mem_total_mb = pga_target;
+                snap.mem_detail = format!("PGA {:.0} MB", pga);
+            }
+            (None, None) => {
+                snap.mem_detail = "SGA/PGA: no V$SGA access".into();
+            }
+        }
+
+        // Optional: Buffer cache hit ratio from V$SYSSTAT.
+        if let Ok(mut cstmt) = self
+            .conn
+            .statement(
+                "SELECT ROUND((1 - (SUM(CASE WHEN name = 'physical reads' THEN value ELSE 0 END) / \
+                 NULLIF(SUM(CASE WHEN name IN ('db block gets', 'consistent gets') THEN value ELSE 0 END), 0))) * 100, 1) \
+                 FROM v$sysstat WHERE name IN ('db block gets', 'consistent gets', 'physical reads')",
+            )
+            .build()
+        {
+            if let Ok(crows) = cstmt.query(&[]) {
+                if let Some(Ok(r)) = crows.into_iter().next() {
+                    snap.cache_hit_pct = r.get::<_, f64>(0).ok().filter(|v| v.is_finite());
+                }
+            }
+        }
+
+        snap.elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(snap)
+    }
+}
+
+/// Quote an Oracle identifier only when it isn't a plain uppercase SQL identifier.
+pub(crate) fn ora_ident(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '_' | '$' | '#'));
+    if plain {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
 
@@ -1421,6 +2310,12 @@ impl DbConnection for OracleConnection {
     }
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
         self.object_ddl(schema, name, kind)
+    }
+    fn describe_object(&self, target: &DdlTarget) -> anyhow::Result<DescribedObject> {
+        OracleConnection::describe_object(self, target)
+    }
+    fn collect_perf_snapshot(&self) -> anyhow::Result<PerfSnapshot> {
+        OracleConnection::collect_perf_snapshot(self)
     }
     fn current_schema(&self) -> anyhow::Result<String> {
         OracleConnection::current_schema(self)

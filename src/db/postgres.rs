@@ -1,7 +1,11 @@
 use super::connection::{
-    format_create_table, ColumnInfo, DbConnection, DbSessionInfo, DbType, MetaObject,
-    MetaObjectKind, QueryData, QueryRow, TableColumns, TableRef,
+    ColumnInfo, DbConnection, DbSessionInfo, DbType, MetaObject, MetaObjectKind, QueryData,
+    QueryRow, TableColumns, TableRef,
 };
+use super::ddl::{
+    format_rich_create_table, DdlTarget, DescribedObject, RichColumn, TableConstraintDdl,
+};
+use super::perf::PerfSnapshot;
 use std::sync::{Arc, Mutex};
 
 pub struct PgConnection {
@@ -417,13 +421,21 @@ impl PgConnection {
             .client
             .lock()
             .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
-        match kind {
-            // pg_get_viewdef reconstructs the query behind views AND
-            // materialized views.
-            "VIEW" | "MVIEW" => {
+        Self::ddl_with_client(&mut client, schema, name, kind)
+    }
+
+    fn ddl_with_client(
+        client: &mut postgres::Client,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> anyhow::Result<String> {
+        match kind.to_ascii_uppercase().as_str() {
+            // pg_get_viewdef reconstructs the query behind views AND materialized views.
+            "VIEW" | "MVIEW" | "MATERIALIZED VIEW" => {
                 let stmt = client
                     .prepare(
-                        "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c \
+                        "SELECT c.oid::bigint, pg_get_viewdef(c.oid, true) FROM pg_class c \
                          JOIN pg_namespace n ON n.oid = c.relnamespace \
                          WHERE n.nspname = $1 AND c.relname = $2",
                     )
@@ -433,47 +445,87 @@ impl PgConnection {
                     .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
                 match rows.into_iter().next() {
                     Some(row) => {
-                        let def: String = row.try_get(0).unwrap_or_default();
+                        let oid: i64 = row.try_get(0).unwrap_or(0);
+                        let def: String = row.try_get(1).unwrap_or_default();
                         if def.trim().is_empty() {
-                            Err(anyhow::anyhow!(
+                            return Err(anyhow::anyhow!(
                                 "no definition for {}.{} (no access?)",
                                 schema,
                                 name
-                            ))
-                        } else if kind == "MVIEW" {
-                            Ok(format!(
+                            ));
+                        }
+                        let is_mv = kind.eq_ignore_ascii_case("MVIEW")
+                            || kind.eq_ignore_ascii_case("MATERIALIZED VIEW");
+                        let mut out = if is_mv {
+                            format!(
                                 "CREATE MATERIALIZED VIEW {}.{} AS\n{}",
                                 pg_quote_ident(schema),
                                 pg_quote_ident(name),
-                                def
-                            ))
+                                def.trim_end()
+                            )
                         } else {
-                            Ok(format!(
+                            format!(
                                 "CREATE OR REPLACE VIEW {}.{} AS\n{}",
                                 pg_quote_ident(schema),
                                 pg_quote_ident(name),
-                                def
-                            ))
+                                def.trim_end()
+                            )
+                        };
+                        if !out.ends_with(';') {
+                            out.push(';');
                         }
+                        if is_mv && oid > 0 {
+                            let idx_ddls = Self::relation_indexes_ddl(client, oid);
+                            if !idx_ddls.is_empty() {
+                                out.push_str("\n\n-- Indexes\n");
+                                out.push_str(&idx_ddls.join("\n"));
+                            }
+                        }
+                        Ok(out)
                     }
                     None => Err(anyhow::anyhow!("view {}.{} not found", schema, name)),
                 }
             }
-            "TABLE" | "FOREIGN TABLE" => {
-                // Synthesize CREATE TABLE from pg_attribute (same lock).
-                let stmt = client
+            "TABLE" | "PARTITIONED TABLE" | "FOREIGN TABLE" => {
+                let rel_stmt = client
                     .prepare(
-                        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                         NOT a.attnotnull FROM pg_catalog.pg_attribute a \
-                         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                        "SELECT c.oid::bigint, c.relkind::text, \
+                                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) ELSE '' END, \
+                                COALESCE(obj_description(c.oid, 'pg_class'), '') \
+                         FROM pg_catalog.pg_class c \
                          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE n.nspname = $1 AND c.relname = $2 \
-                         AND a.attnum > 0 AND NOT a.attisdropped \
+                         WHERE n.nspname = $1 AND c.relname = $2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rel_rows = client
+                    .query(&rel_stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let Some(rel_row) = rel_rows.into_iter().next() else {
+                    return Err(anyhow::anyhow!("table {}.{} not found", schema, name));
+                };
+                let rel_oid: i64 = rel_row.try_get(0).unwrap_or(0);
+                let relkind: String = rel_row.try_get(1).unwrap_or_default();
+                let part_key: String = rel_row.try_get(2).unwrap_or_default();
+                let tbl_comment: String = rel_row.try_get(3).unwrap_or_default();
+
+                let col_stmt = client
+                    .prepare(
+                        "SELECT a.attname, \
+                                pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                                NOT a.attnotnull, \
+                                COALESCE(pg_catalog.pg_get_expr(ad.adbin, ad.adrelid), ''), \
+                                a.attidentity::text, \
+                                COALESCE(col_description(a.attrelid, a.attnum), '') \
+                         FROM pg_catalog.pg_attribute a \
+                         LEFT JOIN pg_catalog.pg_attrdef ad \
+                           ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+                         WHERE a.attrelid = $1::oid \
+                           AND a.attnum > 0 AND NOT a.attisdropped \
                          ORDER BY a.attnum LIMIT 1000",
                     )
                     .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
                 let rows = client
-                    .query(&stmt, &[&schema, &name])
+                    .query(&col_stmt, &[&(rel_oid as u32)])
                     .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
                 if rows.is_empty() {
                     return Err(anyhow::anyhow!(
@@ -482,17 +534,97 @@ impl PgConnection {
                         name
                     ));
                 }
-                let cols: Vec<ColumnInfo> = rows
-                    .iter()
-                    .map(|row| ColumnInfo {
-                        name: row.try_get(0).unwrap_or_default(),
-                        data_type: row.try_get(1).unwrap_or_default(),
-                        nullable: row.try_get(2).unwrap_or(true),
-                    })
-                    .collect();
-                Ok(format_create_table(
-                    &format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(name)),
+
+                let mut cols = Vec::with_capacity(rows.len());
+                let mut col_comments = Vec::new();
+                for row in &rows {
+                    let cname: String = row.try_get(0).unwrap_or_default();
+                    let mut ctype: String = row.try_get(1).unwrap_or_default();
+                    let nullable: bool = row.try_get(2).unwrap_or(true);
+                    let def_expr: String = row.try_get(3).unwrap_or_default();
+                    let identity: String = row.try_get(4).unwrap_or_default();
+                    let ccomment: String = row.try_get(5).unwrap_or_default();
+
+                    if identity == "a" {
+                        ctype.push_str(" GENERATED ALWAYS AS IDENTITY");
+                    } else if identity == "d" {
+                        ctype.push_str(" GENERATED BY DEFAULT AS IDENTITY");
+                    }
+                    cols.push(RichColumn {
+                        name: cname.clone(),
+                        full_type: ctype,
+                        default_expr: if identity.is_empty() && !def_expr.trim().is_empty() {
+                            Some(def_expr)
+                        } else {
+                            None
+                        },
+                        nullable,
+                    });
+                    if !ccomment.trim().is_empty() {
+                        col_comments.push(format!(
+                            "COMMENT ON COLUMN {}.{}.{} IS '{}';",
+                            pg_quote_ident(schema),
+                            pg_quote_ident(name),
+                            pg_quote_ident(&cname),
+                            ccomment.replace('\'', "''")
+                        ));
+                    }
+                }
+
+                // Table constraints (PK, UNIQUE, FK, CHECK).
+                let mut constraints = Vec::new();
+                if let Ok(con_stmt) = client.prepare(
+                    "SELECT conname, pg_get_constraintdef(oid, true) \
+                     FROM pg_constraint \
+                     WHERE conrelid = $1::oid AND contype IN ('p','u','f','c') \
+                     ORDER BY CASE contype WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 ELSE 3 END, conname",
+                ) {
+                    if let Ok(con_rows) = client.query(&con_stmt, &[&(rel_oid as u32)]) {
+                        for r in con_rows {
+                            let cname: String = r.try_get(0).unwrap_or_default();
+                            let cdef: String = r.try_get(1).unwrap_or_default();
+                            if !cdef.trim().is_empty() {
+                                constraints.push(TableConstraintDdl {
+                                    name: (!cname.is_empty()).then_some(cname),
+                                    definition: cdef,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let mut extra = Vec::new();
+                let idx_ddls = Self::relation_indexes_ddl(client, rel_oid);
+                if !idx_ddls.is_empty() {
+                    extra.push("-- Indexes".to_string());
+                    extra.extend(idx_ddls);
+                }
+                if !tbl_comment.trim().is_empty() || !col_comments.is_empty() {
+                    extra.push("-- Comments".to_string());
+                    if !tbl_comment.trim().is_empty() {
+                        extra.push(format!(
+                            "COMMENT ON TABLE {}.{} IS '{}';",
+                            pg_quote_ident(schema),
+                            pg_quote_ident(name),
+                            tbl_comment.replace('\'', "''")
+                        ));
+                    }
+                    extra.extend(col_comments);
+                }
+
+                let table_kw = if relkind == "f" || kind.eq_ignore_ascii_case("FOREIGN TABLE") {
+                    "FOREIGN TABLE"
+                } else {
+                    "TABLE"
+                };
+                let qualified = format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(name));
+                Ok(format_rich_create_table(
+                    table_kw,
+                    &qualified,
                     &cols,
+                    &constraints,
+                    (!part_key.trim().is_empty()).then_some(part_key.as_str()),
+                    &extra,
                     pg_quote_ident,
                 ))
             }
@@ -524,8 +656,6 @@ impl PgConnection {
                 }
             }
             "SEQUENCE" => {
-                // pg_sequences reports NUMERIC (not bigint) values, so cast
-                // to text — reading them as i64 fails with a db error.
                 let stmt = client
                     .prepare(
                         "SELECT start_value::text, minimum_value::text, \
@@ -565,48 +695,551 @@ impl PgConnection {
                     None => Err(anyhow::anyhow!("sequence {}.{} not found", schema, name)),
                 }
             }
-            _ => {
-                // Functions/procedures: first overload wins (note it).
+            "TRIGGER" => {
                 let stmt = client
                     .prepare(
-                        "SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
-                         JOIN pg_namespace n ON n.oid = p.pronamespace \
-                         WHERE n.nspname = $1 AND p.proname = $2 \
-                         ORDER BY p.oid LIMIT 2",
+                        "SELECT pg_get_triggerdef(t.oid, true) \
+                         FROM pg_trigger t \
+                         JOIN pg_class c ON c.oid = t.tgrelid \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal \
+                         ORDER BY t.oid",
                     )
                     .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
                 let rows = client
                     .query(&stmt, &[&schema, &name])
                     .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
-                let mut it = rows.into_iter();
-                match it.next() {
-                    Some(row) => {
-                        let def: String = row.try_get(0).unwrap_or_default();
-                        if def.trim().is_empty() {
-                            Err(anyhow::anyhow!(
-                                "no source for {} {}.{} (no access?)",
-                                kind,
-                                schema,
-                                name
-                            ))
-                        } else if it.next().is_some() {
-                            Ok(format!(
-                                "-- NOTE: {}.{} is overloaded; showing first overload.\n{}",
-                                schema, name, def
-                            ))
+                let defs: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| r.try_get::<_, String>(0).ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!("{};", s.trim_end_matches(';')))
+                    .collect();
+                if defs.is_empty() {
+                    Err(anyhow::anyhow!("trigger {}.{} not found", schema, name))
+                } else {
+                    Ok(defs.join("\n\n"))
+                }
+            }
+            "TYPE" => {
+                let stmt = client
+                    .prepare(
+                        "SELECT t.oid::bigint, t.typtype::text \
+                         FROM pg_type t \
+                         JOIN pg_namespace n ON n.oid = t.typnamespace \
+                         WHERE n.nspname = $1 AND t.typname = $2",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let Some(row) = rows.into_iter().next() else {
+                    return Err(anyhow::anyhow!("type {}.{} not found", schema, name));
+                };
+                let oid: i64 = row.try_get(0).unwrap_or(0);
+                let typtype: String = row.try_get(1).unwrap_or_default();
+                let qual = format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(name));
+                if typtype == "e" {
+                    let estmt = client
+                        .prepare(
+                            "SELECT enumlabel FROM pg_enum WHERE enumtypid = $1::oid \
+                             ORDER BY enumsortorder",
+                        )
+                        .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                    let erows = client
+                        .query(&estmt, &[&(oid as u32)])
+                        .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                    let labels: Vec<String> = erows
+                        .into_iter()
+                        .filter_map(|r| r.try_get::<_, String>(0).ok())
+                        .map(|l| format!("  '{}'", l.replace('\'', "''")))
+                        .collect();
+                    Ok(format!(
+                        "CREATE TYPE {} AS ENUM (\n{}\n);",
+                        qual,
+                        labels.join(",\n")
+                    ))
+                } else {
+                    Ok(format!("-- Postgres type {} (typtype = '{}')", qual, typtype))
+                }
+            }
+            _ => {
+                // Functions/procedures: emit all overloads cleanly.
+                let stmt = client
+                    .prepare(
+                        "SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE n.nspname = $1 AND p.proname = $2 \
+                         ORDER BY p.oid LIMIT 10",
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let rows = client
+                    .query(&stmt, &[&schema, &name])
+                    .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+                let defs: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|r| r.try_get::<_, String>(0).ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let t = s.trim_end();
+                        if t.ends_with(';') {
+                            t.to_string()
                         } else {
-                            Ok(def)
+                            format!("{};", t)
                         }
-                    }
-                    None => Err(anyhow::anyhow!(
+                    })
+                    .collect();
+                if defs.is_empty() {
+                    Err(anyhow::anyhow!(
                         "no source for {} {}.{} (no access?)",
                         kind,
                         schema,
                         name
-                    )),
+                    ))
+                } else if defs.len() > 1 {
+                    let total = defs.len();
+                    let parts: Vec<String> = defs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, d)| format!("-- Overload {} of {}\n{}", i + 1, total, d))
+                        .collect();
+                    Ok(parts.join("\n\n"))
+                } else {
+                    Ok(defs.into_iter().next().unwrap_or_default())
                 }
             }
         }
+    }
+
+    fn relation_indexes_ddl(client: &mut postgres::Client, rel_oid: i64) -> Vec<String> {
+        let Ok(stmt) = client.prepare(
+            "SELECT pg_get_indexdef(i.indexrelid) \
+             FROM pg_index i \
+             JOIN pg_class ic ON ic.oid = i.indexrelid \
+             WHERE i.indrelid = $1::oid \
+               AND NOT i.indisprimary \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_constraint c \
+                 WHERE c.conindid = i.indexrelid AND c.contype IN ('p','u') \
+               ) \
+             ORDER BY ic.relname",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = client.query(&stmt, &[&(rel_oid as u32)]) else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|r| r.try_get::<_, String>(0).ok())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("{};", s.trim_end_matches(';')))
+            .collect()
+    }
+
+    /// F4 Toad-style Describe for Postgres: resolves relations (tables, indexes,
+    /// views, matviews, sequences, foreign tables) via `search_path` / `pg_class`,
+    /// plus functions/procedures, triggers and custom types.
+    fn describe_pg_object(&self, target: &DdlTarget) -> anyhow::Result<DescribedObject> {
+        let start = std::time::Instant::now();
+        let elapsed = || start.elapsed().as_millis() as u64;
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+
+        let norm_name = if target.name_quoted {
+            target.name.clone()
+        } else {
+            target.name.to_lowercase()
+        };
+
+        if let (Some(s), Some(k)) = (target.schema.as_deref(), target.kind_hint.as_deref()) {
+            let ns = if target.schema_quoted {
+                s.to_string()
+            } else {
+                s.to_lowercase()
+            };
+            let ddl = Self::ddl_with_client(&mut client, &ns, &norm_name, k)?;
+            let summary = Self::pg_object_summary(&mut client, &ns, &norm_name, k);
+            return Ok(DescribedObject {
+                schema: ns,
+                name: norm_name,
+                kind: k.to_uppercase(),
+                ddl,
+                summary,
+                elapsed_ms: elapsed(),
+            });
+        }
+
+        let resolved = match target.schema.as_deref() {
+            Some(s) => {
+                let ns = if target.schema_quoted {
+                    s.to_string()
+                } else {
+                    s.to_lowercase()
+                };
+                Self::find_pg_in_schema(&mut client, &ns, &norm_name)
+                    .map(|(n, k)| (ns, n, k))
+            }
+            None => Self::find_pg_unqualified(&mut client, target, &norm_name),
+        };
+
+        let Some((schema, obj_name, kind)) = resolved else {
+            return Err(anyhow::anyhow!(
+                "Object '{}' not found in PostgreSQL catalog (check spelling or search_path)",
+                target.display_label()
+            ));
+        };
+
+        let ddl = Self::ddl_with_client(&mut client, &schema, &obj_name, &kind)?;
+        let summary = Self::pg_object_summary(&mut client, &schema, &obj_name, &kind);
+
+        Ok(DescribedObject {
+            schema,
+            name: obj_name,
+            kind,
+            ddl,
+            summary,
+            elapsed_ms: elapsed(),
+        })
+    }
+
+    fn relkind_label(relkind: &str) -> &'static str {
+        match relkind {
+            "r" => "TABLE",
+            "p" => "PARTITIONED TABLE",
+            "v" => "VIEW",
+            "m" => "MVIEW",
+            "f" => "FOREIGN TABLE",
+            "i" | "I" => "INDEX",
+            "S" => "SEQUENCE",
+            _ => "TABLE",
+        }
+    }
+
+    fn find_pg_in_schema(
+        client: &mut postgres::Client,
+        schema: &str,
+        name: &str,
+    ) -> Option<(String, String)> {
+        // 1. Relation in pg_class (table, view, mview, index, sequence, foreign table).
+        if let Ok(stmt) = client.prepare(
+            "SELECT c.relname, c.relkind::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND c.relkind IN ('r','p','v','m','f','i','I','S')",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&schema, &name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let rn: String = r.try_get(0).unwrap_or_default();
+                    let rk: String = r.try_get(1).unwrap_or_default();
+                    if !rn.is_empty() {
+                        return Some((rn, Self::relkind_label(&rk).to_string()));
+                    }
+                }
+            }
+        }
+        // 2. Function / procedure.
+        if let Ok(stmt) = client.prepare(
+            "SELECT p.proname, CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.proname = $2 LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&schema, &name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let pn: String = r.try_get(0).unwrap_or_default();
+                    let pk: String = r.try_get(1).unwrap_or_default();
+                    if !pn.is_empty() {
+                        return Some((pn, pk));
+                    }
+                }
+            }
+        }
+        // 3. Trigger on any table in this schema.
+        if let Ok(stmt) = client.prepare(
+            "SELECT t.tgname FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&schema, &name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let tn: String = r.try_get(0).unwrap_or_default();
+                    if !tn.is_empty() {
+                        return Some((tn, "TRIGGER".into()));
+                    }
+                }
+            }
+        }
+        // 4. Enum/domain/composite type.
+        if let Ok(stmt) = client.prepare(
+            "SELECT t.typname FROM pg_type t \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype IN ('e','d') LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&schema, &name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let tn: String = r.try_get(0).unwrap_or_default();
+                    if !tn.is_empty() {
+                        return Some((tn, "TYPE".into()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_pg_unqualified(
+        client: &mut postgres::Client,
+        target: &DdlTarget,
+        norm_name: &str,
+    ) -> Option<(String, String, String)> {
+        // 1. Resolve via `to_regclass` so search_path is honored identically to SQL.
+        let reg_arg = if target.name_quoted {
+            pg_quote_ident(&target.name)
+        } else {
+            target.name.clone()
+        };
+        if let Ok(stmt) = client.prepare(
+            "SELECT n.nspname, c.relname, c.relkind::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = to_regclass($1)",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&reg_arg]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let ns: String = r.try_get(0).unwrap_or_default();
+                    let rn: String = r.try_get(1).unwrap_or_default();
+                    let rk: String = r.try_get(2).unwrap_or_default();
+                    if !ns.is_empty() && !rn.is_empty() {
+                        return Some((ns, rn, Self::relkind_label(&rk).to_string()));
+                    }
+                }
+            }
+        }
+
+        // 2. Routine on search_path (or any user schema).
+        if let Ok(stmt) = client.prepare(
+            "SELECT n.nspname, p.proname, \
+                    CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.proname = $1 AND n.nspname NOT IN ('pg_catalog','information_schema') \
+             ORDER BY CASE WHEN n.nspname = ANY(current_schemas(false)) THEN 0 ELSE 1 END, p.oid \
+             LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&norm_name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let ns: String = r.try_get(0).unwrap_or_default();
+                    let pn: String = r.try_get(1).unwrap_or_default();
+                    let pk: String = r.try_get(2).unwrap_or_default();
+                    if !ns.is_empty() && !pn.is_empty() {
+                        return Some((ns, pn, pk));
+                    }
+                }
+            }
+        }
+
+        // 3. Relation in any non-system schema (catches indexes/tables outside search_path).
+        if let Ok(stmt) = client.prepare(
+            "SELECT n.nspname, c.relname, c.relkind::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = $1 \
+               AND c.relkind IN ('r','p','v','m','f','i','I','S') \
+               AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
+             ORDER BY CASE WHEN n.nspname = 'public' THEN 0 ELSE 1 END, n.nspname \
+             LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&norm_name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let ns: String = r.try_get(0).unwrap_or_default();
+                    let rn: String = r.try_get(1).unwrap_or_default();
+                    let rk: String = r.try_get(2).unwrap_or_default();
+                    if !ns.is_empty() && !rn.is_empty() {
+                        return Some((ns, rn, Self::relkind_label(&rk).to_string()));
+                    }
+                }
+            }
+        }
+
+        // 4. Trigger in any user schema.
+        if let Ok(stmt) = client.prepare(
+            "SELECT n.nspname, t.tgname FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE t.tgname = $1 AND NOT t.tgisinternal \
+             ORDER BY CASE WHEN n.nspname = ANY(current_schemas(false)) THEN 0 ELSE 1 END \
+             LIMIT 1",
+        ) {
+            if let Ok(rows) = client.query(&stmt, &[&norm_name]) {
+                if let Some(r) = rows.into_iter().next() {
+                    let ns: String = r.try_get(0).unwrap_or_default();
+                    let tn: String = r.try_get(1).unwrap_or_default();
+                    if !ns.is_empty() && !tn.is_empty() {
+                        return Some((ns, tn, "TRIGGER".into()));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn pg_object_summary(
+        client: &mut postgres::Client,
+        schema: &str,
+        name: &str,
+        kind: &str,
+    ) -> Option<String> {
+        match kind.to_ascii_uppercase().as_str() {
+            "TABLE" | "PARTITIONED TABLE" | "MVIEW" | "MATERIALIZED VIEW" => {
+                let stmt = client
+                    .prepare(
+                        "SELECT pg_size_pretty(pg_total_relation_size(c.oid)), \
+                                pg_size_pretty(pg_table_size(c.oid)), \
+                                pg_size_pretty(pg_indexes_size(c.oid)), \
+                                GREATEST(c.reltuples::bigint, 0) \
+                         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2",
+                    )
+                    .ok()?;
+                let row = client.query(&stmt, &[&schema, &name]).ok()?.into_iter().next()?;
+                let total_sz: String = row.try_get(0).unwrap_or_default();
+                let tbl_sz: String = row.try_get(1).unwrap_or_default();
+                let idx_sz: String = row.try_get(2).unwrap_or_default();
+                let tuples: i64 = row.try_get(3).unwrap_or(0);
+                Some(format!(
+                    "Total: {} (Heap: {}, Indexes: {}) · Est. Rows: {}",
+                    total_sz, tbl_sz, idx_sz, tuples
+                ))
+            }
+            "INDEX" => {
+                let stmt = client
+                    .prepare(
+                        "SELECT tc.relname, i.indisunique, i.indisvalid, \
+                                pg_size_pretty(pg_relation_size(ic.oid)) \
+                         FROM pg_index i \
+                         JOIN pg_class ic ON ic.oid = i.indexrelid \
+                         JOIN pg_class tc ON tc.oid = i.indrelid \
+                         JOIN pg_namespace n ON n.oid = ic.relnamespace \
+                         WHERE n.nspname = $1 AND ic.relname = $2",
+                    )
+                    .ok()?;
+                let row = client.query(&stmt, &[&schema, &name]).ok()?.into_iter().next()?;
+                let tname: String = row.try_get(0).unwrap_or_default();
+                let uniq: bool = row.try_get(1).unwrap_or(false);
+                let valid: bool = row.try_get(2).unwrap_or(true);
+                let sz: String = row.try_get(3).unwrap_or_default();
+                Some(format!(
+                    "On {}.{} · {} · {} · Size: {}",
+                    schema,
+                    tname,
+                    if uniq { "UNIQUE" } else { "NON-UNIQUE" },
+                    if valid { "VALID" } else { "INVALID" },
+                    sz
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// F6 Performance dashboard: live Postgres activity/locks/waits/cache snapshot.
+    fn collect_pg_perf_snapshot(&self) -> anyhow::Result<PerfSnapshot> {
+        let start = std::time::Instant::now();
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
+
+        let mut snap = PerfSnapshot::default();
+
+        let act_stmt = client
+            .prepare(
+                "SELECT
+                   COUNT(*)::bigint,
+                   COUNT(*) FILTER (WHERE state = 'active')::bigint,
+                   COUNT(*) FILTER (WHERE state LIKE 'idle in transaction%')::bigint,
+                   COUNT(*) FILTER (WHERE cardinality(pg_blocking_pids(pid)) > 0)::bigint,
+                   COALESCE(MAX(EXTRACT(EPOCH FROM (clock_timestamp() - query_start))::bigint)
+                            FILTER (WHERE state = 'active'), 0)::bigint
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+        if let Some(row) = client
+            .query(&act_stmt, &[])
+            .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?
+            .into_iter()
+            .next()
+        {
+            snap.total_sessions = row.try_get::<_, i64>(0).unwrap_or(0).max(0) as u64;
+            snap.active_sessions = row.try_get::<_, i64>(1).unwrap_or(0).max(0) as u64;
+            snap.idle_in_tx_sessions = row.try_get::<_, i64>(2).unwrap_or(0).max(0) as u64;
+            snap.blocked_sessions = row.try_get::<_, i64>(3).unwrap_or(0).max(0) as u64;
+            snap.max_active_secs = row.try_get::<_, i64>(4).unwrap_or(0).max(0) as u64;
+        }
+
+        if snap.blocked_sessions > 0 {
+            if let Ok(bstmt) = client.prepare(
+                "SELECT COUNT(DISTINCT bp.pid)::bigint \
+                 FROM pg_stat_activity w \
+                 CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid) \
+                 WHERE w.datname = current_database()",
+            ) {
+                if let Ok(brows) = client.query(&bstmt, &[]) {
+                    if let Some(r) = brows.into_iter().next() {
+                        snap.blocking_sessions = r.try_get::<_, i64>(0).unwrap_or(0).max(0) as u64;
+                    }
+                }
+            }
+        }
+
+        if let Ok(wstmt) = client.prepare(
+            "SELECT COALESCE(wait_event_type, 'CPU'), COUNT(*)::bigint \
+             FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND pid <> pg_backend_pid() \
+               AND state = 'active' \
+             GROUP BY 1 ORDER BY 2 DESC",
+        ) {
+            if let Ok(wrows) = client.query(&wstmt, &[]) {
+                for r in wrows {
+                    let cls: String = r.try_get(0).unwrap_or_default();
+                    let cnt: i64 = r.try_get(1).unwrap_or(0);
+                    if !cls.is_empty() && cnt > 0 {
+                        snap.wait_breakdown.push((cls, cnt as u64));
+                    }
+                }
+            }
+        }
+
+        if let Ok(dstmt) = client.prepare(
+            "SELECT
+               ROUND(COALESCE(blks_hit::numeric * 100.0 / NULLIF(blks_hit + blks_read, 0), 100.0), 1)::text,
+               ROUND(pg_database_size(current_database())::numeric / 1048576.0, 1)::text,
+               COALESCE((SELECT pg_size_pretty(setting::bigint * CASE unit
+                 WHEN '8kB' THEN 8192 WHEN 'kB' THEN 1024 WHEN 'MB' THEN 1048576 ELSE 1 END)
+                 FROM pg_settings WHERE name = 'shared_buffers'), '?')
+             FROM pg_stat_database
+             WHERE datname = current_database()",
+        ) {
+            if let Ok(drows) = client.query(&dstmt, &[]) {
+                if let Some(r) = drows.into_iter().next() {
+                    let hit_s: String = r.try_get(0).unwrap_or_default();
+                    let db_mb_s: String = r.try_get(1).unwrap_or_default();
+                    let shbuf: String = r.try_get(2).unwrap_or_default();
+                    snap.cache_hit_pct = hit_s.parse::<f64>().ok();
+                    let db_mb = db_mb_s.parse::<f64>().ok();
+                    snap.mem_used_mb = db_mb;
+                    snap.mem_detail = match db_mb {
+                        Some(mb) => format!("shared_buffers {} · DB {:.0}M", shbuf, mb),
+                        None => format!("shared_buffers {}", shbuf),
+                    };
+                }
+            }
+        }
+
+        snap.elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(snap)
     }
 
     fn explorer_columns(
@@ -927,6 +1560,12 @@ impl DbConnection for PgConnection {
     }
     fn object_ddl(&self, schema: &str, name: &str, kind: &str) -> anyhow::Result<String> {
         self.explorer_ddl(schema, name, kind)
+    }
+    fn describe_object(&self, target: &DdlTarget) -> anyhow::Result<DescribedObject> {
+        self.describe_pg_object(target)
+    }
+    fn collect_perf_snapshot(&self) -> anyhow::Result<PerfSnapshot> {
+        self.collect_pg_perf_snapshot()
     }
     fn current_schema(&self) -> anyhow::Result<String> {
         PgConnection::current_schema(self)
