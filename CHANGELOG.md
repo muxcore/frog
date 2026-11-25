@@ -2,6 +2,18 @@
 
 All notable changes to frog are documented here.
 
+## [0.10.0] - 2026-11-25
+
+### Added
+- **Emacs-style incremental search (`Ctrl+S`)**: I-search in the current
+  view — SQL editor, result table, `F12` explorer (tree + detail
+  preview/DDL), `F2` sessions (list/SQL/plan), `F4` DDL, `F6` perf
+  (queries/results/SQL), history and help. Type to jump live,
+  `Ctrl+S` / `Ctrl+R` steps next/previous (with wrap notice), `Enter` /
+  `Esc` keeps the match, `Ctrl+G` aborts back to the pre-search cursor.
+  Smart-case (all-lowercase queries match case-insensitively), editor
+  substring and result-cell highlighting, paste lands in the query.
+
 ## [0.9.0] - 2026-11-24
 
 ### Added
@@ -50,14 +62,6 @@ All notable changes to frog are documented here.
     toggles the underlying diagnostic SQL preview, `s`/`i` sends the SQL to
     the editor, `n` opens it in a new session tab, `Tab` switches panes, and
     `Ctrl+Z`/`F11` zooms the focused pane.
-- **Emacs-style incremental search (`Ctrl+S`)**: I-search in the current
-  view — SQL editor, result table, `F12` explorer (tree + detail
-  preview/DDL), `F2` sessions (list/SQL/plan), `F4` DDL, `F6` perf
-  (queries/results/SQL), history and help. Type to jump live,
-  `Ctrl+S` / `Ctrl+R` steps next/previous (with wrap notice), `Enter` /
-  `Esc` keeps the match, `Ctrl+G` aborts back to the pre-search cursor.
-  Smart-case (all-lowercase queries match case-insensitively), editor
-  substring and result-cell highlighting, paste lands in the query.
 
 ## [0.8.2] - 2026-11-23
 
