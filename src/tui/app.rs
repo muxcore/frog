@@ -17,6 +17,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
+use ratatui::widgets::Clear;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -500,6 +501,13 @@ pub struct App {
     /// Last non-empty search query, reused when starting a search and
     /// immediately pressing Ctrl-S again with an empty query.
     last_search_query: String,
+    /// Set on terminal resize: the next frame does a full clear first so
+    /// no stale cells survive (some terminals/proxies drop the diff).
+    needs_clear: bool,
+    /// Last rendered fullscreen view. When it changes, the content area is
+    /// cleared first so a shorter view can't leave ghost characters from
+    /// the previous frame behind.
+    last_view_key: Option<(SessionMode, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -651,6 +659,8 @@ impl App {
             keyboard_enhanced: false,
             search: None,
             last_search_query: String::new(),
+            needs_clear: false,
+            last_view_key: None,
         })
     }
 
@@ -738,6 +748,15 @@ impl App {
 
             terminal.draw(|f| self.ui(f))?;
 
+            // Terminals behind jump proxies don't always report resizes, and
+            // dropped escape sequences can leave ghost cells behind: a full
+            // clear forces the next frame to repaint everything.
+            if self.needs_clear {
+                let _ = terminal.clear();
+                self.needs_clear = false;
+                terminal.draw(|f| self.ui(f))?;
+            }
+
             // git-bash/mintty doesn't emit bracketed paste — pastes arrive as
             // a burst of individual key events. When a text key lands, collect
             // everything queued plus a short 2ms tail (SSH may split the write)
@@ -765,6 +784,12 @@ impl App {
         match ev {
             Event::Key(key) => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Resize(_, _) => {
+                // Window moves/resizes on some terminals (git-bash/mintty
+                // behind a jump proxy) arrive as bare resizes or not at
+                // all; force a full repaint so stale cells can't linger.
+                self.needs_clear = true;
+            }
             Event::Paste(text) => {
                 if self.search.is_some() {
                     self.search_push_text(&text);
@@ -1880,6 +1905,177 @@ impl App {
             current_col: c,
             has_current: !st.matches.is_empty(),
         })
+    }
+
+    /// Short single-line context of the current match for the search bar,
+    /// so the aim is readable even where the in-view highlight can't be
+    /// (limited palettes, relayed sessions). Truncated to ~48 chars.
+    fn search_current_snippet(&self) -> Option<String> {
+        const MAX: usize = 48;
+        let st = self.search.as_ref()?;
+        if st.query.is_empty() || st.matches.is_empty() {
+            return None;
+        }
+        let m = st.matches[st.current.min(st.matches.len() - 1)];
+        let session = self.session_manager.active_session();
+        let raw: String = match m {
+            SearchMatch::Editor { row, .. } => {
+                session.editor.lines.get(row).cloned().unwrap_or_default()
+            }
+            SearchMatch::TableCell { row, col } => {
+                if st.target == SearchTarget::ExplorerDetail {
+                    // Preview-table match: row label is enough context.
+                    let rows = self.session_manager.explorer_visible_rows();
+                    let label = rows
+                        .get(session.explorer_cursor)
+                        .map(|r| self.session_manager.explorer_row_search_label(r))
+                        .unwrap_or_default();
+                    match row {
+                        None => label,
+                        Some(r) => format!("{} [row {}]", label, r + 1),
+                    }
+                } else {
+                    let qr = match st.target {
+                        SearchTarget::Results => session.results.last(),
+                        SearchTarget::PerfResults => {
+                            session.perf_results.get(&session.perf_cursor)
+                        }
+                        _ => None,
+                    }?;
+                    if qr.is_error {
+                        return None;
+                    }
+                    let col_name = qr.columns.get(col).cloned().unwrap_or_default();
+                    let cell = match row {
+                        None => String::from("(header)"),
+                        Some(r) => qr
+                            .rows
+                            .get(r)
+                            .and_then(|rr| rr.get(col))
+                            .cloned()
+                            .unwrap_or_default(),
+                    };
+                    format!("{}: {}", col_name, cell)
+                }
+            }
+            SearchMatch::Line { line, .. } => match st.target {
+                SearchTarget::SessionSql => session
+                    .plan_sql_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .lines()
+                    .nth(line)
+                    .unwrap_or_default()
+                    .to_string(),
+                SearchTarget::SessionPlan => session
+                    .plan_result
+                    .as_ref()
+                    .and_then(|qr| {
+                        if line == 0 && !qr.columns.is_empty() {
+                            Some(qr.columns.join(" | "))
+                        } else {
+                            let r = line.saturating_sub(1);
+                            qr.rows.get(r).map(|rr| rr.join(" | "))
+                        }
+                    })
+                    .unwrap_or_default(),
+                SearchTarget::Ddl => session
+                    .ddl_object
+                    .as_ref()
+                    .and_then(|o| o.ddl.lines().nth(line))
+                    .unwrap_or_default()
+                    .to_string(),
+                SearchTarget::PerfSql => crate::db::perf::perf_queries_for(
+                    self.session_manager.active_db_type(),
+                )
+                .get(session.perf_cursor)
+                .and_then(|q| q.sql.lines().nth(line))
+                .unwrap_or_default()
+                .to_string(),
+                _ => {
+                    // Explorer detail text / other line views.
+                    self.search_explorer_detail_line(line)
+                        .unwrap_or_default()
+                }
+            },
+            SearchMatch::ListRow { row } => self.search_list_label(st.target, row),
+        };
+        let single: String = raw
+            .replace(['\r', '\n', '\t'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if single.is_empty() {
+            return None;
+        }
+        let mut out: String = single.chars().take(MAX).collect();
+        if single.chars().count() > MAX {
+            out.push('…');
+        }
+        Some(out)
+    }
+
+    /// Display label for a flat-list match (explorer tree, session list,
+    /// history, perf queries, help).
+    fn search_list_label(&self, target: SearchTarget, row: usize) -> String {
+        let session = self.session_manager.active_session();
+        match target {
+            SearchTarget::ExplorerTree => self
+                .session_manager
+                .explorer_visible_rows()
+                .get(row)
+                .map(|r| self.session_manager.explorer_row_search_label(r))
+                .unwrap_or_default(),
+            SearchTarget::SessionList => self
+                .session_manager
+                .visible_session_list()
+                .get(row)
+                .map(|d| format!("{} {} {}", d.sid, d.username, d.status))
+                .unwrap_or_default(),
+            SearchTarget::History => session
+                .query_history
+                .get(row)
+                .cloned()
+                .unwrap_or_default(),
+            SearchTarget::PerfQueries => crate::db::perf::perf_queries_for(
+                self.session_manager.active_db_type(),
+            )
+            .get(row)
+            .map(|q| q.title.to_string())
+            .unwrap_or_default(),
+            _ => format!("row {}", row + 1),
+        }
+    }
+
+    /// One Explorer-detail text line for snippet purposes (mirrors the
+    /// fallback label used for matching).
+    fn search_explorer_detail_line(&self, _line: usize) -> Option<String> {
+        let session = self.session_manager.active_session();
+        let rows = self.session_manager.explorer_visible_rows();
+        rows.get(session.explorer_cursor)
+            .map(|r| self.session_manager.explorer_row_search_label(r))
+    }
+
+    /// Identity of the current fullscreen view: mode plus which panes are
+    /// maximized. Used to repaint the content area on view switches.
+    fn view_key(&self) -> (SessionMode, u8) {
+        let mut flags = 0u8;
+        if self.maximized_box.is_some() {
+            flags |= 1;
+        }
+        if self.explorer_maximized {
+            flags |= 2;
+        }
+        if self.session_view_maximized.is_some() {
+            flags |= 4;
+        }
+        if self.perf_maximized {
+            flags |= 8;
+        }
+        (
+            self.session_manager.active_session().mode.clone(),
+            flags,
+        )
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -4340,6 +4536,15 @@ impl App {
 
         let mode = self.session_manager.active_session().mode.clone();
 
+        // View switches (and maximize toggles) can leave ghost characters
+        // from the previous frame when a terminal or proxy drops part of
+        // the diff: clear the content area once so the view repaints fully.
+        let view_key = self.view_key();
+        if self.last_view_key.as_ref() != Some(&view_key) {
+            f.render_widget(Clear, chunks[1]);
+            self.last_view_key = Some(view_key);
+        }
+
         match mode {
             SessionMode::SessionView => {
                 let layout = SessionViewLayout {
@@ -4625,6 +4830,7 @@ impl App {
                 failing,
                 wrapped,
                 Self::search_target_label(target),
+                self.search_current_snippet().as_deref(),
                 f,
                 chunks[2],
             );
@@ -5404,6 +5610,21 @@ mod tests {
         // Enter keeps the match and exits.
         app.handle_key(key(KeyModifiers::NONE, KeyCode::Enter));
         assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn isearch_snippet_shows_current_match_context() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.session_manager
+            .active_session_mut()
+            .editor
+            .set_text("select a\nfrom t");
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('s')));
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('s')));
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('e')));
+        let snip = app.search_current_snippet().expect("snippet");
+        assert!(snip.contains("select"), "{snip}");
     }
 
     #[test]

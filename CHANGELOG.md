@@ -2,6 +2,23 @@
 
 All notable changes to frog are documented here.
 
+## [0.10.1] - 2026-11-27
+
+### Fixed
+- Search visibility on limited terminals (git-bash/mintty, jump proxies
+  that strip 24-bit color): Markdown and ASCII result formats now
+  highlight matches like the Table format does (previously only the
+  Table format highlighted, so searching there looked broken); other
+  matches are black-on-yellow, the current match is black-on-green +
+  bold + underline, distinct from the cyan drag-selection. All styles
+  use 4-bit ANSI colors so they survive restricted palettes.
+- The search bar now shows a short snippet of the current match
+  (`3/12 ▸ …`), so the aim is readable even where in-view highlighting
+  can't be seen.
+- Ghost characters after terminal resizes/moves or view switches: the
+  app now repaints fully on `Resize` events and clears the content area
+  whenever the fullscreen view changes.
+
 ## [0.10.0] - 2026-11-25
 
 ### Added

@@ -99,6 +99,7 @@ pub fn render_search_bar(
     failing: bool,
     wrapped: bool,
     target_label: &str,
+    snippet: Option<&str>,
     f: &mut Frame,
     area: Rect,
 ) {
@@ -124,7 +125,7 @@ pub fn render_search_bar(
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     );
-    let spans = vec![
+    let mut spans = vec![
         prompt,
         Span::styled(
             query.to_string(),
@@ -142,6 +143,17 @@ pub fn render_search_bar(
             Style::default().fg(Color::Black).bg(Color::Yellow),
         ),
     ];
+    // Current-match context: readable on any terminal even when the
+    // in-view highlight can't be (limited palette, relayed sessions).
+    if let Some(snip) = snippet.filter(|s| !s.is_empty()) {
+        spans.push(Span::styled(
+            format!(" ▸ {}", snip),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let bar =
         Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Yellow).fg(Color::Black));
     f.render_widget(bar, area);
@@ -179,6 +191,20 @@ fn cell_contains(haystack: &str, query: &str, case_sensitive: bool) -> bool {
     } else {
         haystack.to_lowercase().contains(&query.to_lowercase())
     }
+}
+
+/// Search highlight styles, built only from 4-bit ANSI colors plus
+/// modifiers so they survive limited terminals (git-bash/mintty, jump-host
+/// proxies that strip 24-bit sequences): other matches black-on-yellow,
+/// the current match black-on-green + bold + underline — distinct from
+/// each other and from the cyan drag-selection.
+fn search_styles() -> (Style, Style) {
+    let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let current_style = Style::default()
+        .bg(Color::Green)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    (match_style, current_style)
 }
 
 /// Split `line` into spans: every occurrence of `query` gets `match_style`,
@@ -524,13 +550,7 @@ pub fn render_editor(
                     }
                     Line::from(spans)
                 } else if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
-                    let match_style = Style::default()
-                        .bg(Color::Yellow)
-                        .fg(Color::Black);
-                    let current_style = Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD);
+                    let (match_style, current_style) = search_styles();
                     let cur = if hl.has_current && idx == hl.current_row {
                         Some(hl.current_col)
                     } else {
@@ -559,13 +579,7 @@ pub fn render_editor(
                 // (num_style/line_num_str intentionally unused here.)
                 let _ = (&line_num_str, &num_style);
                 if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
-                    let match_style = Style::default()
-                        .bg(Color::Yellow)
-                        .fg(Color::Black);
-                    let current_style = Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD);
+                    let (match_style, current_style) = search_styles();
                     let cur = if hl.has_current && idx == hl.current_row {
                         Some(hl.current_col)
                     } else {
@@ -876,6 +890,7 @@ pub fn render_table(
                     top,
                     start_col,
                     sel_rect,
+                    search,
                 );
                 let counts = result_title_counts(
                     top,
@@ -943,24 +958,73 @@ pub fn render_table(
                     .map(|l| Line::from(l.to_string()))
                     .collect();
                 // Exact per-cell highlight: header is line 1, data from
-                // line 3. Only columns inside the selection get tinted.
-                if let Some(((r0, c0), (r1, c1))) = sel_rect {
-                    let sel_cols: Vec<bool> = (start_col..end_col)
-                        .map(|c| c >= c0 && c <= c1)
-                        .collect();
-                    if r0.is_none() {
-                        if let Some(line) = ascii_lines.get_mut(1) {
-                            tint_ascii_cells(line, &sel_cols);
-                        }
+                // line 3. Search matches tint too (current match wins over
+                // the drag-selection so the aim stays visible).
+                let has_search = search.is_some_and(|hl| !hl.query.is_empty());
+                if sel_rect.is_some() || has_search {
+                    let merge_tints = |row: Option<usize>| -> Vec<AsciiCellTint> {
+                        (start_col..end_col)
+                            .map(|c| {
+                                let is_current = match search {
+                                    Some(hl) if hl.has_current => {
+                                        hl.current_row == row && hl.current_col == c
+                                    }
+                                    _ => false,
+                                };
+                                if is_current {
+                                    return AsciiCellTint::SearchCurrent;
+                                }
+                                let hit = match search {
+                                    Some(hl) if !hl.query.is_empty() => {
+                                        let text = match row {
+                                            None => qr.columns.get(c).map(String::as_str),
+                                            Some(r) => qr
+                                                .rows
+                                                .get(r)
+                                                .and_then(|rr| rr.get(c))
+                                                .map(String::as_str),
+                                        };
+                                        text.is_some_and(|t| {
+                                            cell_contains(t, &hl.query, hl.case_sensitive)
+                                        })
+                                    }
+                                    _ => false,
+                                };
+                                if hit {
+                                    return AsciiCellTint::SearchHit;
+                                }
+                                let selected = match sel_rect {
+                                    Some(((r0, c0), (r1, c1))) => {
+                                        c >= c0
+                                            && c <= c1
+                                            && match (row, r0, r1) {
+                                                (None, None, _) => true,
+                                                (Some(r), _, _) => {
+                                                    r0.is_none_or(|s| r >= s)
+                                                        && r1.is_none_or(|e| r <= e)
+                                                }
+                                                _ => false,
+                                            }
+                                    }
+                                    None => false,
+                                };
+                                if selected {
+                                    AsciiCellTint::Selected
+                                } else {
+                                    AsciiCellTint::Plain
+                                }
+                            })
+                            .collect()
+                    };
+                    // Header line.
+                    if let Some(line) = ascii_lines.get_mut(1) {
+                        tint_ascii_cells(line, &merge_tints(None));
                     }
+                    // Data lines.
                     for k in 0..visible_rows {
                         let abs = top + k;
-                        let in_rows = r0.is_none_or(|s| abs >= s)
-                            && r1.is_none_or(|e| abs <= e);
-                        if in_rows {
-                            if let Some(line) = ascii_lines.get_mut(3 + k) {
-                                tint_ascii_cells(line, &sel_cols);
-                            }
+                        if let Some(line) = ascii_lines.get_mut(3 + k) {
+                            tint_ascii_cells(line, &merge_tints(Some(abs)));
                         }
                     }
                 }
@@ -1036,11 +1100,7 @@ pub fn render_table(
             .bg(Color::Cyan)
             .fg(Color::Black)
             .add_modifier(Modifier::BOLD);
-        let search_match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
-        let search_current_style = Style::default()
-            .bg(Color::LightCyan)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD);
+        let (search_match_style, search_current_style) = search_styles();
         let search_hit = |row: Option<usize>, col: usize| -> bool {
             match search {
                 Some(hl) if !hl.query.is_empty() => match row {
@@ -1555,10 +1615,19 @@ pub fn markdown_col_at(
     Some(c)
 }
 
+/// Cell tint precedence for the ASCII grid: the current search match beats
+/// a plain search hit, which beats the mouse drag-selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsciiCellTint {
+    Plain,
+    Selected,
+    SearchHit,
+    SearchCurrent,
+}
+
 /// Tint exact cells of an ASCII grid line (`| a | bb |`): every `|…|`
-/// segment maps to one window column, so `selected[i]` tints that cell
-/// block (padding included). Reassembles to byte-identical text.
-fn tint_ascii_cells(line: &mut Line, selected: &[bool]) {
+/// segment maps to one window column. Reassembles to byte-identical text.
+fn tint_ascii_cells(line: &mut Line, tints: &[AsciiCellTint]) {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let parts: Vec<&str> = text.split('|').collect();
     if parts.len() < 3 {
@@ -1566,14 +1635,18 @@ fn tint_ascii_cells(line: &mut Line, selected: &[bool]) {
     }
     let base = Style::default().fg(Color::White);
     let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let (search_match_style, search_current_style) = search_styles();
+    let style_for = |t: AsciiCellTint| match t {
+        AsciiCellTint::Plain => base,
+        AsciiCellTint::Selected => sel_style,
+        AsciiCellTint::SearchHit => search_match_style,
+        AsciiCellTint::SearchCurrent => search_current_style,
+    };
     let mut spans = vec![Span::styled("|", base)];
     for (i, part) in parts[1..parts.len() - 1].iter().enumerate() {
         let seg = format!("{}|", part);
-        if selected.get(i).copied().unwrap_or(false) {
-            spans.push(Span::styled(seg, sel_style));
-        } else {
-            spans.push(Span::styled(seg, base));
-        }
+        let tint = tints.get(i).copied().unwrap_or(AsciiCellTint::Plain);
+        spans.push(Span::styled(seg, style_for(tint)));
     }
     *line = Line::from(spans);
 }
@@ -1582,16 +1655,33 @@ fn tint_ascii_cells(line: &mut Line, selected: &[bool]) {
 /// highlight. Produces byte-for-byte the same text as `markdown_table`
 /// (verified by test) — only span styles differ for selected cells.
 /// `top`/`start_col` map the window to absolute indices; `sel` is the
-/// absolute selection rectangle.
+/// absolute selection rectangle. `search` tints cells containing the
+/// query (current match wins over selection so the aim stays visible).
 fn markdown_table_lines(
     columns: &[String],
     rows: &[&[String]],
     top: usize,
     start_col: usize,
     sel: Option<TableRect>,
+    search: Option<&TableSearchHighlight>,
 ) -> Vec<Line<'static>> {
     let base = Style::default().fg(Color::White);
     let sel_style = Style::default().bg(Color::Cyan).fg(Color::Black);
+    let (search_match_style, search_current_style) = search_styles();
+    let search_hit = |text: &str| -> bool {
+        match search {
+            Some(hl) if !hl.query.is_empty() => {
+                cell_contains(text, &hl.query, hl.case_sensitive)
+            }
+            _ => false,
+        }
+    };
+    let search_is_current = |row: Option<usize>, col: usize| -> bool {
+        match search {
+            Some(hl) if hl.has_current => hl.current_row == row && hl.current_col == col,
+            _ => false,
+        }
+    };
     let cell_selected = |abs_row: Option<usize>, abs_col: usize| -> bool {
         sel.is_some_and(|((r0, c0), (r1, c1))| {
             if abs_col < c0 || abs_col > c1 {
@@ -1614,7 +1704,12 @@ fn markdown_table_lines(
             if k > 0 {
                 spans.push(Span::styled(" | ", base));
             }
-            let st = if cell_selected(None, start_col + k) {
+            let abs_col = start_col + k;
+            let st = if search_is_current(None, abs_col) {
+                search_current_style
+            } else if search_hit(col) {
+                search_match_style
+            } else if cell_selected(None, abs_col) {
                 sel_style
             } else {
                 base
@@ -1639,7 +1734,12 @@ fn markdown_table_lines(
             if k > 0 {
                 spans.push(Span::styled(" | ", base));
             }
-            let st = if cell_selected(Some(top + j), start_col + k) {
+            let abs = (Some(top + j), start_col + k);
+            let st = if search_is_current(abs.0, abs.1) {
+                search_current_style
+            } else if search_hit(cell) {
+                search_match_style
+            } else if cell_selected(abs.0, abs.1) {
                 sel_style
             } else {
                 base
@@ -3503,7 +3603,7 @@ mod tests {
         let r1 = vec!["x".to_string(), "y".to_string()];
         let rows = vec![r1.as_slice()];
         let plain = markdown_table(&cols, &rows);
-        let lines = markdown_table_lines(&cols, &rows, 0, 0, None);
+        let lines = markdown_table_lines(&cols, &rows, 0, 0, None, None);
         let text: String = lines
             .iter()
             .map(|l| {
@@ -3523,6 +3623,50 @@ mod tests {
     }
 
     #[test]
+    fn markdown_lines_highlight_search_matches() {
+        let cols = vec!["ID".to_string(), "NAME".to_string()];
+        let r1 = vec!["1".to_string(), "ann".to_string()];
+        let r2 = vec!["2".to_string(), "bob".to_string()];
+        let rows = vec![r1.as_slice(), r2.as_slice()];
+        // Case-insensitive "a" hits the NAME header and "ann".
+        let hl = TableSearchHighlight {
+            query: "a".to_string(),
+            case_sensitive: false,
+            current_row: None,
+            current_col: 1,
+            has_current: true,
+        };
+        let lines = markdown_table_lines(&cols, &rows, 0, 0, None, Some(&hl));
+        let green: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.bg == Some(Color::Green))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(green, vec!["NAME"]);
+        let yellow: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(yellow, vec!["ann"]);
+        // Text itself is unchanged (byte-identical to the plain table).
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(text, markdown_table(&cols, &rows));
+    }
+
+    #[test]
     fn markdown_lines_highlight_only_selected_cells() {
         let cols = vec!["ID".to_string(), "NAME".to_string()];
         let r1 = vec!["1".to_string(), "ann".to_string()];
@@ -3535,7 +3679,7 @@ mod tests {
             cursor_col: 1,
         });
         let rect = selected_cell_rect(sel, 2, 2);
-        let lines = markdown_table_lines(&cols, &rows, 0, 0, rect);
+        let lines = markdown_table_lines(&cols, &rows, 0, 0, rect, None);
         // Header line + separator + 2 rows.
         assert_eq!(lines.len(), 4);
         let cyan: Vec<&str> = lines
@@ -3550,9 +3694,10 @@ mod tests {
 
     #[test]
     fn ascii_segment_tint_reassembles_identically() {
+        use AsciiCellTint as T;
         let mut line = Line::from("| OWNER   | ACTIVE |".to_string());
         let original: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        tint_ascii_cells(&mut line, &[false, true]);
+        tint_ascii_cells(&mut line, &[T::Plain, T::Selected]);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, original);
         // Only the second cell block is tinted.
