@@ -1,6 +1,6 @@
 [package]
 name = "frog"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 description = "Terminal Oracle client - inspired by Toad, tmux, btop"
 

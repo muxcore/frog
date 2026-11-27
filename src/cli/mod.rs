@@ -557,6 +557,33 @@ struct ParsedConnect {
     password: Option<String>,
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse_postgres_url(cs: &str) -> Option<ParsedConnect> {
     let rest = cs
         .strip_prefix("postgres://")
@@ -569,21 +596,34 @@ fn parse_postgres_url(cs: &str) -> Option<ParsedConnect> {
         None => ("", rest),
     };
     let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u.to_string(), Some(p.to_string()).filter(|s| !s.is_empty())),
-        None => (auth.to_string(), None),
+        Some((u, p)) => (
+            percent_decode(u),
+            Some(percent_decode(p)).filter(|s| !s.is_empty()),
+        ),
+        None => (percent_decode(auth), None),
     };
     let (hostport, database) = match hostpart.split_once('/') {
-        Some((h, d)) => (h, d.to_string()),
+        Some((h, d)) => (h, percent_decode(d)),
         None => (hostpart, String::new()),
     };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (
-            (!h.is_empty()).then(|| h.to_string()),
-            p.parse::<u16>().ok(),
-        ),
-        None => ((!hostport.is_empty()).then(|| hostport.to_string()), None),
+    let (host, port) = if let Some(after_open) = hostport.strip_prefix('[') {
+        match after_open.split_once(']') {
+            Some((ipv6, tail)) => (
+                (!ipv6.is_empty()).then(|| ipv6.to_string()),
+                tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()),
+            ),
+            None => (Some(hostport.to_string()), None),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (
+                (!h.is_empty()).then(|| percent_decode(h)),
+                p.parse::<u16>().ok(),
+            ),
+            None => ((!hostport.is_empty()).then(|| percent_decode(hostport)), None),
+        }
     };
-    let database = (!database.is_empty()).then(|| database.clone());
+    let database = (!database.is_empty()).then_some(database);
     Some(ParsedConnect {
         db_type: DbType::Postgres,
         host,
@@ -768,6 +808,23 @@ mod tests {
         assert_eq!(params.db_type, DbType::Postgres);
         assert_eq!(params.port, None);
         assert_eq!(params.password.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_percent_decodes_and_handles_ipv6() {
+        let params =
+            parse_connect_string("postgres://b%40b:p%40ss%3Aw%2Frd@[::1]:5433/my%2Ddb");
+        assert_eq!(params.db_type, DbType::Postgres);
+        assert_eq!(params.user, "b@b");
+        assert_eq!(params.password.as_deref(), Some("p@ss:w/rd"));
+        assert_eq!(params.host.as_deref(), Some("::1"));
+        assert_eq!(params.port, Some(5433));
+        assert_eq!(params.database.as_deref(), Some("my-db"));
+
+        let ipv6_no_port = parse_connect_string("postgresql://u@[fe80::1]/app");
+        assert_eq!(ipv6_no_port.host.as_deref(), Some("fe80::1"));
+        assert_eq!(ipv6_no_port.port, None);
+        assert_eq!(ipv6_no_port.database.as_deref(), Some("app"));
     }
 
     #[test]

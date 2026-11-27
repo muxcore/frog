@@ -15,6 +15,7 @@ const ENV_KEYS: &[&str] = &[
     "FROG_NO_AUTOCOMMIT",
     "FROG_SESSION_REFRESH_SECS",
     "FROG_SESSION_REFRESH",
+    "FROG_CLIPBOARD_CMD",
     "FROG_DB_TYPE",
     "PGHOST",
     "PGPORT",
@@ -153,5 +154,10 @@ mod tests {
             info.summary(),
             "'./.env': using ORACLE_HOST; ignored ORACLE_USER (set in environment)"
         );
+    }
+
+    #[test]
+    fn allows_frog_clipboard_cmd_in_dotenv() {
+        assert!(ENV_KEYS.contains(&"FROG_CLIPBOARD_CMD"));
     }
 }

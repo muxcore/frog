@@ -740,7 +740,7 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
+        let owned = schema.to_string();
         let rows = stmt
             .query(&[&owned])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -773,7 +773,7 @@ impl OracleConnection {
 
     /// F12 explorer: objects of one type-group folder, ordered by name.
     pub fn list_objects(&self, schema: &str, group: &str) -> anyhow::Result<Vec<(String, String)>> {
-        let owned = schema.to_uppercase();
+        let owned = schema.to_string();
         let sql = match group {
             "TABLES" => {
                 "SELECT TABLE_NAME, 'TABLE' FROM ALL_TABLES WHERE OWNER = :1 ORDER BY 1"
@@ -844,8 +844,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let iname = index.to_uppercase();
+        let owned = schema.to_string();
+        let iname = index.to_string();
         let rows = stmt
             .query(&[&owned, &iname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -891,8 +891,8 @@ impl OracleConnection {
                     .statement(sql)
                     .build()
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let owned = schema.to_uppercase();
-                let tname = name.to_uppercase();
+                let owned = schema.to_string();
+                let tname = name.to_string();
                 let rows = stmt
                     .query(&[&owned, &tname])
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -935,8 +935,8 @@ impl OracleConnection {
                     .statement(sql)
                     .build()
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let owned = schema.to_uppercase();
-                let tname = name.to_uppercase();
+                let owned = schema.to_string();
+                let tname = name.to_string();
                 let rows = stmt
                     .query(&[&owned, &tname])
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -990,8 +990,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let oname = name.to_uppercase();
+        let owned = schema.to_string();
+        let oname = name.to_string();
         let otype_up = otype.to_uppercase();
         let rows = stmt
             .query(&[&owned, &oname, &otype_up])
@@ -1043,8 +1043,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let tname = name.to_uppercase();
+        let owned = schema.to_string();
+        let tname = name.to_string();
         let rows = stmt
             .query(&[&owned, &tname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1348,8 +1348,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let sname = name.to_uppercase();
+        let owned = schema.to_string();
+        let sname = name.to_string();
         let rows = stmt
             .query(&[&owned, &sname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1404,8 +1404,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let tname = table.to_uppercase();
+        let owned = schema.to_string();
+        let tname = table.to_string();
         let rows = stmt
             .query(&[&owned, &tname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1461,7 +1461,7 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owner = schema.to_uppercase();
+        let owner = schema.to_string();
         let rows = stmt
             .query(&[&owner])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1497,14 +1497,10 @@ impl OracleConnection {
         // owner (dictionary spelling) -> requested table names (dictionary spelling)
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for r in refs {
-            let owner = r
-                .schema
-                .clone()
-                .unwrap_or_else(|| current_schema.to_string());
-            let owner = if r.schema.is_some() && r.schema_quoted {
-                owner
-            } else {
-                owner.to_uppercase()
+            let owner = match &r.schema {
+                Some(s) if r.schema_quoted => s.clone(),
+                Some(s) => s.to_uppercase(),
+                None => current_schema.to_string(),
             };
             let table = if r.quoted {
                 r.name.clone()
@@ -1602,8 +1598,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let iname = index.to_uppercase();
+        let owned = schema.to_string();
+        let iname = index.to_string();
         let rows = stmt
             .query(&[&owned, &iname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1706,8 +1702,8 @@ impl OracleConnection {
             .statement(sql)
             .build()
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let owned = schema.to_uppercase();
-        let sname = name.to_uppercase();
+        let owned = schema.to_string();
+        let sname = name.to_string();
         let rows = stmt
             .query(&[&owned, &sname])
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1722,8 +1718,8 @@ impl OracleConnection {
                 Ok(format!(
                     "CREATE SEQUENCE {}.{}\n  INCREMENT BY {}\n  MINVALUE {}\n  \
                      MAXVALUE {}\n  {}CYCLE\n  CACHE {};",
-                    schema,
-                    name,
+                    ora_ident(schema),
+                    ora_ident(name),
                     inc,
                     min,
                     max,

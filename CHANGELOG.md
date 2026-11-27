@@ -2,7 +2,46 @@
 
 All notable changes to frog are documented here.
 
-## [0.10.1] - 2026-11-27
+## [0.11.0] - 2026-11-27
+
+### Fixed
+- `F3` History browser now scrolls: the viewport tracks `history_cursor`
+  (newest entry visible on open), with `Up/Down`/`j`/`k`, `PgUp`/`PgDn`,
+  `Home`/`End`, mouse wheel and click-to-select, a `[i/N]` counter and a
+  scrollbar. `F1`/startup Help scrolls the same way (`Up/Down`/`j`/`k`,
+  `PgUp`/`PgDn`/`Home`/`End`, wheel) instead of clipping past the first
+  screen, and all Help lines are searchable via `Ctrl+S`.
+- Command bar (`Ctrl+:`) no longer swallows unknown-command errors: the
+  bar stays open with the typed text and shows the inline `⚠ Unknown
+  command` hint until edited or dismissed with `Esc`.
+- `@subdir/script.sql` nested `@@` includes now resolve relative to the
+  including script's directory (previously a top-level `@file` lost its
+  parent dir and nested `@@part.sql` resolved against CWD).
+- `Ctrl+O` (`Esc`) cancels cleanly: the dialog snapshot is restored, and
+  the sidebar, completion engine and `F12` previews now follow the live
+  connection's backend/endpoint instead of unsubmitted dialog edits.
+- Postgres honors `--no-autocommit` / `FROG_NO_AUTOCOMMIT`: mutating
+  statements open an implicit `BEGIN` until `COMMIT`/`ROLLBACK` (with
+  auto-rollback of an empty transaction when the first statement fails),
+  while plain `SELECT`s and non-transactional commands (`VACUUM`,
+  `CREATE INDEX CONCURRENTLY`, `CREATE DATABASE`, …) run outside a
+  transaction.
+- SQL statement splitter is scope-aware: named `END <label>;` endings,
+  internal `CASE ... END;` and nested `BEGIN ... END;` blocks, package
+  spec/body subprograms and `CREATE TYPE ... AS ENUM/OBJECT` no longer
+  split prematurely or swallow the next query; Postgres `E'...'` escaped
+  quotes are handled.
+- SQL history is per-user (`~/.local/state/frog/frog_history.txt`,
+  overridable via `FROG_HISTORY_FILE`, legacy binary-adjacent file kept
+  as a read fallback) with strict timestamp-marker parsing, `0o700`/`0o600`
+  permissions and 2 MB / 1000-entry compaction.
+- `.env` now accepts `FROG_CLIPBOARD_CMD` as documented.
+- Quoted / mixed-case Oracle identifiers work in `F12` and `F4`
+  (dictionary binds keep exact case; `SELECT *` previews and sequence DDL
+  quote via `ora_ident`).
+- Postgres connect strings percent-decode URL-encoded credentials/hosts/
+  dbnames and parse bracketed IPv6 hosts (`[::1]`, `[::1]:5432`).
+- `--max-rows` is honored on the first page, not just on pagination.
 
 ### Fixed
 - Search visibility on limited terminals (git-bash/mintty, jump proxies

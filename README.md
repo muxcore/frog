@@ -17,7 +17,7 @@ Meet 'Frog' - A terminal-based Oracle + Postgres database client written in Rust
 - **Result viewer** — pretty-printed tables (Table / Markdown / ASCII), 2D scrolling, clipboard copy, pagination.
 - **(experimental)sqlplus-style scripting** — run a `.sql` file with `@file.sql`; support nested includes with `@@rel/path.sql`.
 - **Background query execution** — queries run on a worker thread; kick a running query with `Ctrl+C`/`Esc`.
-- **SQL history** — persisted to `frog_history.txt` next to the binary and browsable in-app.
+- **SQL history** — persisted per user (`~/.local/state/frog/frog_history.txt` or `FROG_HISTORY_FILE`, with legacy fallback next to the binary) and browsable in-app (`F3`).
 - **Oracle + Postgres** — pick the backend with `--db-type` or the `Type:` row in the connection dialog (`Ctrl+O`). Postgres needs no client libraries.
 - **Session browser (F2)** — `v$session` / `pg_stat_activity` viewer. Pick a row to see its current SQL, `Enter` shows the explain plan (TOAD-style). Scroll/zoom the full SQL and plan panes, `a` filters ACTIVE sessions only, `s`/`S` sorts columns.
 - **`.env` support** — connection settings are also read from a `.env` file in the working directory (real environment variables take priority).
@@ -171,7 +171,7 @@ PGPASSWORD=tiger
 # (DATABASE_URL works as a fallback for ORACLE_CONNECT)
 ```
 
-Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` accepted as an alias), `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
+Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` accepted as an alias), `FROG_CLIPBOARD_CMD`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
 
 > **Dialog shows defaults?** The `.env` is read from the directory frog is *started* in — a `.env` elsewhere is ignored. If nothing configures the connection, frog prints `no connection settings from CLI flags, env vars or ./.env …` at startup and `frog --help` lists every variable it understands.
 

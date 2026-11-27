@@ -14,23 +14,57 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// History file stored next to the frog binary.
-pub fn history_path() -> PathBuf {
+/// Maximum on-disk history file size before compacting oldest entries (2 MB).
+const MAX_HISTORY_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DISK_HISTORY_ENTRIES: usize = 1000;
+
+/// Legacy history location next to the frog binary (used as read fallback so
+/// upgrading users keep existing history, and as write fallback if `$HOME` is unavailable).
+fn legacy_history_path() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("frog_history.txt")))
         .unwrap_or_else(|| PathBuf::from("frog_history.txt"))
 }
 
-pub fn load_history() -> Vec<String> {
-    let path = history_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+/// Per-user history file path (`$XDG_STATE_HOME/frog/frog_history.txt` or
+/// platform equivalent, overridable via `FROG_HISTORY_FILE`). Avoids silent
+/// permission failures when `frog` is installed in `/usr/local/bin` or `/usr/bin`.
+pub fn history_path() -> PathBuf {
+    if let Some(custom) = std::env::var_os("FROG_HISTORY_FILE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!("frog_test_history_{}.txt", std::process::id()))
+    }
+    #[cfg(not(test))]
+    {
+        if let Some(base) = dirs::state_dir().or_else(dirs::data_local_dir) {
+            return base.join("frog").join("frog_history.txt");
+        }
+        legacy_history_path()
+    }
+}
+
+fn is_history_marker(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("-- frog@") else {
+        return false;
     };
+    let Some(ts) = rest.strip_suffix(';') else {
+        return false;
+    };
+    ts.len() == 19
+        && ts
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b' ' | b':'))
+}
+
+pub(crate) fn parse_history_contents(contents: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
     for line in contents.lines() {
-        if line.starts_with("-- frog@") {
+        if is_history_marker(line) {
             let stmt = buf.trim().trim_end_matches(';').to_string();
             if !stmt.is_empty() {
                 out.push(stmt);
@@ -48,13 +82,44 @@ pub fn load_history() -> Vec<String> {
     out
 }
 
-pub fn append_history(sql: &str) {
-    let path = history_path();
-    let entry = format!(
-        "-- frog@{};\n{};\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        sql.trim().trim_end_matches(';')
-    );
+pub fn load_history() -> Vec<String> {
+    let primary = history_path();
+    let contents = match std::fs::read_to_string(&primary) {
+        Ok(c) => c,
+        Err(_) => {
+            let legacy = legacy_history_path();
+            if legacy != primary {
+                match std::fs::read_to_string(&legacy) {
+                    Ok(c) => c,
+                    Err(_) => return Vec::new(),
+                }
+            } else {
+                return Vec::new();
+            }
+        }
+    };
+    parse_history_contents(&contents)
+}
+
+fn ensure_history_parent(path: &Path) {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        let _ = builder.create(parent);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+}
+
+fn open_history_append(path: &Path) -> std::io::Result<std::fs::File> {
+    ensure_history_parent(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -63,9 +128,60 @@ pub fn append_history(sql: &str) {
         // Only applied when the file is created: history is owner-only (0o600).
         opts.mode(0o600);
     }
-    if let Ok(mut file) = opts.open(&path) {
+    opts.open(path)
+}
+
+fn maybe_compact_history_file(path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= MAX_HISTORY_FILE_BYTES {
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let entries = parse_history_contents(&contents);
+    let keep_from = entries.len().saturating_sub(MAX_DISK_HISTORY_ENTRIES);
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let mut compacted = String::new();
+    for stmt in &entries[keep_from..] {
+        compacted.push_str(&format!("-- frog@{};\n{};\n", ts, stmt));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(path) {
         use std::io::Write;
+        let _ = f.write_all(compacted.as_bytes());
+    }
+}
+
+pub fn append_history(sql: &str) {
+    use std::io::Write;
+    let primary = history_path();
+    let entry = format!(
+        "-- frog@{};\n{};\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        sql.trim().trim_end_matches(';')
+    );
+    if let Ok(mut file) = open_history_append(&primary) {
         let _ = file.write_all(entry.as_bytes());
+        drop(file);
+        maybe_compact_history_file(&primary);
+        return;
+    }
+    let legacy = legacy_history_path();
+    if legacy != primary {
+        if let Ok(mut file) = open_history_append(&legacy) {
+            let _ = file.write_all(entry.as_bytes());
+            drop(file);
+            maybe_compact_history_file(&legacy);
+        }
     }
 }
 
@@ -597,6 +713,8 @@ pub struct Session {
     pub connect_error: Option<String>,
     pub query_history: Vec<String>,
     pub history_cursor: usize,
+    pub history_scroll: usize,
+    pub help_scroll: usize,
     pub results: Vec<QueryRow>,
     pub scroll_offset: usize,
     pub col_scroll_offset: usize,
@@ -615,6 +733,10 @@ pub struct Session {
     /// placeholder, and prevents duplicate page requests).
     pub paging: bool,
     pub conn_dialog: ConnectionDialog,
+    /// Snapshot of `conn_dialog` taken when `Ctrl+O` opens so `Esc` cancels cleanly.
+    pub conn_dialog_backup: Option<ConnectionDialog>,
+    /// Endpoint parameters of the currently established connection (password scrubbed).
+    pub connected_params: Option<ConnectionParams>,
     /// The last SELECT SQL executed — used for fetching additional pages.
     pub last_sql: Option<String>,
     /// Page size for pagination (default 100).
@@ -1226,6 +1348,28 @@ impl Session {
         }
     }
 
+    /// Keep `history_cursor` clamped and inside a `visible_height`-row viewport.
+    pub fn ensure_history_cursor_visible(&mut self, visible_height: usize) {
+        let total = self.query_history.len();
+        if total == 0 {
+            self.history_cursor = 0;
+            self.history_scroll = 0;
+            return;
+        }
+        self.history_cursor = self.history_cursor.min(total - 1);
+        if visible_height == 0 {
+            self.history_scroll = self.history_scroll.min(total - 1);
+            return;
+        }
+        if self.history_cursor < self.history_scroll {
+            self.history_scroll = self.history_cursor;
+        } else if self.history_cursor >= self.history_scroll + visible_height {
+            self.history_scroll = self.history_cursor + 1 - visible_height;
+        }
+        let max_scroll = total.saturating_sub(visible_height);
+        self.history_scroll = self.history_scroll.min(max_scroll);
+    }
+
     /// If an editor drag-selection exists, delete its text and park the
     /// cursor at its start. Returns true when something was deleted.
     /// Used for type/paste-replaces-selection and Backspace/Delete.
@@ -1323,14 +1467,18 @@ impl Session {
     }
 
     fn new(id: usize) -> Self {
+        let query_history = load_history();
+        let history_cursor = query_history.len().saturating_sub(1);
         Self {
             id,
             name: format!("Session {}", id),
             is_connected: false,
             connecting: false,
             connect_error: None,
-            query_history: load_history(),
-            history_cursor: 0,
+            query_history,
+            history_cursor,
+            history_scroll: 0,
+            help_scroll: 0,
             results: Vec::new(),
             scroll_offset: 0,
             col_scroll_offset: 0,
@@ -1341,6 +1489,8 @@ impl Session {
             pending_query: false,
             paging: false,
             conn_dialog: ConnectionDialog::default(),
+            conn_dialog_backup: None,
+            connected_params: None,
             last_sql: None,
             page_size: 100,
             status_message: None,
@@ -1418,8 +1568,14 @@ pub struct PerfMsg {
 
 /// `(session_id, job_seq, result_row, is_final_for_job)`
 type ResultMsg = (usize, u64, QueryRow, bool);
-/// `(session_id, conn_seq, conn_or_error, display_name)`
-type ConnResultMsg = (usize, u64, Result<Arc<dyn DbConnection>, String>, String);
+/// `(session_id, conn_seq, conn_or_error, display_name, sanitized_params)`
+type ConnResultMsg = (
+    usize,
+    u64,
+    Result<Arc<dyn DbConnection>, String>,
+    String,
+    ConnectionParams,
+);
 
 pub struct SessionManager {
     pub sessions: Vec<Session>,
@@ -1619,12 +1775,13 @@ impl SessionManager {
                     &null_display,
                 )
                 .map(|c| c as Arc<dyn DbConnection>),
-                DbType::Postgres => PgConnection::connect(
+                DbType::Postgres => PgConnection::connect_with_autocommit(
                     &params.host,
                     params.port,
                     &params.database,
                     &params.user,
                     params.password.as_deref().unwrap_or(""),
+                    autocommit,
                     &null_display,
                 )
                 .map(|c| c as Arc<dyn DbConnection>),
@@ -1636,9 +1793,13 @@ impl SessionManager {
                     e.to_string()
                 }
             });
-            if let Err(send_err) = conn_result_tx.send((id, conn_seq, outcome, name_str)) {
+            let mut sanitized = params;
+            sanitized.password = None;
+            if let Err(send_err) =
+                conn_result_tx.send((id, conn_seq, outcome, name_str, sanitized))
+            {
                 //SessionManager dropped before connect finished: close cleanly.
-                if let (_, _, Ok(conn), _) = send_err.0 {
+                if let (_, _, Ok(conn), _, _) = send_err.0 {
                     let _ = conn.close();
                 }
             }
@@ -1741,43 +1902,45 @@ impl SessionManager {
         );
     }
 
+    /// Backend of session `idx`'s live connection if connected, else the
+    /// backend selected in its connection dialog.
+    pub fn session_db_type(&self, idx: usize) -> DbType {
+        let Some(sess) = self.sessions.get(idx) else {
+            return DbType::Oracle;
+        };
+        let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = map.get(&sess.id) {
+            return conn.db_type();
+        }
+        if let Some(ref p) = sess.connected_params {
+            if sess.is_connected {
+                return p.db_type;
+            }
+        }
+        sess.conn_dialog.db_type
+    }
+
     /// Backend of the active session's connection if connected, else the
     /// backend selected in its connection dialog.
     pub fn active_db_type(&self) -> DbType {
-        let map = self.conn_map.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(conn) = map.get(&self.sessions[self.active_idx].id) {
-            return conn.db_type();
-        }
-        self.sessions[self.active_idx].conn_dialog.db_type
+        self.session_db_type(self.active_idx)
     }
 
     pub fn execute_query(&mut self, sql: &str) {
-        // @file / @ file.sql directive: read the file and run it as a script,
-        // honoring nested @file includes and aborting on the first error.
-        if let Some(raw) = parse_file_directive(sql) {
-            let path = PathBuf::from(raw.trim_start_matches("@@").trim());
-            match load_script_file(&path) {
-                Ok(statements) => {
-                    self.sessions[self.active_idx].set_status(format!(
-                        "Running script '{}' ({} statements)",
-                        path.display(),
-                        statements.len()
-                    ));
-                    self.execute_script(statements);
-                }
-                Err(err) => {
-                    self.emit_error(self.active_idx, err.clone());
-                }
-            }
-            return;
-        }
-
-        // last_sql (for pagination) is recorded per statement in execute_script.
-        self.execute_script(vec![sql.to_string()]);
+        // Delegate `@file.sql` directives directly to `execute_script` so
+        // `expand_statements` preserves the script's parent directory as the
+        // base for nested `@@relative.sql` includes.
+        let script_label = parse_file_directive(sql)
+            .map(|raw| raw.trim_start_matches("@@").trim().to_string());
+        self.execute_script_internal(vec![sql.to_string()], script_label.as_deref());
     }
 
     pub fn execute_script(&mut self, statements: Vec<String>) {
-        // Expand any nested @file directives found among the statements before running.
+        self.execute_script_internal(statements, None);
+    }
+
+    fn execute_script_internal(&mut self, statements: Vec<String>, script_label: Option<&str>) {
+        // Expand any `@file` / nested `@@file` directives before running.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let statements = match expand_statements(statements, &cwd) {
             Ok(stmts) => stmts,
@@ -1786,6 +1949,13 @@ impl SessionManager {
                 return;
             }
         };
+        if let Some(label) = script_label {
+            self.sessions[self.active_idx].set_status(format!(
+                "Running script '{}' ({} statements)",
+                label,
+                statements.len()
+            ));
+        }
         if statements.is_empty() {
             return;
         }
@@ -1802,6 +1972,11 @@ impl SessionManager {
         let conn_map = self.conn_map.clone();
         let result_tx = self.result_tx.clone();
         let page_size = self.sessions[idx].page_size;
+        let initial_limit = if self.max_rows > 0 {
+            page_size.min(self.max_rows)
+        } else {
+            page_size
+        };
         let exec_lock = self.sessions[idx].exec_lock.clone();
 
         self.sessions[idx].pending_query = true;
@@ -1843,7 +2018,7 @@ impl SessionManager {
                 .cloned();
             if let Some(conn) = conn_opt {
                 for (n, sql) in statements.iter().enumerate() {
-                    let result = conn.execute_query(sql, page_size);
+                    let result = conn.execute_query(sql, initial_limit);
                     let was_cancelled = result.is_error
                         && result
                             .error_msg
@@ -2056,7 +2231,7 @@ impl SessionManager {
     }
 
     pub fn poll_conn_result(&mut self) {
-        while let Ok((id, seq, outcome, name)) = self.conn_result_rx.try_recv() {
+        while let Ok((id, seq, outcome, name, connected_params)) = self.conn_result_rx.try_recv() {
             let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
                 // Session tab was closed while connecting: close the handle so
                 // the DB session does not leak.
@@ -2071,7 +2246,7 @@ impl SessionManager {
                     let _ = conn.close();
                 }
                 continue;
-            }
+            };
             match outcome {
                 Ok(conn) => {
                     let dialect = conn.db_type();
@@ -2088,6 +2263,7 @@ impl SessionManager {
                     sess.is_connected = true;
                     sess.connect_error = None;
                     sess.name = name;
+                    sess.connected_params = Some(connected_params);
                     // Fresh connection: drop any metadata/explorer/perf state from a previous one.
                     sess.metadata = MetadataStore::default();
                     sess.metadata.set_dialect(dialect);
@@ -2194,7 +2370,7 @@ impl SessionManager {
     /// Build a completion context for a session's editor at its cursor.
     fn completion_context(&self, idx: usize) -> (CompletionContext, usize, usize) {
         let ed = &self.sessions[idx].editor;
-        let dialect = self.sessions[idx].conn_dialog.db_type;
+        let dialect = self.session_db_type(idx);
         let text = ed.text();
         let ctx = completion::analyze(&text, ed.cursor_char_offset(), dialect);
         (ctx, ed.cursor_row, ed.cursor_col)
@@ -3662,9 +3838,11 @@ impl SessionManager {
         let db_type = self.active_db_type();
         // Only row-bearing relations (and PG sequences) make a SELECT.
         match (db_type, obj.kind.as_str()) {
-            (DbType::Oracle, "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE") => {
-                Some(format!("SELECT * FROM {}.{};", schema, table))
-            }
+            (DbType::Oracle, "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE") => Some(format!(
+                "SELECT * FROM {}.{};",
+                crate::db::connection::ora_ident(&schema),
+                crate::db::connection::ora_ident(&table)
+            )),
             (DbType::Postgres, "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE" | "SEQUENCE") => {
                 Some(format!(
                     "SELECT * FROM {}.{};",
@@ -3692,7 +3870,11 @@ impl SessionManager {
     ) -> Option<String> {
         match kind {
             "TABLE" | "VIEW" | "MVIEW" | "FOREIGN TABLE" => Some(match db_type {
-                DbType::Oracle => format!("SELECT * FROM {}.{}", schema, name),
+                DbType::Oracle => format!(
+                    "SELECT * FROM {}.{}",
+                    crate::db::connection::ora_ident(schema),
+                    crate::db::connection::ora_ident(name)
+                ),
                 DbType::Postgres => crate::db::postgres::pg_relation_select(schema, name),
             }),
             // Sequences have no table data: show live properties instead.
@@ -3838,12 +4020,11 @@ impl SessionManager {
             Some(o) => o.clone(),
             None => return,
         };
-        let sess = &mut self.sessions[self.active_idx];
-        let schema = match sess.explorer_schemas.get(sidx) {
+        let db_type = self.active_db_type();
+        let schema = match self.sessions[self.active_idx].explorer_schemas.get(sidx) {
             Some(s) => s.name.clone(),
             None => return,
         };
-        let db_type = sess.conn_dialog.db_type;
         let sql = match Self::explorer_preview_sql(db_type, &schema, &obj.name, &obj.kind) {
             Some(s) => s,
             None => return,
@@ -5295,5 +5476,75 @@ mod tests {
         dlg.cursor = 1; // inside 2-byte 'ä'
         dlg.cursor_right();
         assert!(dlg.host.is_char_boundary(dlg.cursor));
+    }
+
+    #[test]
+    fn execute_query_at_subdir_resolves_nested_relative_includes() {
+        let dir = std::env::temp_dir().join(format!("frog_test_at_subdir_{}", std::process::id()));
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("part.sql"), "select 2 from dual;").unwrap();
+        std::fs::write(sub.join("setup.sql"), "select 1 from dual;\n@@part.sql").unwrap();
+
+        let mut sm = SessionManager::new();
+        sm.sessions[0].query_history.clear();
+        let script_directive = format!("@{}", sub.join("setup.sql").display());
+        sm.execute_query(&script_directive);
+
+        // Both statements from setup.sql and its sibling @@part.sql were expanded.
+        assert_eq!(
+            sm.sessions[0].query_history,
+            vec!["select 1 from dual", "select 2 from dual"]
+        );
+        assert!(sm.sessions[0]
+            .status_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("2 statements"));
+
+        let _ = std::fs::remove_file(history_path());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_parser_ignores_inline_frog_comments_without_timestamp() {
+        let raw = "-- frog@2026-11-27 12:00:00;\nSELECT 1\n-- frog@note inside sql\nFROM dual;\n\
+                   -- frog@2026-11-27 12:01:00;\nSELECT 2 FROM dual;\n";
+        let parsed = parse_history_contents(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                "SELECT 1\n-- frog@note inside sql\nFROM dual",
+                "SELECT 2 FROM dual"
+            ]
+        );
+    }
+
+    #[test]
+    fn explorer_preview_sql_quotes_mixed_case_oracle_identifiers() {
+        assert_eq!(
+            SessionManager::explorer_preview_sql(DbType::Oracle, "SCOTT", "myTable", "TABLE")
+                .as_deref(),
+            Some("SELECT * FROM SCOTT.\"myTable\"")
+        );
+        assert_eq!(
+            SessionManager::explorer_preview_sql(DbType::Oracle, "SCOTT", "EMP", "TABLE")
+                .as_deref(),
+            Some("SELECT * FROM SCOTT.EMP")
+        );
+    }
+
+    #[test]
+    fn history_scroll_tracks_cursor_into_view() {
+        let mut sm = SessionManager::new();
+        let sess = &mut sm.sessions[0];
+        sess.query_history = (0..50).map(|i| format!("SELECT {}", i)).collect();
+        sess.history_cursor = 49;
+        sess.history_scroll = 0;
+        sess.ensure_history_cursor_visible(10);
+        assert_eq!(sess.history_scroll, 40);
+        sess.history_cursor = 5;
+        sess.ensure_history_cursor_visible(10);
+        assert_eq!(sess.history_scroll, 5);
     }
 }

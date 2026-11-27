@@ -742,12 +742,12 @@ pub fn render_completion_popup(
 }
 
 pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .title(" SQL History Browser (Up/Down: navigate | Enter: insert into editor | Esc: exit) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
-
-    if session.query_history.is_empty() {
+    let total = session.query_history.len();
+    if total == 0 {
+        let block = Block::default()
+            .title(" SQL History Browser (Up/Down: navigate | Enter: insert into editor | Esc: exit) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
         let p = Paragraph::new("No history entries recorded yet.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
@@ -755,12 +755,35 @@ pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
         return;
     }
 
+    let cursor = session.history_cursor.min(total - 1);
+    let avail_height = area.height.saturating_sub(2) as usize;
+    let max_scroll = total.saturating_sub(avail_height.max(1));
+    let mut scroll = session.history_scroll.min(max_scroll);
+    if avail_height > 0 {
+        if cursor < scroll {
+            scroll = cursor;
+        } else if cursor >= scroll + avail_height {
+            scroll = cursor + 1 - avail_height;
+        }
+    }
+
+    let block = Block::default()
+        .title(format!(
+            " SQL History [{}/{}] (↑/↓/PgUp/PgDn/Home/End: navigate | Enter: insert | Esc/q: exit) ",
+            cursor + 1,
+            total
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
     let items: Vec<ListItem> = session
         .query_history
         .iter()
         .enumerate()
+        .skip(scroll)
+        .take(avail_height.max(1))
         .map(|(i, stmt)| {
-            let style = if i == session.history_cursor {
+            let style = if i == cursor {
                 Style::default()
                     .bg(Color::Rgb(60, 60, 100))
                     .fg(Color::Yellow)
@@ -768,11 +791,7 @@ pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
             } else {
                 Style::default().fg(Color::White)
             };
-            let prefix = if i == session.history_cursor {
-                "▶ "
-            } else {
-                "  "
-            };
+            let prefix = if i == cursor { "▶ " } else { "  " };
             let single_line_stmt = stmt.replace('\n', " ");
             ListItem::new(Line::from(vec![
                 Span::styled(prefix, Style::default().fg(Color::Cyan)),
@@ -787,6 +806,16 @@ pub fn render_history(session: &Session, f: &mut Frame, area: Rect) {
 
     let list = List::new(items).block(block);
     f.render_widget(list, area);
+
+    if total > avail_height.max(1) && area.height >= 5 {
+        let mut vstate = ScrollbarState::new(max_scroll.max(1)).position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::default().fg(Color::Yellow)),
+            area,
+            &mut vstate,
+        );
+    }
 }
 
 /// Render-time state for the result viewer (scroll + display format + focus).
@@ -2390,8 +2419,8 @@ fn render_f2_plan(session: &Session, focused: bool, maximized: bool, f: &mut Fra
     render_plan_pane(session, focused, maximized, f, area);
 }
 
-pub fn render_help(f: &mut Frame, area: Rect) {
-    let help_text = vec![
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(
             " Frog DB Client — Welcome & Usability Overview ",
             Style::default()
@@ -2477,48 +2506,69 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         Line::from("  Esc / q             Return to query editor"),
         Line::from("  Ctrl+Q              Quit application"),
         Line::from("  Ctrl+S              Incremental search (Emacs I-search) — type to find, Ctrl-S next, Ctrl-R prev, Enter/Esc done, Ctrl-G cancel"),
-    ];
-    let p = Paragraph::new(help_text).block(
+    ]
+}
+
+pub fn help_line_count() -> usize {
+    help_lines().len()
+}
+
+pub fn render_help(scroll: usize, is_startup: bool, f: &mut Frame, area: Rect) {
+    let lines = help_lines();
+    let total = lines.len();
+    let view_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = total.saturating_sub(view_h.max(1));
+    let skip = scroll.min(max_scroll);
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(skip)
+        .take(view_h.max(1))
+        .collect();
+    let title = if is_startup {
+        if max_scroll > 0 {
+            " Welcome / Help (↑/↓/PgUp/PgDn: scroll · Any other key: start) ".to_string()
+        } else {
+            " Welcome / Help (Press any key to start) ".to_string()
+        }
+    } else if max_scroll > 0 {
+        format!(
+            " Help [{}-{}/{}] (↑/↓/PgUp/PgDn/Home/End: scroll · Ctrl+S: search · Esc/q/F1: close) ",
+            skip + 1,
+            (skip + visible.len()).min(total),
+            total
+        )
+    } else {
+        " Help (Ctrl+S: search · Esc/q/F1: close) ".to_string()
+    };
+    let p = Paragraph::new(visible).block(
         Block::default()
-            .title(" Welcome / Help (Press any key to start) ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow)),
     );
     f.render_widget(p, area);
+    if total > view_h.max(1) && area.height >= 5 {
+        let mut vstate = ScrollbarState::new(max_scroll.max(1)).position(skip);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(Style::default().fg(Color::Yellow)),
+            area,
+            &mut vstate,
+        );
+    }
 }
 
-/// Plain-text help lines for incremental search (same content as `render_help`).
+/// Plain-text help lines for incremental search (exact line indices matching `render_help`).
 pub fn help_search_lines() -> Vec<String> {
-    vec![
-        " Frog DB Client — Welcome & Usability Overview ".to_string(),
-        " ─ Window & Panels ─ ".to_string(),
-        "  Ctrl+T              Open new session tab".to_string(),
-        "  Ctrl+W              Close current tab".to_string(),
-        "  Ctrl+Right / Alt+Right  Next session tab".to_string(),
-        "  Ctrl+Left / Alt+Left   Previous session tab".to_string(),
-        "  Alt+1..9            Switch to session tab 1-9".to_string(),
-        "  Tab                 Switch active window (Editor / Results / Sidebar)".to_string(),
-        "  Ctrl+Z / F11        Zoom / Maximize active panel".to_string(),
-        "  Ctrl+S              Incremental search (Emacs I-search)".to_string(),
-        " ─ SQL Execution ─ ".to_string(),
-        "  Ctrl+Enter / Alt+Enter / Ctrl+J / F8 / F9  Execute statement under cursor".to_string(),
-        "  F5 / Ctrl+R         Execute all statements as script".to_string(),
-        " ─ Results ─ ".to_string(),
-        "  Ctrl+F              Fetch next page of results".to_string(),
-        "  Ctrl+D              Cycle result format: Table → Markdown → ASCII".to_string(),
-        " ─ SQL Editor ─ ".to_string(),
-        "  F3                  Open SQL history".to_string(),
-        "  F4                  Toad-style Object Describe / DDL".to_string(),
-        " ─ Connection & Views ─ ".to_string(),
-        "  Ctrl+O              Open connection dialog".to_string(),
-        "  F1                  This help screen".to_string(),
-        "  F2                  Session browser".to_string(),
-        "  F4                  Object DDL viewer".to_string(),
-        "  F6                  Performance & DBA dashboard".to_string(),
-        "  F12                 DB explorer".to_string(),
-        "  Esc / q             Return to query editor".to_string(),
-        "  Ctrl+Q              Quit application".to_string(),
-    ]
+    help_lines()
+        .into_iter()
+        .map(|l| {
+            l.spans
+                .into_iter()
+                .map(|s| s.content.into_owned())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
@@ -2647,28 +2697,46 @@ pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
     f.render_widget(p, area);
 }
 
-pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
-    let backend = match session.conn_dialog.db_type {
+fn format_dialog_endpoint(dlg: &ConnectionDialog) -> String {
+    match dlg.db_type {
         DbType::Oracle => format!(
             "Backend: oracle  {}:{}/{}",
-            session.conn_dialog.host,
-            session.conn_dialog.port,
-            if session.conn_dialog.service.is_empty() {
-                session.conn_dialog.database.clone()
+            dlg.host,
+            dlg.port,
+            if dlg.service.is_empty() {
+                dlg.database.as_str()
             } else {
-                session.conn_dialog.service.clone()
+                dlg.service.as_str()
             },
         ),
         DbType::Postgres => format!(
             "Backend: postgres  {}:{}/{}",
-            session.conn_dialog.host,
-            session.conn_dialog.port,
-            if session.conn_dialog.database.is_empty() {
-                session.conn_dialog.service.clone()
+            dlg.host,
+            dlg.port,
+            if dlg.database.is_empty() {
+                dlg.service.as_str()
             } else {
-                session.conn_dialog.database.clone()
+                dlg.database.as_str()
             },
         ),
+    }
+}
+
+pub fn render_right_panel(session: &Session, f: &mut Frame, area: Rect) {
+    let backend = if session.is_connected {
+        if let Some(ref p) = session.connected_params {
+            format!(
+                "Backend: {}  {}:{}/{}",
+                p.db_type,
+                p.host,
+                p.port,
+                p.db_name()
+            )
+        } else {
+            format_dialog_endpoint(&session.conn_dialog)
+        }
+    } else {
+        format_dialog_endpoint(&session.conn_dialog)
     };
     let text = vec![
         Line::from(Span::styled(

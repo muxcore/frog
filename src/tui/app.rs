@@ -465,6 +465,10 @@ pub struct App {
     perf_sql_area: Rect,
     /// Last rendered F4 DDL area.
     ddl_area: Rect,
+    /// Last rendered F1/startup Help area.
+    help_area: Rect,
+    /// Last rendered F3 History area.
+    history_area: Rect,
     command_mode: bool,
     command_input: String,
     command_error: Option<String>,
@@ -646,6 +650,8 @@ impl App {
             perf_results_area: Rect::default(),
             perf_sql_area: Rect::default(),
             ddl_area: Rect::default(),
+            help_area: Rect::default(),
+            history_area: Rect::default(),
             command_mode: false,
             command_input: String::new(),
             command_error: None,
@@ -1232,6 +1238,8 @@ impl App {
             perf_col_scroll: s.perf_col_scroll,
             perf_sql_scroll: s.perf_sql_scroll,
             history_cursor: s.history_cursor,
+            history_scroll: s.history_scroll,
+            help_scroll: s.help_scroll,
         }
     }
 
@@ -1258,6 +1266,8 @@ impl App {
         s.perf_col_scroll = origin.perf_col_scroll;
         s.perf_sql_scroll = origin.perf_sql_scroll;
         s.history_cursor = origin.history_cursor;
+        s.history_scroll = origin.history_scroll;
+        s.help_scroll = origin.help_scroll;
     }
 
     /// Start Emacs-style incremental search in the current view.
@@ -1392,18 +1402,36 @@ impl App {
                 _ => Vec::new(),
             },
             SearchTarget::Sidebar => {
-                let labels = vec![
-                    format!("{:?}", session.conn_dialog.db_type),
-                    session.conn_dialog.host.clone(),
-                    session.conn_dialog.service.clone(),
-                    session.conn_dialog.database.clone(),
-                    session.conn_dialog.user.clone(),
-                    if session.is_connected {
-                        "Connected".to_string()
+                let labels = if session.is_connected {
+                    if let Some(ref p) = session.connected_params {
+                        vec![
+                            format!("{:?}", p.db_type),
+                            p.host.clone(),
+                            p.service.clone(),
+                            p.database.clone(),
+                            p.user.clone(),
+                            "Connected".to_string(),
+                        ]
                     } else {
-                        "Disconnected".to_string()
-                    },
-                ];
+                        vec![
+                            format!("{:?}", session.conn_dialog.db_type),
+                            session.conn_dialog.host.clone(),
+                            session.conn_dialog.service.clone(),
+                            session.conn_dialog.database.clone(),
+                            session.conn_dialog.user.clone(),
+                            "Connected".to_string(),
+                        ]
+                    }
+                } else {
+                    vec![
+                        format!("{:?}", session.conn_dialog.db_type),
+                        session.conn_dialog.host.clone(),
+                        session.conn_dialog.service.clone(),
+                        session.conn_dialog.database.clone(),
+                        session.conn_dialog.user.clone(),
+                        "Disconnected".to_string(),
+                    ]
+                };
                 find_list_matches(&labels, query)
             }
             SearchTarget::ExplorerTree => {
@@ -1568,6 +1596,7 @@ impl App {
         if let Some(st) = self.search.as_mut() {
             st.current = idx.min(st.matches.len().saturating_sub(1));
         }
+        let help_max = self.help_max_scroll();
         let session = self.session_manager.active_session_mut();
         match (target, m) {
             (SearchTarget::Editor, SearchMatch::Editor { row, col, .. }) => {
@@ -1654,7 +1683,10 @@ impl App {
             (SearchTarget::History, SearchMatch::ListRow { row }) => {
                 session.history_cursor = row;
             }
-            // Sidebar / Help / fallback: count only, nothing to move.
+            (SearchTarget::Help, SearchMatch::ListRow { row }) => {
+                session.help_scroll = row.min(help_max);
+            }
+            // Sidebar / fallback: count only, nothing to move.
             _ => {}
         }
     }
@@ -2043,6 +2075,10 @@ impl App {
             .get(row)
             .map(|q| q.title.to_string())
             .unwrap_or_default(),
+            SearchTarget::Help => crate::tui::widgets::help_search_lines()
+                .get(row)
+                .cloned()
+                .unwrap_or_default(),
             _ => format!("row {}", row + 1),
         }
     }
@@ -2079,6 +2115,21 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.show_startup_help {
+            let max = self.help_max_scroll();
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = scroll_by(s.help_scroll, 3, max);
+                }
+                MouseEventKind::ScrollUp => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = s.help_scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return;
+        }
         // A click exits incremental search (keeping the match) so the
         // click can relocate focus/cursor normally.
         if self.search.is_some()
@@ -2095,6 +2146,18 @@ impl App {
             && matches!(mouse.kind, MouseEventKind::Down(_))
         {
             self.session_manager.close_completion();
+        }
+        // F1 Help viewer owns its area fullscreen.
+        if self.session_manager.active_session().mode == SessionMode::Help
+            && self.handle_help_mouse(mouse)
+        {
+            return;
+        }
+        // F3 History viewer owns its area fullscreen.
+        if self.session_manager.active_session().mode == SessionMode::History
+            && self.handle_history_mouse(mouse)
+        {
+            return;
         }
         // F4 Object DDL viewer owns its area fullscreen.
         if self.session_manager.active_session().mode == SessionMode::ObjectDdl
@@ -2466,8 +2529,40 @@ impl App {
         }
 
         if self.show_startup_help {
-            self.show_startup_help = false;
-            return;
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            {
+                self.should_quit = true;
+                return;
+            }
+            let max = self.help_max_scroll();
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Up) => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = s.help_scroll.saturating_sub(1);
+                    return;
+                }
+                (KeyModifiers::NONE, KeyCode::Down) => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = scroll_by(s.help_scroll, 1, max);
+                    return;
+                }
+                (KeyModifiers::NONE, KeyCode::PageUp) => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = s.help_scroll.saturating_sub(15);
+                    return;
+                }
+                (KeyModifiers::NONE, KeyCode::PageDown) => {
+                    let s = self.session_manager.active_session_mut();
+                    s.help_scroll = scroll_by(s.help_scroll, 15, max);
+                    return;
+                }
+                _ => {
+                    self.show_startup_help = false;
+                    self.session_manager.active_session_mut().help_scroll = 0;
+                    return;
+                }
+            }
         }
 
         // Mouse toggle works in every mode (command bar, dialogs, browsers):
@@ -2525,6 +2620,10 @@ impl App {
 
         if mode == SessionMode::ConnectionPickerDialog {
             self.handle_conn_dialog(key);
+            return;
+        }
+        if mode == SessionMode::Help {
+            self.handle_help(key);
             return;
         }
         if mode == SessionMode::History {
@@ -2631,6 +2730,7 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('o')) => {
                 self.session_manager.close_completion();
                 let session = self.session_manager.active_session_mut();
+                session.conn_dialog_backup = Some(session.conn_dialog.clone());
                 let field = session.conn_dialog.active_field;
                 session.conn_dialog.select_field(field);
                 session.mode = SessionMode::ConnectionPickerDialog;
@@ -2745,7 +2845,9 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::F(1)) => {
                 self.session_manager.close_completion();
-                self.session_manager.active_session_mut().mode = SessionMode::Help;
+                let s = self.session_manager.active_session_mut();
+                s.help_scroll = 0;
+                s.mode = SessionMode::Help;
                 return;
             }
             (KeyModifiers::NONE, KeyCode::F(2)) => {
@@ -3028,9 +3130,11 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
+                self.command_error = None;
                 self.command_input.pop();
             }
             KeyCode::Char(c) if !c.is_control() => {
+                self.command_error = None;
                 self.command_input.push(c);
             }
             _ => {}
@@ -3066,24 +3170,101 @@ impl App {
                 session.set_status("Results cleared");
             }
             _ => {
-                self.command_error = Some(format!("Unknown command: '{}'", cmd));
+                // Keep the command bar open with the typed text so the inline
+                // error in `render_command_bar` is actually visible and editable.
+                self.command_mode = true;
+                self.command_input = cmd.to_string();
+                self.command_error = Some(format!(
+                    "Unknown command: '{}' (try @file.sql or clear)",
+                    cmd
+                ));
             }
         }
     }
 
-    fn handle_history(&mut self, key: event::KeyEvent) {
+    fn help_max_scroll(&self) -> usize {
+        let total = crate::tui::widgets::help_line_count();
+        let view_h = self.help_area.height.saturating_sub(2).max(1) as usize;
+        total.saturating_sub(view_h)
+    }
+
+    fn handle_help(&mut self, key: event::KeyEvent) {
+        let max = self.help_max_scroll();
         let session = self.session_manager.active_session_mut();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 session.mode = SessionMode::Query;
+                self.active_window = ActiveWindow::Editor;
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                session.help_scroll = session.help_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                session.help_scroll = scroll_by(session.help_scroll, 1, max);
+            }
+            KeyCode::PageUp => {
+                session.help_scroll = session.help_scroll.saturating_sub(15);
+            }
+            KeyCode::PageDown => {
+                session.help_scroll = scroll_by(session.help_scroll, 15, max);
+            }
+            KeyCode::Home => {
+                session.help_scroll = 0;
+            }
+            KeyCode::End => {
+                session.help_scroll = max;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_help_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let max = self.help_max_scroll();
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                let s = self.session_manager.active_session_mut();
+                s.help_scroll = scroll_by(s.help_scroll, 3, max);
+            }
+            MouseEventKind::ScrollUp => {
+                let s = self.session_manager.active_session_mut();
+                s.help_scroll = s.help_scroll.saturating_sub(3);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_history(&mut self, key: event::KeyEvent) {
+        let vis_h = self.history_area.height.saturating_sub(2) as usize;
+        let session = self.session_manager.active_session_mut();
+        let len = session.query_history.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                session.mode = SessionMode::Query;
+                self.active_window = ActiveWindow::Editor;
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                 session.history_cursor = session.history_cursor.saturating_sub(1);
             }
-            KeyCode::Down => {
-                if session.history_cursor + 1 < session.query_history.len() {
-                    session.history_cursor += 1;
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                if len > 0 {
+                    session.history_cursor = (session.history_cursor + 1).min(len - 1);
                 }
+            }
+            KeyCode::PageUp => {
+                session.history_cursor = session.history_cursor.saturating_sub(15);
+            }
+            KeyCode::PageDown => {
+                if len > 0 {
+                    session.history_cursor = (session.history_cursor + 15).min(len - 1);
+                }
+            }
+            KeyCode::Home => {
+                session.history_cursor = 0;
+            }
+            KeyCode::End => {
+                session.history_cursor = len.saturating_sub(1);
             }
             KeyCode::Enter => {
                 if let Some(stmt) = session.query_history.get(session.history_cursor).cloned() {
@@ -3091,9 +3272,44 @@ impl App {
                     session.mode = SessionMode::Query;
                     self.active_window = ActiveWindow::Editor;
                 }
+                return;
             }
             _ => {}
         }
+        session.ensure_history_cursor_visible(vis_h);
+    }
+
+    fn handle_history_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let vis_h = self.history_area.height.saturating_sub(2) as usize;
+        let session = self.session_manager.active_session_mut();
+        let len = session.query_history.len();
+        if len == 0 {
+            return true;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                session.history_cursor = (session.history_cursor + 3).min(len - 1);
+                session.ensure_history_cursor_visible(vis_h);
+            }
+            MouseEventKind::ScrollUp => {
+                session.history_cursor = session.history_cursor.saturating_sub(3);
+                session.ensure_history_cursor_visible(vis_h);
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if self
+                    .history_area
+                    .contains(Position::new(mouse.column, mouse.row)) =>
+            {
+                let rel = mouse.row.saturating_sub(self.history_area.y + 1) as usize;
+                if rel < vis_h {
+                    let idx = (session.history_scroll + rel).min(len - 1);
+                    session.history_cursor = idx;
+                    session.ensure_history_cursor_visible(vis_h);
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     /// TOAD-style session browser: pick a session row, preview its current
@@ -4460,12 +4676,27 @@ impl App {
 
     fn handle_conn_dialog(&mut self, key: event::KeyEvent) {
         let session = self.session_manager.active_session_mut();
-        let dlg = &mut session.conn_dialog;
 
         match key.code {
             KeyCode::Esc => {
+                if let Some(prev) = session.conn_dialog_backup.take() {
+                    session.conn_dialog = prev;
+                }
                 session.mode = SessionMode::Query;
+                return;
             }
+            KeyCode::Enter => {
+                let params = session.conn_dialog.to_params();
+                session.conn_dialog_backup = None;
+                session.mode = SessionMode::Query;
+                self.session_manager.connect_active(&params);
+                return;
+            }
+            _ => {}
+        }
+
+        let dlg = &mut session.conn_dialog;
+        match key.code {
             KeyCode::Tab | KeyCode::Down => {
                 let next = (dlg.active_field + 1) % ConnectionDialog::FIELD_COUNT;
                 dlg.select_field(next);
@@ -4480,17 +4711,10 @@ impl App {
             }
             KeyCode::Left => dlg.cursor_left(),
             KeyCode::Right => dlg.cursor_right(),
-            KeyCode::Home | KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
-                dlg.cursor_home()
-            }
-            KeyCode::End | KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
-                dlg.cursor_end()
-            }
-            KeyCode::Enter => {
-                let params = dlg.to_params();
-                session.mode = SessionMode::Query;
-                self.session_manager.connect_active(&params);
-            }
+            KeyCode::Home => dlg.cursor_home(),
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => dlg.cursor_home(),
+            KeyCode::End => dlg.cursor_end(),
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => dlg.cursor_end(),
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => dlg.clear_field(),
             KeyCode::Backspace => dlg.backspace(),
             KeyCode::Delete => dlg.delete(),
@@ -4514,7 +4738,9 @@ impl App {
         let size = f.area();
 
         if self.show_startup_help {
-            render_help(f, size);
+            self.help_area = size;
+            let scroll = self.session_manager.active_session().help_scroll;
+            render_help(scroll, true, f, size);
             return;
         }
 
@@ -4599,9 +4825,16 @@ impl App {
                 self.perf_sql_area = sa;
             }
             SessionMode::Help => {
-                render_help(f, chunks[1]);
+                self.help_area = chunks[1];
+                let scroll = self.session_manager.active_session().help_scroll;
+                render_help(scroll, false, f, chunks[1]);
             }
             SessionMode::History => {
+                self.history_area = chunks[1];
+                let vis_h = chunks[1].height.saturating_sub(2) as usize;
+                self.session_manager
+                    .active_session_mut()
+                    .ensure_history_cursor_visible(vis_h);
                 let session = self.session_manager.active_session();
                 render_history(session, f, chunks[1]);
             }
@@ -5641,5 +5874,103 @@ mod tests {
         app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('g')));
         assert!(app.search.is_none());
         assert_eq!(app.session_manager.active_session().editor.cursor_row, 1);
+    }
+
+    #[test]
+    fn command_bar_keeps_bar_open_on_unknown_command_error() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char(':')));
+        assert!(app.command_mode);
+        for c in "bogus".chars() {
+            app.handle_key(key(KeyModifiers::NONE, KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Enter));
+        // Command bar stays open so `command_error` is rendered inline.
+        assert!(app.command_mode);
+        assert_eq!(app.command_input, "bogus");
+        assert!(app
+            .command_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unknown command"));
+
+        // Editing clears the stale error, and Esc closes cleanly.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Backspace));
+        assert!(app.command_error.is_none());
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Esc));
+        assert!(!app.command_mode);
+    }
+
+    #[test]
+    fn conn_dialog_esc_restores_previous_settings_and_home_end_work() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        {
+            let sess = app.session_manager.active_session_mut();
+            sess.conn_dialog.db_type = crate::db::DbType::Oracle;
+            sess.conn_dialog.host = "ora.prod".into();
+            sess.conn_dialog.port = "1521".into();
+        }
+        // Open Ctrl+O, toggle Type to Postgres and edit Host, then press Esc.
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('o')));
+        assert_eq!(
+            app.session_manager.active_session().mode,
+            SessionMode::ConnectionPickerDialog
+        );
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char(' '))); // toggle -> Postgres
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Tab)); // Host field
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Home));
+        assert_eq!(app.session_manager.active_session().conn_dialog.cursor, 0);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::End));
+        assert_eq!(app.session_manager.active_session().conn_dialog.cursor, 8);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Char('X')));
+        assert_eq!(
+            app.session_manager.active_session().conn_dialog.db_type,
+            crate::db::DbType::Postgres
+        );
+        // Esc cancels all edits.
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Esc));
+        let dlg = &app.session_manager.active_session().conn_dialog;
+        assert_eq!(dlg.db_type, crate::db::DbType::Oracle);
+        assert_eq!(dlg.host, "ora.prod");
+        assert_eq!(dlg.port, "1521");
+    }
+
+    #[test]
+    fn help_and_history_views_scroll_full_content() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.help_area = Rect::new(0, 0, 80, 20);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::F(1)));
+        assert_eq!(app.session_manager.active_session().mode, SessionMode::Help);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::End));
+        let max_help = app.help_max_scroll();
+        assert!(max_help > 20);
+        assert_eq!(app.session_manager.active_session().help_scroll, max_help);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Home));
+        assert_eq!(app.session_manager.active_session().help_scroll, 0);
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::Esc));
+
+        // Populate 60 history entries and verify F3 renders the newest entry at bottom.
+        {
+            let sess = app.session_manager.active_session_mut();
+            sess.query_history = (1..=60).map(|i| format!("SELECT {}", i)).collect();
+            sess.history_cursor = 59;
+            sess.history_scroll = 0;
+        }
+        app.handle_key(key(KeyModifiers::NONE, KeyCode::F(3)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 15)).unwrap();
+        terminal.draw(|f| app.ui(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(rendered.contains("SELECT 60"), "rendered:\n{rendered}");
     }
 }

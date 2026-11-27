@@ -69,6 +69,8 @@ pub struct SearchOrigin {
     pub perf_col_scroll: usize,
     pub perf_sql_scroll: usize,
     pub history_cursor: usize,
+    pub history_scroll: usize,
+    pub help_scroll: usize,
 }
 
 #[derive(Debug, Clone)]

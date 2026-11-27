@@ -6,12 +6,117 @@ use super::ddl::{
     format_rich_create_table, DdlTarget, DescribedObject, RichColumn, TableConstraintDdl,
 };
 use super::perf::PerfSnapshot;
+use crate::db::sql_scan::{self, TokenKind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct PgConnection {
     client: Mutex<postgres::Client>,
     cancel_token: postgres::CancelToken,
     null_display: String,
+    autocommit: bool,
+    in_tx: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgTxAction {
+    ExplicitBegin,
+    ExplicitCommit { chain: bool },
+    ExplicitRollback { chain: bool },
+    ImplicitBegin,
+    None,
+}
+
+/// Classify how a statement interacts with Postgres transactions when
+/// `autocommit` is disabled (`-n` / `FROG_NO_AUTOCOMMIT`).
+///
+/// Mutating statements (`INSERT`/`UPDATE`/`DELETE`/`MERGE`/DDL/`SELECT ... FOR UPDATE`)
+/// get an implicit `BEGIN`, while plain `SELECT`s stay outside a transaction so
+/// interactive browsing never holds an `idle in transaction` snapshot, and
+/// commands forbidden inside transactions (`VACUUM`, `CREATE INDEX CONCURRENTLY`,
+/// `CREATE/DROP DATABASE`) execute cleanly on their own.
+pub(crate) fn classify_pg_tx_action(sql: &str) -> PgTxAction {
+    let all = sql_scan::tokenize(sql);
+    let toks: Vec<_> = all
+        .iter()
+        .filter(|t| t.kind != TokenKind::Comment)
+        .collect();
+    if toks.is_empty() {
+        return PgTxAction::None;
+    }
+    let word = |idx: usize| -> Option<String> {
+        toks.get(idx)
+            .filter(|t| {
+                !t.is_quoted() && matches!(t.kind, TokenKind::Keyword | TokenKind::Ident { .. })
+            })
+            .map(|t| t.text.to_ascii_uppercase())
+    };
+    let has_kw = |kw: &str| -> bool {
+        toks.iter().any(|t| {
+            !t.is_quoted()
+                && matches!(t.kind, TokenKind::Keyword | TokenKind::Ident { .. })
+                && t.text.eq_ignore_ascii_case(kw)
+        })
+    };
+
+    let Some(w0) = word(0) else {
+        return PgTxAction::None;
+    };
+    match w0.as_str() {
+        "BEGIN" => PgTxAction::ExplicitBegin,
+        "START" if word(1).as_deref() == Some("TRANSACTION") => PgTxAction::ExplicitBegin,
+        "COMMIT" | "END" => PgTxAction::ExplicitCommit {
+            chain: has_kw("CHAIN") && !has_kw("NO"),
+        },
+        "ROLLBACK" | "ABORT" => {
+            if word(1).as_deref() == Some("TO") {
+                PgTxAction::None
+            } else {
+                PgTxAction::ExplicitRollback {
+                    chain: has_kw("CHAIN") && !has_kw("NO"),
+                }
+            }
+        }
+        "SAVEPOINT" | "RELEASE" => PgTxAction::None,
+        "VACUUM" | "CLUSTER" | "DISCARD" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "VALUES" | "SET"
+        | "RESET" | "LISTEN" | "UNLISTEN" | "NOTIFY" | "ANALYZE" | "CHECKPOINT" | "LOAD" => {
+            PgTxAction::None
+        }
+        "REINDEX" if has_kw("CONCURRENTLY") => PgTxAction::None,
+        "CREATE" | "DROP" | "ALTER" => {
+            if has_kw("CONCURRENTLY")
+                || matches!(
+                    word(1).as_deref(),
+                    Some("DATABASE" | "TABLESPACE" | "SYSTEM" | "SUBSCRIPTION")
+                )
+            {
+                PgTxAction::None
+            } else {
+                PgTxAction::ImplicitBegin
+            }
+        }
+        "SELECT" | "TABLE" | "WITH" => {
+            let locks_rows = (0..toks.len().saturating_sub(1)).any(|i| {
+                word(i).as_deref() == Some("FOR")
+                    && matches!(
+                        word(i + 1).as_deref(),
+                        Some("UPDATE" | "SHARE" | "NO" | "KEY")
+                    )
+            });
+            if has_kw("INSERT")
+                || has_kw("UPDATE")
+                || has_kw("DELETE")
+                || has_kw("MERGE")
+                || has_kw("INTO")
+                || locks_rows
+            {
+                PgTxAction::ImplicitBegin
+            } else {
+                PgTxAction::None
+            }
+        }
+        _ => PgTxAction::ImplicitBegin,
+    }
 }
 
 fn clean_error_msg(msg: &str) -> String {
@@ -81,13 +186,41 @@ impl PgConnection {
     /// intervals, uuids, json, arrays, …) display correctly with no per-type
     /// binary decoding. Returns the display data plus the completion count.
     fn do_simple(&self, sql: &str, max_rows: usize) -> anyhow::Result<(QueryData, u64)> {
+        self.do_simple_tx(sql, max_rows, false)
+    }
+
+    fn do_simple_tx(
+        &self,
+        sql: &str,
+        max_rows: usize,
+        implicit_begin: bool,
+    ) -> anyhow::Result<(QueryData, u64)> {
         let mut client = self
             .client
             .lock()
             .map_err(|e| anyhow::anyhow!("connection locked: {}", e))?;
-        let messages = client
-            .simple_query(sql)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let started_here = if implicit_begin && !self.in_tx.load(Ordering::SeqCst) {
+            client
+                .batch_execute("BEGIN")
+                .map_err(|e| anyhow::anyhow!("{}", verbose_pg_error(&e)))?;
+            self.in_tx.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        };
+        let messages = match client.simple_query(sql) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                // If this statement itself triggered the implicit BEGIN and
+                // failed immediately, roll back the empty aborted transaction so
+                // the session does not stay stuck in SQLSTATE 25P02.
+                if started_here {
+                    let _ = client.batch_execute("ROLLBACK");
+                    self.in_tx.store(false, Ordering::SeqCst);
+                }
+                return Err(anyhow::anyhow!("{}", verbose_pg_error(&e)));
+            }
+        };
         let mut columns: Vec<String> = Vec::new();
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut byte_count = 0usize;
@@ -130,12 +263,25 @@ impl PgConnection {
         let total = rows.len();
         Ok(((columns, rows, truncated, total, byte_count), completed))
     }
+
     pub fn connect(
         host: &str,
         port: u16,
         database: &str,
         user: &str,
         password: &str,
+        null_display: &str,
+    ) -> Result<Arc<Self>, anyhow::Error> {
+        Self::connect_with_autocommit(host, port, database, user, password, true, null_display)
+    }
+
+    pub fn connect_with_autocommit(
+        host: &str,
+        port: u16,
+        database: &str,
+        user: &str,
+        password: &str,
+        autocommit: bool,
         null_display: &str,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let mut cfg = postgres::Config::new();
@@ -160,6 +306,8 @@ impl PgConnection {
             client: Mutex::new(client),
             cancel_token,
             null_display: null_display.to_string(),
+            autocommit,
+            in_tx: AtomicBool::new(false),
         }))
     }
 
@@ -169,24 +317,39 @@ impl PgConnection {
         let cmd = super::connection::clean_command_word(sql);
 
         if cmd.eq_ignore_ascii_case("commit") || cmd.eq_ignore_ascii_case("end") {
-            return match self.do_simple("COMMIT", 1) {
+            let res = self.do_simple("COMMIT", 1);
+            self.in_tx.store(false, Ordering::SeqCst);
+            return match res {
                 Ok(_) => QueryRow::notice("COMMIT", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
             };
         }
         if cmd.eq_ignore_ascii_case("rollback") || cmd.eq_ignore_ascii_case("abort") {
-            return match self.do_simple("ROLLBACK", 1) {
+            let res = self.do_simple("ROLLBACK", 1);
+            self.in_tx.store(false, Ordering::SeqCst);
+            return match res {
                 Ok(_) => QueryRow::notice("ROLLBACK", elapsed(), max_rows),
                 Err(e) => QueryRow::error(clean_error_msg(&e.to_string()), elapsed(), 0, max_rows),
             };
         }
 
+        let tx_action = classify_pg_tx_action(sql);
+        let implicit_begin = !self.autocommit && tx_action == PgTxAction::ImplicitBegin;
+
         // One path for everything: statements returning rows (SELECT, but
         // also INSERT/UPDATE/DELETE ... RETURNING, EXPLAIN, SHOW, …) display
         // as tables; the rest become "rows affected" notices from the
         // completion tag.
-        match self.do_simple(sql, max_rows) {
+        match self.do_simple_tx(sql, max_rows, implicit_begin) {
             Ok((data, completed)) => {
+                match tx_action {
+                    PgTxAction::ExplicitBegin => self.in_tx.store(true, Ordering::SeqCst),
+                    PgTxAction::ExplicitCommit { chain }
+                    | PgTxAction::ExplicitRollback { chain } => {
+                        self.in_tx.store(chain, Ordering::SeqCst);
+                    }
+                    PgTxAction::ImplicitBegin | PgTxAction::None => {}
+                }
                 if data.0.is_empty() {
                     let mut row = QueryRow::notice(
                         &format!("Statement executed. Rows affected: {}", completed),
@@ -1659,5 +1822,56 @@ mod tests {
         assert!(other.contains("some weird thing"));
         let nouser = friendly_connect_error("h", 1, "d", "", "boom");
         assert!(nouser.contains("<no user>"));
+    }
+
+    #[test]
+    fn pg_tx_classification_for_no_autocommit() {
+        assert_eq!(classify_pg_tx_action("SELECT * FROM emp"), PgTxAction::None);
+        assert_eq!(
+            classify_pg_tx_action("SELECT * FROM emp FOR UPDATE"),
+            PgTxAction::ImplicitBegin
+        );
+        assert_eq!(
+            classify_pg_tx_action("WITH d AS (DELETE FROM emp RETURNING *) SELECT * FROM d"),
+            PgTxAction::ImplicitBegin
+        );
+        assert_eq!(
+            classify_pg_tx_action("UPDATE emp SET sal = sal + 100"),
+            PgTxAction::ImplicitBegin
+        );
+        assert_eq!(
+            classify_pg_tx_action("CREATE TABLE t (id int)"),
+            PgTxAction::ImplicitBegin
+        );
+        assert_eq!(
+            classify_pg_tx_action("CREATE INDEX CONCURRENTLY idx_t ON t (id)"),
+            PgTxAction::None
+        );
+        assert_eq!(classify_pg_tx_action("VACUUM ANALYZE t"), PgTxAction::None);
+        assert_eq!(
+            classify_pg_tx_action("CREATE DATABASE other"),
+            PgTxAction::None
+        );
+        assert_eq!(classify_pg_tx_action("BEGIN"), PgTxAction::ExplicitBegin);
+        assert_eq!(
+            classify_pg_tx_action("START TRANSACTION"),
+            PgTxAction::ExplicitBegin
+        );
+        assert_eq!(
+            classify_pg_tx_action("COMMIT WORK"),
+            PgTxAction::ExplicitCommit { chain: false }
+        );
+        assert_eq!(
+            classify_pg_tx_action("COMMIT AND CHAIN"),
+            PgTxAction::ExplicitCommit { chain: true }
+        );
+        assert_eq!(
+            classify_pg_tx_action("ROLLBACK TO sp1"),
+            PgTxAction::None
+        );
+        assert_eq!(
+            classify_pg_tx_action("ROLLBACK"),
+            PgTxAction::ExplicitRollback { chain: false }
+        );
     }
 }
