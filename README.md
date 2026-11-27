@@ -171,7 +171,7 @@ PGPASSWORD=tiger
 # (DATABASE_URL works as a fallback for ORACLE_CONNECT)
 ```
 
-Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` accepted as an alias), `FROG_CLIPBOARD_CMD`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
+Supported keys: `ORACLE_CONNECT`, `DATABASE_URL`, `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`, `FROG_DB_TYPE`, `FROG_CONNECTION`, `FROG_CONFIG`, `FROG_MAX_ROWS`, `FROG_NO_AUTOCOMMIT`, `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` accepted as an alias), `FROG_CLIPBOARD_CMD`, `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`, `FROG_SSLMODE`. Comments (`#`) and quoted values are handled; keys already present in the environment keep their environment value and are reported as ignored. If `--db-type` is omitted, frog selects postgres when only `PG*` variables are set, otherwise oracle.
 
 > **Dialog shows defaults?** The `.env` is read from the directory frog is *started* in — a `.env` elsewhere is ignored. If nothing configures the connection, frog prints `no connection settings from CLI flags, env vars or ./.env …` at startup and `frog --help` lists every variable it understands.
 
@@ -202,19 +202,22 @@ Inside the dialog: the first row selects the backend (`Type: oracle/postgres` �
 | `Alt+Y` | Copy SQL statement at cursor explicitly (never includes line numbers) |
 | `Ctrl+V` / `Shift+Ins` | Paste (OS clipboard, else frog's copy buffer — works over SSH) |
 | `Ctrl+D` | Cycle result format: Table → Markdown → ASCII |
-| `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password) |
+| `Ctrl+O` | Connection dialog (backend / host / port / service-or-db / user / password). `Alt+N`/`Alt+P` cycles `config.yml` `connections[]`; `-c/--connection NAME` (`FROG_CONNECTION`) picks one at startup |
 | `Ctrl+Space` | SQL completion popup (`Ctrl+.` also accepted). `↑`/`↓`/`PgUp`/`PgDn` select, `Enter`/`Tab` insert, `Esc` close |
+| `Alt+Z` / `Alt+Shift+Z` | Undo / redo SQL edit |
+| `Ctrl+Left/Right` / `Alt+B`/`Alt+F` | Jump one word in the SQL editor (long lines scroll sideways; `Shift+wheel` scrolls them too) |
 | `Ctrl+S` | Emacs-style incremental search in the current view (Editor, Results, Explorer, F2 List/SQL/Plan, DDL, Perf, History, Help). Type to find, `Ctrl+S` next, `Ctrl+R` prev, `Enter`/`Esc` done, `Ctrl+G` cancel. Smart-case (lowercase = case-insensitive) |
 | `Ctrl+F` | Fetch next page of results (next page also auto-loads when scrolling near the end) |
-| `Ctrl+T` / `Ctrl+W` | New / close session tab |
-| `Ctrl+Left/Right` | Switch session tabs |
+| `Ctrl+T` / `Ctrl+W` | New / close session tab (`Ctrl+W` asks again when the editor has SQL) |
+| `Alt+Left/Right` | Switch session tabs (`Ctrl+Left/Right` jumps by word in the editor; `Alt+B`/`Alt+F` also jump words) |
+| `Alt+1..9` | Switch to session tab n (or click the tab bar) |
 | `F1` / `F2` / `F3` | Help / Session browser (pick row, `Enter`/`e` = explain plan, `r` = reload SQL, `R`/`F5` = refresh list, `a` = ACTIVE-only filter, `s`/`S` = cycle sort column / direction, `Tab` = focus List/SQL/Plan, `Ctrl+Z`/`F11` = zoom pane, `Alt+↑`/`↓` = grow/shrink focused pane, `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL/plan) / History |
 | `F4` | Toad-style Object Describe / DDL under cursor (table, index, view, mview, sequence, package, routine, trigger, synonym; also works in `F12`). `Ctrl+C`/`Ctrl+Y`/`c` copies DDL, `Enter`/`i` loads into SQL editor, `n` opens in a new tab, `r` reloads, `F4`/`Esc` closes |
 | `F6` | Performance & DBA dashboard — live `btop`-style telemetry cards (active/total sessions + sparkline, blocking locks, CPU/wait stacked bar, SGA+PGA / cache hit) + 10 curated DBA queries with inline `████░░` bars. `1`–`0`/`↑`/`↓` pick query, `Enter`/`r` run, `R`/`F5` refresh all, `a` toggle 5s live auto-refresh, `v` show/hide SQL, `s`/`i` load SQL into editor, `n` open SQL in new tab, `Tab` cycle pane, `Ctrl+Z`/`F11` zoom |
 | `F12` | DB explorer — schema → type folders (tables, views, matviews, indexes, …), paged preview in result style (`Ctrl+D` switches format; scroll to the end or `Ctrl+F` for the next 20 rows), DDL/source (`F4` opens full DDL script). `Tab` switches focus Objects/Detail, `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` resizes the split, `↑`/`↓`/`PgUp`/`PgDn` and `←`/`→` scroll the detail pane, wheel scrolls (Shift+wheel or horizontal wheel scrolls columns) |
 | `Ctrl+Q` | Quit |
 | `Ctrl+M` / `Alt+M` | Toggle mouse capture (tmux-style copy/paste mode) |
-| Mouse | Hover tabs to focus, drag splitter to resize, click to focus panel, scroll results |
+| Mouse | Click tab bar to switch tabs, drag splitter to resize (sidebar border, editor/results), click to focus panel, scroll editor/results, `Shift+wheel` scrolls sideways |
 
 ### Copy & paste (tmux style)
 
@@ -265,10 +268,14 @@ ui:
   null_display: "(NULL)"
 ```
 
+Pick a saved connection with `-c/--connection NAME` (`FROG_CONNECTION` env / `.env`
+alias); inside `Ctrl+O`, `Alt+N`/`Alt+P` cycles the list. CLI/env/`.env` values
+still win per setting over the saved entry.
+
 ## Backend notes
 
 - **Pagination**: Oracle pages with `ROWNUM`/`OFFSET … FETCH`, Postgres with `LIMIT`/`OFFSET`. The result viewer and F12 previews append the next page automatically when you scroll near the end; `Ctrl+F` fetches one explicitly (20 rows per preview page, `page_size` for query results).
-- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically, `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `a` toggles the ACTIVE-only filter, `s` cycles the sort column, `S` toggles sort direction. `Tab` focuses List/SQL/Plan; `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` grows/shrinks it, and `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL or plan pane (`←`/`→` scroll the plan sideways; the wheel scrolls the pane under the mouse). Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
+- **Session browser (F2)**: Oracle reads `v$session` (SQL text via `v$sql`), Postgres reads `pg_stat_activity`. `↑`/`↓` picks a row, its SQL loads automatically in the background (arrow keys never block, even over slow links), `Enter` runs `EXPLAIN` (`EXPLAIN PLAN` + `DBMS_XPLAN` on Oracle, plain `EXPLAIN` — never `ANALYZE` — on Postgres), `r` reloads the SQL, `R`/`F5` refreshes the list, `a` toggles the ACTIVE-only filter, `s` cycles the sort column, `S` toggles sort direction. `Tab` focuses List/SQL/Plan; `Ctrl+Z`/`F11` zooms the focused pane, `Alt+↑`/`↓` grows/shrinks it, and `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End` scroll the focused SQL or plan pane (`←`/`→` scroll the plan sideways; the wheel scrolls the pane under the mouse). Auto-refresh interval (default 60s) via `--session-refresh-secs` / `FROG_SESSION_REFRESH_SECS` (`FROG_SESSION_REFRESH` alias) / `.env` (same) / `config.yml` `defaults.session_refresh_secs` (`session_refresh` alias); `0` disables auto-refresh.
 - **F2 privileges (Oracle)**: the browser needs dictionary access. If F2 shows an error about it, ask your DBA for e.g.:
   ```sql
   GRANT SELECT_CATALOG_ROLE TO scott;
@@ -276,7 +283,9 @@ ui:
   GRANT SELECT ON V_$SESSION TO scott;
   GRANT SELECT ON V_$SQL TO scott;
   ```
+- **DB explorer (F12)**: schema / group / object / column levels load in the background too — expanding nodes never freezes the UI; a `⟳` in the tree title marks in-flight loads.
 - **Postgres statements**: besides `SELECT`/`WITH`, `VALUES`/`TABLE`/`SHOW` and `… RETURNING` run as queries and return rows.
+- **Postgres TLS**: plaintext by default; set `PGSSLMODE=require` (`FROG_SSLMODE` alias, also via `.env`) for managed/`hostssl` servers (`prefer`/`allow` try TLS then fall back; `verify-ca`/`verify-full` verify the chain with system certs). The TLS hint in connect errors points at `PGSSLMODE`.
 
 
 

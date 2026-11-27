@@ -16,12 +16,15 @@ const ENV_KEYS: &[&str] = &[
     "FROG_SESSION_REFRESH_SECS",
     "FROG_SESSION_REFRESH",
     "FROG_CLIPBOARD_CMD",
+    "FROG_CONNECTION",
     "FROG_DB_TYPE",
     "PGHOST",
     "PGPORT",
     "PGDATABASE",
     "PGUSER",
     "PGPASSWORD",
+    "PGSSLMODE",
+    "FROG_SSLMODE",
     "DATABASE_URL",
 ];
 

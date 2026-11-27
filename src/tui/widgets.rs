@@ -471,7 +471,44 @@ pub fn render_editor(
 
     let inner_area = if borderless { area } else { block.inner(area) };
     let vis_height = inner_area.height as usize;
+    let vis_width = inner_area.width as usize;
     let scroll = session.editor.scroll_offset;
+    let hscroll = session.editor.col_offset;
+
+    /// Byte range of `line` covering display cells `[skip, skip+width)`.
+    /// The end includes the char overlapping the right edge (the terminal
+    /// truncates it); an empty window yields an empty range.
+    fn visible_byte_range(line: &str, skip: usize, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, 0);
+        }
+        let mut cells = 0usize;
+        let mut start = line.len();
+        let mut end = line.len();
+        for (bi, ch) in line.char_indices() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if start == line.len() && cells + w > skip {
+                start = bi;
+            }
+            cells += w;
+            if cells >= skip + width {
+                end = bi + ch.len_utf8();
+                break;
+            }
+        }
+        if start > line.len() {
+            start = line.len();
+        }
+        // No visible chars (line scrolled fully past): empty range at end.
+        if start == line.len() {
+            return (line.len(), line.len());
+        }
+        // If we never reached the right edge, the window runs to EOL.
+        if end < start {
+            end = start;
+        }
+        (start.min(line.len()), end.min(line.len()))
+    }
 
     let stmt_rows = session.editor.current_statement_rows();
 
@@ -509,8 +546,13 @@ pub fn render_editor(
 
             let text_style = Style::default().bg(bg).fg(Color::White);
 
+            // Horizontal window into this line.
+            let (vb, ve) = visible_byte_range(line_str, hscroll, vis_width.max(1));
+            let vis_slice = &line_str[vb..ve];
+
             // Mouse drag-selection window for this line, if any. Endpoints
             // are floored to char boundaries so wide chars highlight cleanly.
+            // Intersected with the horizontal viewport.
             let sel_span: Option<(usize, usize)> = session.editor_selection.and_then(|sel| {
                 let ((sr, sc), (er, ec)) = sel.ordered();
                 if sr == er && sc == ec {
@@ -528,10 +570,13 @@ pub fn render_editor(
                 while b > 0 && !line_str.is_char_boundary(b) {
                     b -= 1;
                 }
+                // Intersect with viewport.
+                a = a.max(vb).min(ve);
+                b = b.max(vb).min(ve);
                 if a >= b {
                     None
                 } else {
-                    Some((a, b))
+                    Some((a - vb, b - vb))
                 }
             });
 
@@ -543,7 +588,7 @@ pub fn render_editor(
                         .fg(Color::Black)
                         .add_modifier(Modifier::BOLD);
                     let mut spans = vec![Span::styled(line_num_str, num_style)];
-                    for (bi, ch) in line_str.char_indices() {
+                    for (bi, ch) in vis_slice.char_indices() {
                         let be = bi + ch.len_utf8();
                         let st = if bi >= a && be <= b { sel_style } else { text_style };
                         spans.push(Span::styled(ch.to_string(), st));
@@ -552,13 +597,13 @@ pub fn render_editor(
                 } else if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
                     let (match_style, current_style) = search_styles();
                     let cur = if hl.has_current && idx == hl.current_row {
-                        Some(hl.current_col)
+                        hl.current_col.checked_sub(vb)
                     } else {
                         None
                     };
                     let mut spans = vec![Span::styled(line_num_str, num_style)];
                     spans.extend(highlight_spans(
-                        line_str,
+                        vis_slice,
                         &hl.query,
                         hl.case_sensitive,
                         cur,
@@ -570,7 +615,7 @@ pub fn render_editor(
                 } else {
                     Line::from(vec![
                         Span::styled(line_num_str, num_style),
-                        Span::styled(line_str.to_string(), text_style),
+                        Span::styled(vis_slice.to_string(), text_style),
                     ])
                 }
             } else {
@@ -581,12 +626,12 @@ pub fn render_editor(
                 if let Some(hl) = search.filter(|h| !h.query.is_empty()) {
                     let (match_style, current_style) = search_styles();
                     let cur = if hl.has_current && idx == hl.current_row {
-                        Some(hl.current_col)
+                        hl.current_col.checked_sub(vb)
                     } else {
                         None
                     };
                     Line::from(highlight_spans(
-                        line_str,
+                        vis_slice,
                         &hl.query,
                         hl.case_sensitive,
                         cur,
@@ -595,17 +640,37 @@ pub fn render_editor(
                         current_style,
                     ))
                 } else {
-                    Line::from(vec![Span::styled(line_str.to_string(), text_style)])
+                    Line::from(vec![Span::styled(vis_slice.to_string(), text_style)])
                 }
             }
         })
         .collect();
+
+    // Horizontal scrollbar when any line is wider than the viewport.
+    let max_w = session
+        .editor
+        .lines
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(0);
+    let show_hbar = max_w > vis_width.max(1);
 
     if borderless {
         f.render_widget(Paragraph::new(lines), area);
     } else {
         let paragraph = Paragraph::new(lines).block(block);
         f.render_widget(paragraph, area);
+    }
+    if show_hbar && area.height >= 3 {
+        let max_h = max_w.saturating_sub(vis_width.max(1)).max(1);
+        let mut hstate = ScrollbarState::new(max_h).position(hscroll.min(max_h));
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .thumb_style(Style::default().fg(Color::DarkGray)),
+            area,
+            &mut hstate,
+        );
     }
 }
 
@@ -630,7 +695,8 @@ pub fn render_completion_popup(
     while col > 0 && !line.is_char_boundary(col) {
         col -= 1;
     }
-    let x_off = UnicodeWidthStr::width(&line[..col]) as u16;
+    let cursor_cells = UnicodeWidthStr::width(&line[..col]) as u16;
+    let x_off = cursor_cells.saturating_sub(ed.col_offset as u16);
 
     let max_rows = 10usize;
     let rows = popup.items.len().min(max_rows);
@@ -2073,6 +2139,7 @@ fn render_f2_list(
     );
     let total_cached = sess.session_list_cache.len();
     let session_view_error = sess.session_view_error.clone();
+    let list_loading = sess.session_list_loading;
     let (title_base, headers): (&str, Vec<&str>) = match db_type {
         DbType::Oracle => (
             "v$session",
@@ -2124,8 +2191,13 @@ fn render_f2_list(
         " · Tab focus · Alt+↑/↓ grow/shrink focused · Ctrl+Z zoom"
     };
     let title = format!(
-        " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {}{} ",
-        title_base, filter_label, sort_label, refresh_label, zoom_hint
+        " {} — ↑/↓ pick · Enter/e explain · r sql · R/F5 refresh · a: {} · s: {} · Esc back · {}{}{} ",
+        title_base,
+        filter_label,
+        sort_label,
+        refresh_label,
+        if list_loading { " · ⟳" } else { "" },
+        zoom_hint
     );
     let header_cells: Vec<String> = headers
         .iter()
@@ -2156,6 +2228,11 @@ fn render_f2_list(
                 ),
                 err.clone(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            None if list_loading => (
+                format!(" Sessions — {} ", refresh_label),
+                "⟳ Loading sessions…".to_string(),
+                Style::default().fg(Color::Yellow),
             ),
             None if active_only && total_cached > 0 => (
                 format!(" Sessions — {} ", refresh_label),
@@ -2321,10 +2398,14 @@ fn render_f2_sql(session: &Session, focused: bool, maximized: bool, f: &mut Fram
             }
         }
     };
-    let sql_text = session
-        .plan_sql_text
-        .as_deref()
-        .unwrap_or("↑/↓ selects a session · its SQL loads here · Enter runs EXPLAIN");
+    let sql_text = if session.sql_loading {
+        "⟳ Loading SQL…"
+    } else {
+        session
+            .plan_sql_text
+            .as_deref()
+            .unwrap_or("↑/↓ selects a session · its SQL loads here · Enter runs EXPLAIN")
+    };
     let inner_w = area.width.saturating_sub(2) as usize;
     let view_h = area.height.saturating_sub(2) as usize;
     let lines = wrap_sql_lines(sql_text, inner_w);
@@ -2369,7 +2450,14 @@ fn render_plan_pane(session: &Session, focused: bool, maximized: bool, f: &mut F
             .border_style(Style::default().fg(f2_border(focused)))
     };
     let Some(qr) = session.plan_result.as_ref() else {
-        let p = Paragraph::new("Press Enter to EXPLAIN the SQL above.")
+        let msg = if session.plan_loading {
+            "⟳ Running EXPLAIN…"
+        } else if session.sql_loading {
+            "⟳ Loading SQL first…"
+        } else {
+            "Press Enter to EXPLAIN the SQL above."
+        };
+        let p = Paragraph::new(msg)
             .style(Style::default().fg(Color::DarkGray))
             .block(block());
         f.render_widget(p, area);
@@ -2433,17 +2521,16 @@ fn help_lines() -> Vec<Line<'static>> {
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  Ctrl+T              Open new session tab"),
-        Line::from("  Ctrl+W              Close current tab"),
-        Line::from("  Ctrl+Right / Alt+Right  Next session tab"),
-        Line::from("  Ctrl+Left / Alt+Left   Previous session tab"),
+        Line::from("  Ctrl+W              Close current tab (press twice when editor has SQL)"),
         Line::from("  Alt+1..9            Switch to session tab 1-9"),
+        Line::from("  Alt+Left / Alt+Right  Previous / next session tab (Ctrl+Left/Right jumps by word in editor)"),
         Line::from("  Tab                 Switch active window (Editor / Results / Sidebar)"),
         Line::from("  Ctrl+Z / F11        Zoom / Maximize active panel"),
         Line::from("  Ctrl+B              Toggle connection/info sidebar"),
-        Line::from("  Alt+Up / Alt+Down   Grow / shrink SQL editor height"),
-        Line::from("  Mouse Hover         Auto-focus panels (Hyprland style)"),
-        Line::from("  Mouse Drag Border   Resize panels horizontally"),
-        Line::from("  Mouse Scroll        Scroll result table vertically"),
+        Line::from("  Alt+Up / Alt+Down   Grow / shrink SQL editor height (or drag the editor/results splitter)"),
+        Line::from("  Click tab bar       Switch session tab"),
+        Line::from("  Mouse Drag Border   Resize panels: sidebar border, editor/results splitter"),
+        Line::from("  Mouse Scroll        Scroll result table vertically (Shift+wheel: columns; wheel over editor scrolls it)"),
         Line::from("  Mouse drag editor   Select SQL text — release copies it to clipboard"),
         Line::from("  Middle-click        Paste selection at cursor (tmux style)"),
         Line::from("  Ctrl+V / Shift+Ins  Paste clipboard at cursor (OS clipboard, else frog's copy buffer — works over SSH)"),
@@ -2478,9 +2565,11 @@ fn help_lines() -> Vec<Line<'static>> {
             " ─ SQL Editor ─ ",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Arrow keys          Move cursor"),
+        Line::from("  Arrow keys          Move cursor (Shift+wheel scrolls long lines sideways)"),
         Line::from("  Home / End          Start / end of line"),
         Line::from("  Ctrl+A / Ctrl+E     Start / end of line"),
+        Line::from("  Ctrl+Left / Ctrl+Right  Jump one word left / right (Alt+B / Alt+F also work)"),
+        Line::from("  Alt+Z / Alt+Shift+Z  Undo / redo edit"),
         Line::from("  Ctrl+K              Kill (delete) to end of line"),
         Line::from("  Ctrl+U              Delete to start of line"),
         Line::from("  Delete / Backspace  Delete character"),
@@ -2493,6 +2582,8 @@ fn help_lines() -> Vec<Line<'static>> {
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  Ctrl+O              Open connection dialog (Type/Host/Port/Service|DB/User/Password)"),
+        Line::from("    in dialog: Tab/Up/Down fields · Alt+N/P cycle config.yml saved connections · -c/--connection NAME picks one"),
+        Line::from("    Postgres TLS: PGSSLMODE=require (FROG_SSLMODE alias; disable|prefer|allow|require|verify-ca|verify-full)"),
         Line::from("  F1                  This help screen"),
         Line::from("  F2                  Session browser — pick a session, Enter/e shows EXPLAIN plan"),
         Line::from("    in sessions: ↑/↓ pick · r reload SQL · R/F5 refresh · a ACTIVE-only filter · s cycle sort col · S direction"),
@@ -2666,7 +2757,7 @@ pub fn render_connection_dialog(session: &Session, f: &mut Frame, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!(
-            " Tab/Up/Down: field ({}/{}) | Left/Right: cursor | Ctrl+U: clear | Enter: connect | Esc: cancel ",
+            " Tab/Up/Down: field ({}/{}) | Left/Right: cursor | Ctrl+U: clear | Alt+N/P: saved conn | Enter: connect | Esc: cancel ",
             dlg.active_field + 1,
             ConnectionDialog::FIELD_COUNT
         ),
@@ -2895,21 +2986,26 @@ fn render_explorer_tree(
     } else {
         format!("  [Filter: {}]", sess.explorer_filter)
     };
+    let loading_note = if sess.explorer_struct_pending > 0 {
+        " · ⟳"
+    } else {
+        ""
+    };
     let title = if detail_hidden || maximized {
         if maximized {
             format!(
-                " Objects [MAX] — Ctrl+Z restore · Tab focus · ↑↓ move · →/Enter expand · / filter{} ",
-                filter_note
+                " Objects [MAX] — Ctrl+Z restore · Tab focus · ↑↓ move · →/Enter expand · / filter{}{} ",
+                filter_note, loading_note
             )
         } else {
             format!(
-                " DB Explorer — ↑↓ move · →/Enter expand · F4 DDL · s SELECT→editor · d reload · / filter · r refresh · Tab pane · Ctrl+Z zoom · Esc back{} ",
-                filter_note
+                " DB Explorer — ↑↓ move · →/Enter expand · F4 DDL · s SELECT→editor · d reload · / filter · r refresh · Tab pane · Ctrl+Z zoom · Esc back{}{} ",
+                filter_note, loading_note
             )
         }
     } else {
         format!(
-            " {}Objects ({} shown{}) · Tab pane · Ctrl+Z zoom{} ",
+            " {}Objects ({} shown{}) · Tab pane · Ctrl+Z zoom{}{} ",
             if focused { "▸ " } else { "" },
             rows.len(),
             if sess.explorer_filter.is_empty() {
@@ -2917,7 +3013,8 @@ fn render_explorer_tree(
             } else {
                 " · filtered".into()
             },
-            filter_note
+            filter_note,
+            loading_note
         )
     };
 

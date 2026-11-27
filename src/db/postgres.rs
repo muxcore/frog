@@ -16,6 +16,30 @@ pub struct PgConnection {
     null_display: String,
     autocommit: bool,
     in_tx: AtomicBool,
+    use_tls: bool,
+}
+
+/// Postgres SSL mode, mirroring libpq `sslmode` (`PGSSLMODE`).
+/// `FROG_SSLMODE` is accepted as an alias. Default `disable` preserves
+/// frog's historical plaintext behavior; `require`/`verify-ca`/`verify-full`
+/// connect over TLS, `prefer`/`allow` try TLS first and fall back to NoTls.
+pub(crate) fn pg_sslmode() -> String {
+    crate::cli::env_get_public("PGSSLMODE")
+        .or_else(|| crate::cli::env_get_public("FROG_SSLMODE"))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "disable".into())
+}
+
+fn sslmode_wants_tls(mode: &str) -> bool {
+    matches!(
+        mode,
+        "require" | "verify-ca" | "verify-full" | "prefer" | "allow"
+    )
+}
+
+fn sslmode_fallback_allowed(mode: &str) -> bool {
+    matches!(mode, "prefer" | "allow" | "prefer-verify")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,8 +192,9 @@ pub fn friendly_connect_error(
     {
         "Hostname does not resolve — check PGHOST."
     } else if lower.contains("ssl") {
-        "TLS problem — frog v1 connects without TLS (NoTls); the server must accept \
-         non-SSL connections (sslmode allow/disable equivalent)."
+        "TLS problem — check PGSSLMODE (disable/prefer/require/verify-ca/verify-full; \
+          FROG_SSLMODE is an alias). frog connects plaintext by default; managed \
+          Postgres with `hostssl` entries needs PGSSLMODE=require."
     } else {
         ""
     };
@@ -295,12 +320,42 @@ impl PgConnection {
             cfg.password(password);
         }
         cfg.connect_timeout(std::time::Duration::from_secs(10));
-        let client = cfg.connect(postgres::NoTls).map_err(|e| {
-            anyhow::anyhow!(
-                "{}",
-                friendly_connect_error(host, port, database, user, &e.to_string())
-            )
-        })?;
+        let mode = pg_sslmode();
+        let wants_tls = sslmode_wants_tls(&mode);
+        let (client, use_tls) = if !wants_tls {
+            let client = cfg.connect(postgres::NoTls).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    friendly_connect_error(host, port, database, user, &e.to_string())
+                )
+            })?;
+            (client, false)
+        } else {
+            let mk_tls = || {
+                let inner = native_tls::TlsConnector::new()
+                    .map_err(|e| anyhow::anyhow!("TLS connector setup failed: {}", e))?;
+                Ok::<_, anyhow::Error>(postgres_native_tls::MakeTlsConnector::new(inner))
+            };
+            match cfg.connect(mk_tls()?) {
+                Ok(client) => (client, true),
+                Err(e) if sslmode_fallback_allowed(&mode) => {
+                    let client = cfg.connect(postgres::NoTls).map_err(|e2| {
+                        anyhow::anyhow!(
+                            "{}\n(TLS attempt also failed: {})",
+                            friendly_connect_error(host, port, database, user, &e2.to_string()),
+                            e
+                        )
+                    })?;
+                    (client, false)
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        friendly_connect_error(host, port, database, user, &e.to_string())
+                    ));
+                }
+            }
+        };
         let cancel_token = client.cancel_token();
         Ok(Arc::new(Self {
             client: Mutex::new(client),
@@ -308,6 +363,7 @@ impl PgConnection {
             null_display: null_display.to_string(),
             autocommit,
             in_tx: AtomicBool::new(false),
+            use_tls,
         }))
     }
 
@@ -1651,9 +1707,18 @@ impl DbConnection for PgConnection {
         self.run_query_paged(sql, page_offset, page_size)
     }
     fn cancel_query(&self) -> anyhow::Result<()> {
-        self.cancel_token
-            .cancel_query(postgres::NoTls)
-            .map_err(|e| anyhow::anyhow!("{}", e))
+        if self.use_tls {
+            let inner = native_tls::TlsConnector::new()
+                .map_err(|e| anyhow::anyhow!("TLS connector setup failed: {}", e))?;
+            let connector = postgres_native_tls::MakeTlsConnector::new(inner);
+            self.cancel_token
+                .cancel_query(connector)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        } else {
+            self.cancel_token
+                .cancel_query(postgres::NoTls)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
     }
     fn close(&self) -> anyhow::Result<()> {
         // The TCP connection closes when the last Arc<PgConnection> is
@@ -1822,6 +1887,17 @@ mod tests {
         assert!(other.contains("some weird thing"));
         let nouser = friendly_connect_error("h", 1, "d", "", "boom");
         assert!(nouser.contains("<no user>"));
+    }
+
+    #[test]
+    fn pg_sslmode_classification() {
+        assert!(!sslmode_wants_tls("disable"));
+        assert!(sslmode_wants_tls("require"));
+        assert!(sslmode_wants_tls("verify-full"));
+        assert!(sslmode_wants_tls("prefer"));
+        assert!(sslmode_fallback_allowed("prefer"));
+        assert!(sslmode_fallback_allowed("allow"));
+        assert!(!sslmode_fallback_allowed("require"));
     }
 
     #[test]

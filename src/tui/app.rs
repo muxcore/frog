@@ -418,9 +418,15 @@ pub struct App {
     maximized_box: Option<MaximizedBox>,
     active_window: ActiveWindow,
     result_format: ResultFormat,
+    tabs_area: Rect,
     editor_area: Rect,
     results_area: Rect,
     sidebar_area: Rect,
+    /// True while the horizontal editor/results splitter is being dragged.
+    resizing_editor: bool,
+    /// Two-step tab close: first Ctrl+W arms `(tab_idx, time)`, second
+    /// within 5s actually closes. Prevents losing SQL on a stray keypress.
+    pending_close_tab: Option<(usize, Instant)>,
     explorer_area: Rect,
     explorer_detail_area: Rect,
     /// F12 DB explorer: which pane has focus (Tab toggles Tree/Detail).
@@ -625,9 +631,12 @@ impl App {
             maximized_box: None,
             active_window: ActiveWindow::Editor,
             result_format: ResultFormat::default(),
+            tabs_area: Rect::default(),
             editor_area: Rect::default(),
             results_area: Rect::default(),
             sidebar_area: Rect::default(),
+            resizing_editor: false,
+            pending_close_tab: None,
             explorer_area: Rect::default(),
             explorer_detail_area: Rect::default(),
             explorer_focus: ExplorerPane::Tree,
@@ -745,6 +754,8 @@ impl App {
             self.session_manager.poll_explorer();
             self.session_manager.poll_ddl();
             self.session_manager.poll_perf();
+            self.session_manager.poll_f2();
+            self.session_manager.poll_cat();
             self.session_manager.poll_conn_result();
             self.session_manager.poll_metadata();
             self.session_manager.check_connections();
@@ -2187,6 +2198,16 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                // Tab bar click: switch directly to the clicked session tab.
+                if self.tabs_area.contains(Position::new(mouse.column, mouse.row)) {
+                    let n = self.session_manager.sessions.len();
+                    if n > 0 && self.tabs_area.width > 0 {
+                        let rel = mouse.column.saturating_sub(self.tabs_area.x) as usize;
+                        let idx = (rel * n / self.tabs_area.width.max(1) as usize).min(n - 1);
+                        self.session_manager.switch_to(idx);
+                    }
+                    return;
+                }
                 let in_editor = self
                     .editor_area
                     .contains(Position::new(mouse.column, mouse.row));
@@ -2200,6 +2221,15 @@ impl App {
                 let splitter_x = self.sidebar_area.x;
                 if !self.hide_sidebar && (mouse.column).abs_diff(splitter_x) <= 1 && mouse.row > 2 {
                     self.is_resizing = true;
+                } else if self.maximized_box.is_none()
+                    && self.editor_area.height > 0
+                    && self.results_area.height > 0
+                    && mouse.column >= self.editor_area.x
+                    && mouse.column < self.editor_area.x + self.editor_area.width.max(1)
+                    && (mouse.row as i16 - self.editor_area.bottom() as i16).abs() <= 1
+                {
+                    // Horizontal splitter between the SQL editor and results.
+                    self.resizing_editor = true;
                 } else if in_editor {
                     self.click_editor(mouse.column, mouse.row);
                     // Start a drag-selection: a plain click just places the
@@ -2258,6 +2288,7 @@ impl App {
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 self.is_resizing = false;
+                self.resizing_editor = false;
                 self.session_resizing = None;
                 // End of an editor drag: copy a non-empty selection to the
                 // clipboard (OS + OSC52, so it works over SSH). A plain
@@ -2284,6 +2315,11 @@ impl App {
                     let col = mouse.column as usize;
                     let pct = ((width.saturating_sub(col)) * 100) / width;
                     self.sidebar_split_pct = (pct as u16).clamp(10, 70);
+                }
+                if self.resizing_editor {
+                    // Drag the editor/results boundary: grow/shrink editor.
+                    let new_h = mouse.row.saturating_sub(self.editor_area.y).saturating_add(1).clamp(4, 40);
+                    self.editor_height = new_h;
                 }
                 if let Some(which) = self.session_resizing {
                     self.drag_session_splitter(which, mouse.row);
@@ -2320,6 +2356,19 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if self
+                    .editor_area
+                    .contains(Position::new(mouse.column, mouse.row))
+                {
+                    // Mouse wheel over the SQL editor scrolls it vertically;
+                    // Shift+wheel scrolls long lines horizontally.
+                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        let s = self.session_manager.active_session_mut();
+                        s.editor.col_offset = s.editor.col_offset.saturating_add(4);
+                    } else {
+                        let s = self.session_manager.active_session_mut();
+                        s.editor.scroll_offset = s.editor.scroll_offset.saturating_add(3);
+                    }
+                } else if self
                     .results_area
                     .contains(Position::new(mouse.column, mouse.row))
                 {
@@ -2334,6 +2383,19 @@ impl App {
                         session.scroll_offset = session.scroll_offset.saturating_add(3);
                         self.session_manager.maybe_fetch_next_page();
                     }
+                }
+            }
+            MouseEventKind::ScrollUp
+                if self
+                    .editor_area
+                    .contains(Position::new(mouse.column, mouse.row)) =>
+            {
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let s = self.session_manager.active_session_mut();
+                    s.editor.col_offset = s.editor.col_offset.saturating_sub(4);
+                } else {
+                    let s = self.session_manager.active_session_mut();
+                    s.editor.scroll_offset = s.editor.scroll_offset.saturating_sub(3);
                 }
             }
             MouseEventKind::ScrollUp
@@ -2365,10 +2427,12 @@ impl App {
             (row.saturating_sub(self.editor_area.y + frame)) as usize + session.editor.scroll_offset;
         let target_col =
             (column.saturating_sub(self.editor_area.x + frame + gutter as u16)) as usize;
+        // The viewport starts `col_offset` display cells into the line.
+        let visual_col = target_col + session.editor.col_offset;
         let target_row = raw_row.min(session.editor.lines.len().saturating_sub(1));
         (
             target_row,
-            byte_offset_for_column(&session.editor.lines[target_row], target_col),
+            byte_offset_for_column(&session.editor.lines[target_row], visual_col),
         )
     }
 
@@ -2558,9 +2622,10 @@ impl App {
                     return;
                 }
                 _ => {
+                    // Dismiss the splash AND keep processing this same key so
+                    // the first Ctrl+O / F-key / shortcut isn't swallowed.
                     self.show_startup_help = false;
                     self.session_manager.active_session_mut().help_scroll = 0;
-                    return;
                 }
             }
         }
@@ -2619,6 +2684,18 @@ impl App {
         let mode = self.session_manager.active_session().mode.clone();
 
         if mode == SessionMode::ConnectionPickerDialog {
+            // Alt+N / Alt+P cycles config.yml `connections[]` entries.
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('p') | KeyCode::Char('P'))
+            {
+                let dir = match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('N') => 1isize,
+                    _ => -1isize,
+                };
+                if self.cycle_saved_connection(dir) {
+                    return;
+                }
+            }
             self.handle_conn_dialog(key);
             return;
         }
@@ -2712,14 +2789,59 @@ impl App {
             }
             (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
                 let idx = self.session_manager.active_idx;
+                if self.session_manager.sessions.len() <= 1 {
+                    return;
+                }
+                // Two-step close when the tab holds unsaved work: first
+                // press arms, second press within 5s closes.
+                let needs_confirm = {
+                    let s = self.session_manager.active_session();
+                    !s.editor.text().trim().is_empty()
+                        || s.pending_query
+                        || s.paging
+                        || s.connecting
+                };
+                if needs_confirm {
+                    let now = Instant::now();
+                    let armed = matches!(self.pending_close_tab, Some((i, t))
+                        if i == idx && now.duration_since(t).as_secs() < 5);
+                    if !armed {
+                        self.pending_close_tab = Some((idx, now));
+                        self.session_manager.active_session_mut().set_status(
+                            "Press Ctrl+W again to close this tab (editor has SQL)",
+                        );
+                        return;
+                    }
+                }
+                self.pending_close_tab = None;
                 self.session_manager.remove_session(idx);
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Right) | (KeyModifiers::ALT, KeyCode::Right) => {
+                // In the SQL editor Ctrl+Right jumps by word (readline-style);
+                // Alt+Right always switches tabs. Elsewhere both switch tabs.
+                let in_editor = self.session_manager.active_session().mode
+                    == SessionMode::Query
+                    && self.active_window == ActiveWindow::Editor;
+                if in_editor && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let s = self.session_manager.active_session_mut();
+                    s.editor_selection = None;
+                    s.editor.move_word_right();
+                    return;
+                }
                 self.session_manager.switch_next();
                 return;
             }
             (KeyModifiers::CONTROL, KeyCode::Left) | (KeyModifiers::ALT, KeyCode::Left) => {
+                let in_editor = self.session_manager.active_session().mode
+                    == SessionMode::Query
+                    && self.active_window == ActiveWindow::Editor;
+                if in_editor && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let s = self.session_manager.active_session_mut();
+                    s.editor_selection = None;
+                    s.editor.move_word_left();
+                    return;
+                }
                 self.session_manager.switch_prev();
                 return;
             }
@@ -2917,6 +3039,30 @@ impl App {
                     (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
                         session.editor_selection = None;
                         session.editor.cursor_col = 0;
+                    }
+                    // Undo (Alt+Z) / redo (Alt+Shift+Z).
+                    (KeyModifiers::ALT, KeyCode::Char('z')) => {
+                        session.editor_selection = None;
+                        if !session.editor.undo() {
+                            session.set_status("Nothing to undo");
+                        }
+                    }
+                    (KeyModifiers::ALT, KeyCode::Char('Z')) => {
+                        session.editor_selection = None;
+                        if !session.editor.redo() {
+                            session.set_status("Nothing to redo");
+                        }
+                    }
+                    // Emacs word jumps (don't clash with tab switching).
+                    (KeyModifiers::ALT, KeyCode::Char('b'))
+                    | (KeyModifiers::ALT, KeyCode::Char('B')) => {
+                        session.editor_selection = None;
+                        session.editor.move_word_left();
+                    }
+                    (KeyModifiers::ALT, KeyCode::Char('f'))
+                    | (KeyModifiers::ALT, KeyCode::Char('F')) => {
+                        session.editor_selection = None;
+                        session.editor.move_word_right();
                     }
                     (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
                         session.editor_selection = None;
@@ -3415,12 +3561,22 @@ impl App {
             KeyCode::Char('R') => {
                 // Manual list refresh (auto-refresh interval is configurable,
                 // see --session-refresh-secs / FROG_SESSION_REFRESH_SECS).
+                // Clear SQL so the fresh list auto-loads the cursor row's SQL
+                // when it arrives (see poll_f2).
+                {
+                    let s = self.session_manager.active_session_mut();
+                    s.plan_sql_text = None;
+                    s.plan_result = None;
+                }
                 self.session_manager.refresh_session_list();
-                self.session_manager.load_selected_sql();
             }
             KeyCode::F(5) => {
+                {
+                    let s = self.session_manager.active_session_mut();
+                    s.plan_sql_text = None;
+                    s.plan_result = None;
+                }
                 self.session_manager.refresh_session_list();
-                self.session_manager.load_selected_sql();
             }
             KeyCode::F(6) => {
                 self.perf_focus = PerfPane::Queries;
@@ -4674,9 +4830,67 @@ impl App {
         }
     }
 
+    /// Cycle config.yml `connections[]` into the open dialog (Alt+N / Alt+P).
+    /// Returns true when a saved entry was loaded.
+    fn cycle_saved_connection(&mut self, dir: isize) -> bool {
+        if self.config.saved_connections.is_empty() {
+            self.session_manager
+                .active_session_mut()
+                .set_status("No saved connections in config.yml connections[]");
+            return true;
+        }
+        let cur_idx = {
+            let dlg = &self.session_manager.active_session().conn_dialog;
+            self.config.saved_connections.iter().position(|e| {
+                let db = e.db_type.unwrap_or(crate::db::DbType::Oracle);
+                db == dlg.db_type && e.host == dlg.host && e.user == dlg.user
+            })
+        };
+        let n = self.config.saved_connections.len() as isize;
+        let next = match cur_idx {
+            Some(i) => (i as isize + dir).rem_euclid(n) as usize,
+            None => {
+                if dir > 0 {
+                    0
+                } else {
+                    n as usize - 1
+                }
+            }
+        };
+        let entry = self.config.saved_connections[next].clone();
+        {
+            let sess = self.session_manager.active_session_mut();
+            let dlg = &mut sess.conn_dialog;
+            dlg.set_db_type(entry.db_type.unwrap_or(crate::db::DbType::Oracle));
+            dlg.host = entry.host.clone();
+            dlg.port = entry.port.to_string();
+            dlg.service = entry.service.clone();
+            dlg.database = entry
+                .database
+                .clone()
+                .unwrap_or_else(|| entry.service.clone());
+            if dlg.db_type == crate::db::DbType::Oracle && dlg.service.is_empty() {
+                dlg.service = "ORCL".into();
+            }
+            if dlg.db_type == crate::db::DbType::Postgres && dlg.database.is_empty() {
+                dlg.database = "postgres".into();
+            }
+            dlg.user = entry.user.clone();
+            dlg.password = entry.password.clone().unwrap_or_default();
+            let field = dlg.active_field;
+            dlg.select_field(field);
+            sess.set_status(format!(
+                "Loaded saved connection '{}' ({}/{}) — Alt+N/P cycles",
+                entry.name,
+                next + 1,
+                n
+            ));
+        }
+        true
+    }
+
     fn handle_conn_dialog(&mut self, key: event::KeyEvent) {
         let session = self.session_manager.active_session_mut();
-
         match key.code {
             KeyCode::Esc => {
                 if let Some(prev) = session.conn_dialog_backup.take() {
@@ -4759,6 +4973,7 @@ impl App {
             f,
             chunks[0],
         );
+        self.tabs_area = chunks[0];
 
         let mode = self.session_manager.active_session().mode.clone();
 
@@ -4906,10 +5121,16 @@ impl App {
                 if self.editor_area.height > 0 {
                     let frame = if self.mouse_capture { 2 } else { 0 };
                     let vis_height = self.editor_area.height.saturating_sub(frame) as usize;
+                    let gutter = self.editor_gutter_width();
+                    let vis_width = self
+                        .editor_area
+                        .width
+                        .saturating_sub(frame * 2 + gutter)
+                        as usize;
                     self.session_manager
                         .active_session_mut()
                         .editor
-                        .ensure_cursor_visible(vis_height);
+                        .ensure_cursor_visible_sized(vis_height, vis_width.max(1));
                 }
 
                 let session = self.session_manager.active_session();
@@ -5022,10 +5243,8 @@ impl App {
                             col_bytes -= 1;
                         }
                         let visual_col = UnicodeWidthStr::width(&line[..col_bytes]);
-                        let cx = area.x
-                            + frame
-                            + gutter
-                            + visual_col.min(max_text_width) as u16;
+                        let rel = visual_col.saturating_sub(session.editor.col_offset);
+                        let cx = area.x + frame + gutter + rel.min(max_text_width) as u16;
                         let cy = area.y + frame + (row - scroll) as u16;
                         f.set_cursor_position(Position::new(cx, cy));
                     }
@@ -5935,6 +6154,91 @@ mod tests {
         assert_eq!(dlg.db_type, crate::db::DbType::Oracle);
         assert_eq!(dlg.host, "ora.prod");
         assert_eq!(dlg.port, "1521");
+    }
+
+    #[test]
+    fn conn_dialog_alt_n_cycles_saved_connections() {
+        use crate::cli::ConnectionEntry;
+
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.config.saved_connections = vec![
+            ConnectionEntry {
+                name: "prod".into(),
+                host: "db1".into(),
+                port: 1521,
+                service: "ORCL".into(),
+                user: "scott".into(),
+                password: None,
+                db_type: Some(crate::db::DbType::Oracle),
+                database: None,
+            },
+            ConnectionEntry {
+                name: "pg-dev".into(),
+                host: "db2".into(),
+                port: 5432,
+                service: String::new(),
+                user: "bob".into(),
+                password: None,
+                db_type: Some(crate::db::DbType::Postgres),
+                database: Some("myapp".into()),
+            },
+        ];
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('o')));
+        app.handle_key(key(KeyModifiers::ALT, KeyCode::Char('n')));
+        assert_eq!(
+            app.session_manager.active_session().conn_dialog.host,
+            "db1"
+        );
+        app.handle_key(key(KeyModifiers::ALT, KeyCode::Char('n')));
+        let dlg = &app.session_manager.active_session().conn_dialog;
+        assert_eq!(dlg.host, "db2");
+        assert_eq!(dlg.db_type, crate::db::DbType::Postgres);
+        app.handle_key(key(KeyModifiers::ALT, KeyCode::Char('p')));
+        assert_eq!(
+            app.session_manager.active_session().conn_dialog.host,
+            "db1"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_requires_confirm_when_editor_has_sql() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.session_manager.add_session();
+        assert_eq!(app.session_manager.sessions.len(), 2);
+        app.session_manager
+            .active_session_mut()
+            .editor
+            .set_text("select 1");
+        // First Ctrl+W arms, second closes.
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('w')));
+        assert_eq!(app.session_manager.sessions.len(), 2);
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Char('w')));
+        assert_eq!(app.session_manager.sessions.len(), 1);
+    }
+
+    #[test]
+    fn editor_ctrl_arrows_jump_words_not_tabs() {
+        let mut app = test_app();
+        app.show_startup_help = false;
+        app.session_manager
+            .active_session_mut()
+            .editor
+            .set_text("select empno from emp");
+        {
+            let s = app.session_manager.active_session_mut();
+            s.editor.cursor_row = 0;
+            s.editor.cursor_col = s.editor.lines[0].len();
+        }
+        let tabs_before = app.session_manager.active_idx;
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::Left));
+        assert_eq!(app.session_manager.active_idx, tabs_before);
+        assert_eq!(
+            &app.session_manager.active_session().editor.lines[0]
+                [app.session_manager.active_session().editor.cursor_col..],
+            "emp"
+        );
     }
 
     #[test]

@@ -289,6 +289,10 @@ pub struct SqlEditor {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub scroll_offset: usize,
+    /// Horizontal scroll in display cells (for lines wider than the pane).
+    pub col_offset: usize,
+    undo_stack: Vec<(Vec<String>, usize, usize)>,
+    redo_stack: Vec<(Vec<String>, usize, usize)>,
 }
 
 /// Rectangular cell selection in the result table. Row endpoints are
@@ -388,7 +392,163 @@ impl SqlEditor {
             cursor_row: 0,
             cursor_col: 0,
             scroll_offset: 0,
+            col_offset: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
+    }
+
+    fn push_undo(&mut self) {
+        // Coalesce keystroke undo: cap history at 100 snapshots.
+        let snap = (self.lines.clone(), self.cursor_row, self.cursor_col);
+        if self.undo_stack.last().is_some_and(|s| s == &snap) {
+            return;
+        }
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > 100 {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    /// Undo the last edit (Alt+Z). Returns true when something changed.
+    pub fn undo(&mut self) -> bool {
+        let Some((lines, row, col)) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.redo_stack
+            .push((self.lines.clone(), self.cursor_row, self.cursor_col));
+        self.lines = lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col;
+        self.snap_cursor_to_char_boundary();
+        true
+    }
+
+    /// Redo an undone edit (Alt+Shift+Z). Returns true when something changed.
+    pub fn redo(&mut self) -> bool {
+        let Some((lines, row, col)) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.undo_stack
+            .push((self.lines.clone(), self.cursor_row, self.cursor_col));
+        self.lines = lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col;
+        self.snap_cursor_to_char_boundary();
+        true
+    }
+
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '_' | '$' | '#')
+    }
+
+    /// Move one word left (Emacs Alt+B semantics, ASCII/Unicode aware).
+    pub fn move_word_left(&mut self) {
+        self.snap_cursor_to_char_boundary();
+        // Step 1: skip separators (and newlines) backward.
+        loop {
+            if self.cursor_col > 0 {
+                let line = &self.lines[self.cursor_row];
+                let ch = line[..self.cursor_col].chars().next_back().unwrap_or(' ');
+                if Self::is_word_char(ch) {
+                    break;
+                }
+                let prev = line[..self.cursor_col]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.cursor_col = prev;
+            } else if self.cursor_row > 0 {
+                self.cursor_row -= 1;
+                self.cursor_col = self.lines[self.cursor_row].len();
+                // A newline is a separator: keep skipping (may land in words above).
+                if self.cursor_col == 0 {
+                    continue;
+                }
+            } else {
+                return;
+            }
+        }
+        // Step 2: skip the word itself backward to its start.
+        loop {
+            if self.cursor_col == 0 {
+                return;
+            }
+            let line = &self.lines[self.cursor_row];
+            let ch = line[..self.cursor_col].chars().next_back().unwrap_or(' ');
+            if !Self::is_word_char(ch) {
+                return;
+            }
+            let prev = line[..self.cursor_col]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.cursor_col = prev;
+        }
+    }
+
+    /// Move one word right (Emacs Alt+F semantics).
+    pub fn move_word_right(&mut self) {
+        self.snap_cursor_to_char_boundary();
+        let mut jumped_line = false;
+        loop {
+            let len = self.lines[self.cursor_row].len();
+            if self.cursor_col < len {
+                let line = &self.lines[self.cursor_row];
+                let ch = line[self.cursor_col..].chars().next().unwrap_or(' ');
+                let next = self.cursor_col + ch.len_utf8();
+                self.cursor_col = next;
+                if Self::is_word_char(ch) {
+                    // Stop at end of word: next char is non-word or EOL.
+                    let after = line[self.cursor_col..].chars().next();
+                    if after.is_none_or(|a| !Self::is_word_char(a)) {
+                        break;
+                    }
+                }
+            } else if self.cursor_row + 1 < self.lines.len() {
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+                jumped_line = true;
+                break;
+            } else {
+                break;
+            }
+        }
+        if jumped_line {
+            return;
+        }
+        // Skip one run of separators so repeated presses advance word by word.
+        while let Some(ch) = self.lines[self.cursor_row][self.cursor_col..]
+            .chars()
+            .next()
+            .filter(|c| !Self::is_word_char(*c))
+        {
+            self.cursor_col += ch.len_utf8();
+            if let Some(next) = self.lines[self.cursor_row][self.cursor_col..].chars().next() {
+                if Self::is_word_char(next) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Display-cell width of `line[..col]` (byte col -> terminal cells).
+    pub fn visual_col(&self, row: usize, col: usize) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        let line = self.lines.get(row).map(String::as_str).unwrap_or("");
+        let col = col.min(line.len());
+        UnicodeWidthStr::width(&line[..col])
     }
 
     pub fn text(&self) -> String {
@@ -396,6 +556,7 @@ impl SqlEditor {
     }
 
     pub fn set_text(&mut self, text: &str) {
+        self.push_undo();
         self.lines = text.split('\n').map(|s| s.to_string()).collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
@@ -403,12 +564,14 @@ impl SqlEditor {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.scroll_offset = 0;
+        self.col_offset = 0;
     }
 
     pub fn insert_char(&mut self, c: char) {
         if c.is_control() {
             return;
         }
+        self.push_undo();
         self.snap_cursor_to_char_boundary();
         let line = &mut self.lines[self.cursor_row];
         line.insert(self.cursor_col, c);
@@ -416,6 +579,7 @@ impl SqlEditor {
     }
 
     pub fn backspace(&mut self) {
+        self.push_undo();
         self.snap_cursor_to_char_boundary();
         if self.cursor_col > 0 {
             let line = &mut self.lines[self.cursor_row];
@@ -441,6 +605,7 @@ impl SqlEditor {
     }
 
     pub fn delete(&mut self) {
+        self.push_undo();
         self.snap_cursor_to_char_boundary();
         if self.cursor_col < self.lines[self.cursor_row].len() {
             let line = &mut self.lines[self.cursor_row];
@@ -459,6 +624,7 @@ impl SqlEditor {
     }
 
     pub fn kill_line(&mut self) {
+        self.push_undo();
         self.snap_cursor_to_char_boundary();
         if self.cursor_col < self.lines[self.cursor_row].len() {
             self.lines[self.cursor_row].truncate(self.cursor_col);
@@ -480,6 +646,7 @@ impl SqlEditor {
     }
 
     pub fn newline(&mut self) {
+        self.push_undo();
         self.snap_cursor_to_char_boundary();
         let rest = self.lines[self.cursor_row].split_off(self.cursor_col);
         self.lines.insert(self.cursor_row + 1, rest);
@@ -492,6 +659,15 @@ impl SqlEditor {
     /// head/tail lines. Endpoints are clamped and floored to char
     /// boundaries, so a stale drag-selection can never panic.
     pub fn delete_range(&mut self, start: (usize, usize), end: (usize, usize)) {
+        // No-op for empty ranges: don't pollute the undo stack.
+        let (sr0, er0) = (start.0.min(end.0), start.0.max(end.0));
+        if sr0 == er0 {
+            let (a, b) = (start.1.min(end.1), start.1.max(end.1));
+            if a == b {
+                return;
+            }
+        }
+        self.push_undo();
         let snap = |line: &str, mut col: usize| -> usize {
             col = col.min(line.len());
             while col > 0 && !line.is_char_boundary(col) {
@@ -592,13 +768,29 @@ impl SqlEditor {
     }
 
     pub fn ensure_cursor_visible(&mut self, visible_height: usize) {
-        if visible_height == 0 {
+        self.ensure_cursor_visible_sized(visible_height, usize::MAX);
+    }
+
+    /// Keep the cursor inside a `visible_height` x `visible_width` viewport,
+    /// adjusting both the vertical scroll and the horizontal display-cell
+    /// offset (`col_offset`) so long lines scroll sideways instead of
+    /// clipping.
+    pub fn ensure_cursor_visible_sized(&mut self, visible_height: usize, visible_width: usize) {
+        if visible_height > 0 {
+            if self.cursor_row < self.scroll_offset {
+                self.scroll_offset = self.cursor_row;
+            } else if self.cursor_row >= self.scroll_offset + visible_height {
+                self.scroll_offset = self.cursor_row + 1 - visible_height;
+            }
+        }
+        if visible_width == usize::MAX || visible_width == 0 {
             return;
         }
-        if self.cursor_row < self.scroll_offset {
-            self.scroll_offset = self.cursor_row;
-        } else if self.cursor_row >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.cursor_row + 1 - visible_height;
+        let vcol = self.visual_col(self.cursor_row, self.cursor_col);
+        if vcol < self.col_offset {
+            self.col_offset = vcol;
+        } else if vcol >= self.col_offset + visible_width {
+            self.col_offset = vcol + 1 - visible_width;
         }
     }
 
@@ -787,10 +979,26 @@ pub struct Session {
     pub session_list_cache: Vec<DbSessionInfo>,
     /// When `session_list_cache` was last refreshed.
     pub session_list_since: Option<std::time::Instant>,
+    /// True while a background F2 list refresh is in flight.
+    pub session_list_loading: bool,
+    /// Monotonic request id for F2 list loads (stale responses dropped).
+    pub session_list_req: u64,
+    /// True while a background F2 current-SQL load is in flight.
+    pub sql_loading: bool,
+    /// Monotonic request id for F2 SQL loads (stale responses dropped).
+    pub sql_req: u64,
+    /// True while a background F2 EXPLAIN is running.
+    pub plan_loading: bool,
+    /// Monotonic request id for F2 EXPLAIN loads (stale responses dropped).
+    pub plan_req: u64,
     /// F12 DB explorer: cached schema tree (lazy-loaded per level).
     pub explorer_schemas: Vec<ExplorerSchema>,
     /// Whether the top-level schema list was loaded at least once.
     pub explorer_loaded: bool,
+    /// Number of in-flight background explorer structure loads
+    /// (schemas / groups / objects / columns). The tree renders a
+    /// loading indicator while nonzero.
+    pub explorer_struct_pending: usize,
     /// Cursor into the flattened visible explorer rows.
     pub explorer_cursor: usize,
     /// Vertical scroll offset of the explorer tree pane.
@@ -1512,8 +1720,15 @@ impl Session {
             session_view_error: None,
             session_list_cache: Vec::new(),
             session_list_since: None,
+            session_list_loading: false,
+            session_list_req: 0,
+            sql_loading: false,
+            sql_req: 0,
+            plan_loading: false,
+            plan_req: 0,
             explorer_schemas: Vec::new(),
             explorer_loaded: false,
+            explorer_struct_pending: 0,
             explorer_cursor: 0,
             explorer_scroll: 0,
             explorer_detail_scroll: 0,
@@ -1546,6 +1761,59 @@ impl Session {
             perf_latest_seq: Arc::new(AtomicU64::new(0)),
         }
     }
+}
+
+/// Background F2 session-list refresh result.
+#[derive(Debug)]
+pub struct F2ListMsg {
+    pub sid: usize,
+    pub req: u64,
+    pub result: Result<Vec<DbSessionInfo>, String>,
+}
+
+/// Background F2 current-SQL load result.
+#[derive(Debug)]
+pub struct F2SqlMsg {
+    pub sid: usize,
+    pub req: u64,
+    pub label: String,
+    pub result: Result<String, String>,
+}
+
+/// Background F2 EXPLAIN result.
+#[derive(Debug)]
+pub struct F2PlanMsg {
+    pub sid: usize,
+    pub req: u64,
+    pub result: QueryRow,
+}
+
+/// Background F12 explorer structure result (schemas / groups / objects /
+/// columns). Applied by name so concurrent expansions can't clobber each other.
+#[derive(Debug)]
+pub enum CatMsg {
+    Schemas {
+        sid: usize,
+        result: Result<Vec<String>, String>,
+    },
+    Groups {
+        sid: usize,
+        schema: String,
+        result: Result<Vec<(String, u64)>, String>,
+    },
+    Objects {
+        sid: usize,
+        schema: String,
+        group: String,
+        result: Result<Vec<(String, String)>, String>,
+    },
+    Columns {
+        sid: usize,
+        schema: String,
+        name: String,
+        kind: String,
+        result: Result<Vec<ColumnInfo>, String>,
+    },
 }
 
 /// Background F4 Object Describe / DDL result.
@@ -1593,6 +1861,14 @@ pub struct SessionManager {
     ddl_tx: Sender<DdlMsg>,
     perf_rx: Receiver<PerfMsg>,
     perf_tx: Sender<PerfMsg>,
+    f2list_rx: Receiver<F2ListMsg>,
+    f2list_tx: Sender<F2ListMsg>,
+    f2sql_rx: Receiver<F2SqlMsg>,
+    f2sql_tx: Sender<F2SqlMsg>,
+    f2plan_rx: Receiver<F2PlanMsg>,
+    f2plan_tx: Sender<F2PlanMsg>,
+    cat_rx: Receiver<CatMsg>,
+    cat_tx: Sender<CatMsg>,
     conn_map: Arc<Mutex<HashMap<usize, Arc<dyn DbConnection>>>>,
     /// Maximum number of query-history entries kept per session.
     pub max_history: usize,
@@ -1678,6 +1954,10 @@ impl SessionManager {
         let (mtx, mrx) = mpsc::channel();
         let (dtx, drx) = mpsc::channel();
         let (ptx, prx) = mpsc::channel();
+        let (f2ltx, f2lrx) = mpsc::channel();
+        let (f2stx, f2srx) = mpsc::channel();
+        let (f2ptx, f2prx) = mpsc::channel();
+        let (cattx, catrx) = mpsc::channel();
         let sessions = vec![Session::new(1)];
         Self {
             sessions,
@@ -1695,6 +1975,14 @@ impl SessionManager {
             ddl_tx: dtx,
             perf_rx: prx,
             perf_tx: ptx,
+            f2list_rx: f2lrx,
+            f2list_tx: f2ltx,
+            f2sql_rx: f2srx,
+            f2sql_tx: f2stx,
+            f2plan_rx: f2prx,
+            f2plan_tx: f2ptx,
+            cat_rx: catrx,
+            cat_tx: cattx,
             conn_map: Arc::new(Mutex::new(HashMap::new())),
             max_history: 1000,
             max_results_per_session: 200,
@@ -2758,9 +3046,10 @@ impl SessionManager {
         }
     }
 
-    /// Run a short catalog/session operation on the active session's connection,
-    /// serialized on `exec_lock`. Fails fast without blocking the UI thread if
-    /// a user query or page fetch is currently running on the connection.
+    /// Run a short catalog/session operation on the active session's connection.
+    /// Background workers use `active_connection()` + `exec_lock` directly so
+    /// the UI thread never blocks; this helper is kept for parity in tests.
+    #[allow(dead_code)]
     fn with_active_conn_sync<T>(
         &self,
         op: impl FnOnce(&dyn DbConnection) -> Result<T, String>,
@@ -2782,9 +3071,9 @@ impl SessionManager {
         op(conn.as_ref())
     }
 
-    /// Query the backend for its session list. Failures (notably missing
-    /// `V$SESSION` privileges on Oracle) are returned as a displayable
-    /// message instead of being swallowed.
+    /// Query the backend for its session list (background; use
+    /// `request_session_list` — this sync variant is kept for tests).
+    #[allow(dead_code)]
     pub fn get_session_info(&self) -> Result<Vec<DbSessionInfo>, String> {
         self.with_active_conn_sync(|c| {
             c.query_sessions().map_err(|e| {
@@ -2983,31 +3272,49 @@ impl SessionManager {
         self.load_selected_sql();
     }
 
-    /// Refresh the F2 list, recording any failure on the active session so
-    /// the browser can show it (e.g. missing dictionary privileges).
-    /// Updates the cache + timestamp and clamps the cursor into range.
+    /// Request an F2 list refresh in the background (never blocks the UI).
+    /// Returns the currently cached visible list; the fresh list arrives via
+    /// `poll_f2()` and auto-loads the cursor row's SQL. Duplicate requests
+    /// while one is in flight are coalesced.
     pub fn refresh_session_list(&mut self) -> Vec<DbSessionInfo> {
+        self.request_session_list();
+        self.visible_session_list()
+    }
+
+    fn request_session_list(&mut self) {
         let idx = self.active_idx;
-        match self.get_session_info() {
-            Ok(list) => {
-                {
-                    let sess = &mut self.sessions[idx];
-                    sess.session_view_error = None;
-                    sess.session_list_cache = list;
-                    sess.session_list_since = Some(std::time::Instant::now());
-                }
-                self.clamp_session_cursor(idx);
-                self.visible_session_list()
-            }
-            Err(msg) => {
-                let sess = &mut self.sessions[idx];
-                sess.session_view_error = Some(msg);
-                sess.session_list_cache.clear();
-                sess.session_list_since = Some(std::time::Instant::now());
-                sess.session_view_cursor = 0;
-                vec![]
-            }
+        let sess_id = self.sessions[idx].id;
+        if self.sessions[idx].session_list_loading {
+            return;
         }
+        let Some(conn) = self.active_connection() else {
+            let sess = &mut self.sessions[idx];
+            sess.session_view_error = Some("Not connected. Use Ctrl+O to connect.".into());
+            sess.session_list_cache.clear();
+            sess.session_list_since = Some(std::time::Instant::now());
+            sess.session_view_cursor = 0;
+            return;
+        };
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+        let req = self.sessions[idx].session_list_req.wrapping_add(1);
+        self.sessions[idx].session_list_req = req;
+        self.sessions[idx].session_list_loading = true;
+        let tx = self.f2list_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let res = conn.query_sessions().map_err(|e| {
+                if conn.db_type() == DbType::Oracle {
+                    OracleConnection::friendly_session_error(&e.to_string())
+                } else {
+                    e.to_string()
+                }
+            });
+            let _ = tx.send(F2ListMsg {
+                sid: sess_id,
+                req,
+                result: res,
+            });
+        });
     }
 
     /// Cached F2 list (no DB hit). Renderers and cursor movement must use
@@ -3049,30 +3356,37 @@ impl SessionManager {
         }
     }
 
-    /// TTL-guarded F2 list: returns the cache when fresh, otherwise refreshes.
-    /// Use this for cursor moves / SQL loads; renderers must use
+    /// TTL-guarded F2 list: returns the cache immediately, kicking off a
+    /// background refresh when stale. Renderers must use
     /// `visible_session_list()` instead to stay side-effect free.
+    #[allow(dead_code)]
     pub(crate) fn fresh_session_list(&mut self) -> Vec<DbSessionInfo> {
         if self.session_list_stale() {
-            self.refresh_session_list()
-        } else {
-            self.visible_session_list()
+            self.request_session_list();
         }
+        self.visible_session_list()
     }
 
     /// Periodic auto-refresh for the F2 browser. Called every frame from the
-    /// TUI loop; only queries when the browser is open and the TTL expired.
+    /// TUI loop; only requests when the browser is open and the TTL expired.
+    /// Never blocks: the refresh runs on a worker thread.
     pub fn tick_session_view(&mut self) {
         if self.sessions[self.active_idx].mode != SessionMode::SessionView {
             return;
         }
+        if self.sessions[self.active_idx].pending_query
+            || self.sessions[self.active_idx].paging
+            || self.sessions[self.active_idx].session_list_loading
+        {
+            return;
+        }
         if self.session_list_stale() {
-            self.refresh_session_list();
+            self.request_session_list();
         }
     }
 
-    /// Open the F2 session browser: reset selection/plan state, force a
-    /// refresh and preload the current SQL of the first row (best effort).
+    /// Open the F2 session browser: reset selection/plan state, request a
+    /// background refresh; the cursor row's SQL loads when the list arrives.
     pub fn enter_session_view(&mut self) {
         let idx = self.active_idx;
         {
@@ -3089,17 +3403,18 @@ impl SessionManager {
             s.plan_hscroll = 0;
             s.sql_scroll = 0;
             s.session_view_error = None;
+            s.sql_loading = false;
+            s.plan_loading = false;
         }
-        self.refresh_session_list();
-        self.load_selected_sql();
+        self.request_session_list();
     }
 
-    /// Move the F2 highlight and preload that row's SQL (best effort).
-    /// Uses the TTL-guarded list so arrow keys only refresh when the
-    /// configured interval expired — never a DB query per keypress.
+    /// Move the F2 highlight and preload that row's SQL in the background.
+    /// Arrow keys never touch the database on the UI thread anymore.
     pub fn move_session_cursor(&mut self, delta: isize) {
-        let len = self.fresh_session_list().len();
+        let len = self.visible_session_list().len();
         if len == 0 {
+            // No rows yet (list still loading) — let the list arrival load SQL.
             return;
         }
         let idx = self.active_idx;
@@ -3108,54 +3423,88 @@ impl SessionManager {
         if next != self.sessions[idx].session_view_cursor {
             self.sessions[idx].session_view_cursor = next;
             self.load_selected_sql();
+        } else if self.sessions[self.active_idx].plan_sql_text.is_none()
+            && !self.sessions[self.active_idx].sql_loading
+        {
+            self.load_selected_sql();
         }
     }
 
-    /// Load the full SQL text of the highlighted F2 row into `plan_sql_text`.
-    /// Clears any previous plan; failures surface as a status message.
-    /// Reads from the visible (filtered/sorted) list — call
-    /// `refresh_session_list()` first when a fresh list is required
-    /// (enter / auto-refresh tick / manual `R`).
+    /// Load the full SQL text of the highlighted F2 row in the background.
+    /// Clears any previous plan; failures surface as a status message when
+    /// the worker result arrives. Reads from the visible (filtered/sorted)
+    /// list.
     pub fn load_selected_sql(&mut self) {
-        let info = {
+        let (info, label) = {
             let idx = self.active_idx;
             let cursor = self.sessions[idx].session_view_cursor;
-            self.visible_session_list().get(cursor).cloned()
-        };
-        let info = match info {
-            Some(info) => info,
-            None => {
-                let idx = self.active_idx;
-                let s = &mut self.sessions[idx];
-                s.plan_sql_text = None;
-                s.plan_result = None;
-                s.plan_for = None;
-                return;
+            match self.visible_session_list().get(cursor).cloned() {
+                Some(info) => {
+                    let label = format!("{} {}", info.sid, info.username);
+                    (Some(info), Some(label))
+                }
+                None => (None, None),
             }
         };
-        let label = format!("{} {}", info.sid, info.username);
+        let Some(info) = info else {
+            let idx = self.active_idx;
+            let s = &mut self.sessions[idx];
+            s.plan_sql_text = None;
+            s.plan_result = None;
+            s.plan_for = None;
+            return;
+        };
+        let label = label.unwrap_or_default();
         let idx = self.active_idx;
-        let res = self.with_active_conn_sync(|c| c.session_sql(&info).map_err(|e| e.to_string()));
-        let sess = &mut self.sessions[idx];
-        sess.plan_for = Some(label);
-        sess.plan_scroll = 0;
-        sess.plan_hscroll = 0;
-        sess.sql_scroll = 0;
-        sess.plan_result = None;
-        match res {
-            Ok(text) => sess.plan_sql_text = Some(text),
-            Err(e) => {
-                sess.plan_sql_text = None;
-                sess.set_status(format!("No SQL text: {}", e));
-            }
+        let Some(conn) = self.active_connection() else {
+            let sess = &mut self.sessions[idx];
+            sess.plan_sql_text = None;
+            sess.plan_result = None;
+            sess.plan_for = Some(label);
+            sess.set_status("No SQL text: Not connected. Use Ctrl+O to connect.".to_string());
+            return;
+        };
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+        let req = self.sessions[idx].sql_req.wrapping_add(1);
+        let sid;
+        {
+            let sess = &mut self.sessions[idx];
+            sess.sql_req = req;
+            sess.sql_loading = true;
+            sess.plan_for = Some(label.clone());
+            sess.plan_scroll = 0;
+            sess.plan_hscroll = 0;
+            sess.sql_scroll = 0;
+            sess.plan_result = None;
+            sess.plan_sql_text = None;
+            sid = sess.id;
         }
+        let tx = self.f2sql_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let res = conn.session_sql(&info).map_err(|e| e.to_string());
+            let _ = tx.send(F2SqlMsg {
+                sid,
+                req,
+                label,
+                result: res,
+            });
+        });
     }
 
-    /// Run EXPLAIN for the highlighted F2 row's SQL and store the plan.
+    /// Run EXPLAIN for the highlighted F2 row's SQL in the background.
     pub fn explain_selected(&mut self) {
         let idx = self.active_idx;
         if self.sessions[idx].plan_sql_text.is_none() {
-            self.load_selected_sql();
+            if !self.sessions[idx].sql_loading {
+                self.load_selected_sql();
+                self.sessions[self.active_idx]
+                    .set_status("Loading SQL first — press Enter again to EXPLAIN");
+            }
+            return;
+        }
+        if self.sessions[idx].plan_loading {
+            return;
         }
         let (sql, max_rows) = {
             let sess = &self.sessions[idx];
@@ -3164,14 +3513,113 @@ impl SessionManager {
                 _ => return,
             }
         };
-        match self.with_active_conn_sync(|c| Ok(c.explain_plan(&sql, max_rows))) {
-            Ok(result) => {
-                let sess = &mut self.sessions[idx];
-                sess.plan_result = Some(result);
-                sess.plan_scroll = 0;
-                sess.plan_hscroll = 0;
+        let Some(conn) = self.active_connection() else {
+            self.sessions[idx].set_status("Not connected. Use Ctrl+O to connect.");
+            return;
+        };
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+        let req = self.sessions[idx].plan_req.wrapping_add(1);
+        let sid;
+        {
+            let sess = &mut self.sessions[idx];
+            sess.plan_req = req;
+            sess.plan_loading = true;
+            sid = sess.id;
+        }
+        let tx = self.f2plan_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = conn.explain_plan(&sql, max_rows);
+            let _ = tx.send(F2PlanMsg { sid, req, result });
+        });
+    }
+
+    /// Drain finished background F2 list / SQL / EXPLAIN results.
+    /// Called every frame (like `poll_result`). Stale responses are dropped.
+    pub fn poll_f2(&mut self) {
+        for _ in 0..16 {
+            let msg = match self.f2list_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let Some(sess) = self.sessions.iter_mut().find(|s| s.id == msg.sid) else {
+                continue;
+            };
+            if sess.session_list_req != msg.req {
+                continue;
             }
-            Err(msg) => self.sessions[idx].set_status(msg),
+            sess.session_list_loading = false;
+            match msg.result {
+                Ok(list) => {
+                    sess.session_view_error = None;
+                    sess.session_list_cache = list;
+                    sess.session_list_since = Some(std::time::Instant::now());
+                }
+                Err(err) => {
+                    sess.session_view_error = Some(err);
+                    sess.session_list_cache.clear();
+                    sess.session_list_since = Some(std::time::Instant::now());
+                    sess.session_view_cursor = 0;
+                    continue;
+                }
+            }
+        }
+        // Clamp cursor after list updates (needs active session index).
+        {
+            let idx = self.active_idx;
+            self.clamp_session_cursor(idx);
+        }
+        // If the list just arrived and no SQL is loaded yet, load it.
+        let need_sql = {
+            let sess = &self.sessions[self.active_idx];
+            sess.mode == SessionMode::SessionView
+                && !sess.session_list_cache.is_empty()
+                && sess.plan_sql_text.is_none()
+                && !sess.sql_loading
+        };
+        if need_sql {
+            self.load_selected_sql();
+        }
+        for _ in 0..16 {
+            let msg = match self.f2sql_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let Some(sess) = self.sessions.iter_mut().find(|s| s.id == msg.sid) else {
+                continue;
+            };
+            if sess.sql_req != msg.req {
+                continue;
+            }
+            sess.sql_loading = false;
+            sess.plan_for = Some(msg.label);
+            sess.plan_scroll = 0;
+            sess.plan_hscroll = 0;
+            sess.sql_scroll = 0;
+            sess.plan_result = None;
+            match msg.result {
+                Ok(text) => sess.plan_sql_text = Some(text),
+                Err(e) => {
+                    sess.plan_sql_text = None;
+                    sess.set_status(format!("No SQL text: {}", e));
+                }
+            }
+        }
+        for _ in 0..8 {
+            let msg = match self.f2plan_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let Some(sess) = self.sessions.iter_mut().find(|s| s.id == msg.sid) else {
+                continue;
+            };
+            if sess.plan_req != msg.req {
+                continue;
+            }
+            sess.plan_loading = false;
+            sess.plan_result = Some(msg.result);
+            sess.plan_scroll = 0;
+            sess.plan_hscroll = 0;
         }
     }
 
@@ -3193,39 +3641,27 @@ impl SessionManager {
         }
     }
 
-    /// (Re)load the top-level schema list from the backend.
+    /// (Re)load the top-level schema list in the background (never blocks).
     pub fn refresh_explorer(&mut self) {
         let idx = self.active_idx;
-        let res = self.with_active_conn_sync(|c| c.list_schemas().map_err(|e| e.to_string()));
-        let sess = &mut self.sessions[idx];
-        match res {
-            Ok(names) => {
-                sess.explorer_schemas = names
-                    .into_iter()
-                    .map(|n| {
-                        // Preserve expansion of schemas that are still there.
-                        let prev = sess.explorer_schemas.iter().find(|p| p.name == n);
-                        ExplorerSchema {
-                            name: n,
-                            expanded: prev.map(|p| p.expanded).unwrap_or(false),
-                            groups: prev.and_then(|p| p.groups.clone()),
-                            load_error: None,
-                        }
-                    })
-                    .collect();
-                sess.explorer_loaded = true;
-                sess.explorer_error = None;
-                if sess.explorer_schemas.is_empty() {
-                    sess.explorer_error =
-                        Some("No schemas found (or no dictionary access).".into());
-                }
-            }
-            Err(e) => {
-                sess.explorer_loaded = true;
-                sess.explorer_error = Some(explorer_error_hint(&e));
-            }
-        }
-        self.clamp_explorer_cursor();
+        let Some(conn) = self.active_connection() else {
+            let sess = &mut self.sessions[idx];
+            sess.explorer_loaded = true;
+            sess.explorer_error =
+                Some("Not connected. Use Ctrl+O to connect.".into());
+            return;
+        };
+        let exec_lock = self.sessions[idx].exec_lock.clone();
+        let sid = self.sessions[idx].id;
+        self.sessions[idx].explorer_struct_pending += 1;
+        // Mark loaded so the tree renders a loading state instead of empty.
+        self.sessions[idx].explorer_loaded = true;
+        let tx = self.cat_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = conn.list_schemas().map_err(|e| e.to_string());
+            let _ = tx.send(CatMsg::Schemas { sid, result });
+        });
     }
 
     /// Refresh the node under the cursor (schema groups, group objects or
@@ -3324,56 +3760,33 @@ impl SessionManager {
         }
     }
 
-    /// Load the type-group folders of one schema (only types it has).
+    /// Load the type-group folders of one schema in the background.
     fn load_schema_groups(&mut self, sidx: usize) {
         let schema = match self.sessions[self.active_idx].explorer_schemas.get(sidx) {
             Some(s) => s.name.clone(),
             None => return,
         };
-        let res =
-            self.with_active_conn_sync(|c| c.list_object_groups(&schema).map_err(|e| e.to_string()));
-        let sess = &mut self.sessions[self.active_idx];
-        let Some(entry) = sess.explorer_schemas.get_mut(sidx) else {
+        let Some(conn) = self.active_connection() else {
             return;
         };
-        match res {
-            Ok(mut groups) => {
-                groups.sort_by(|a, b| {
-                    explorer_group_order(&a.0)
-                        .cmp(&explorer_group_order(&b.0))
-                        .then(a.0.cmp(&b.0))
-                });
-                // Preserve open folders (and their loaded objects) across
-                // refreshes so `r` doesn't discard open subtrees.
-                let prev = entry.groups.take().unwrap_or_default();
-                entry.groups = Some(
-                    groups
-                        .into_iter()
-                        .map(|(key, count)| {
-                            let mut g = prev
-                                .iter()
-                                .find(|p| p.key == key)
-                                .cloned()
-                                .unwrap_or_else(|| ExplorerGroup::new(key, count));
-                            g.count = count;
-                            g.load_error = None;
-                            g
-                        })
-                        .collect(),
-                );
-                entry.load_error = None;
-                if entry.groups.as_ref().map(|g| g.is_empty()).unwrap_or(true) {
-                    entry.load_error = Some(format!("Schema '{}' has no visible objects.", schema));
-                }
-            }
-            Err(e) => {
-                entry.groups = Some(Vec::new());
-                entry.load_error = Some(explorer_error_hint(&e));
-            }
-        }
+        let exec_lock = self.sessions[self.active_idx].exec_lock.clone();
+        let sid = self.sessions[self.active_idx].id;
+        self.sessions[self.active_idx].explorer_struct_pending += 1;
+        let tx = self.cat_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = conn
+                .list_object_groups(&schema)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(CatMsg::Groups {
+                sid,
+                schema,
+                result,
+            });
+        });
     }
 
-    /// Load the objects of one type-group folder.
+    /// Load the objects of one type-group folder in the background.
     fn load_group_objects(&mut self, sidx: usize, gidx: usize) {
         let (schema, key) = match self.sessions[self.active_idx]
             .explorer_schemas
@@ -3389,51 +3802,25 @@ impl SessionManager {
             ),
             None => return,
         };
-        let res =
-            self.with_active_conn_sync(|c| c.list_objects(&schema, &key).map_err(|e| e.to_string()));
-        let sess = &mut self.sessions[self.active_idx];
-        let Some(entry) = sess
-            .explorer_schemas
-            .get_mut(sidx)
-            .and_then(|s| s.groups.as_mut())
-            .and_then(|g| g.get_mut(gidx))
-        else {
+        let Some(conn) = self.active_connection() else {
             return;
         };
-        match res {
-            Ok(items) => {
-                // Preserve loaded children (columns/previews/DDL) across
-                // refreshes; cap the list so huge schemas stay usable.
-                let prev = entry.objects.take().unwrap_or_default();
-                entry.objects = Some(
-                    items
-                        .into_iter()
-                        .take(2500)
-                        .map(|(name, kind)| {
-                            let mut t = prev
-                                .iter()
-                                .find(|p| p.name == name && p.kind == kind)
-                                .cloned()
-                                .unwrap_or_else(|| ExplorerTable::new(name, kind));
-                            t.load_error = None;
-                            t
-                        })
-                        .collect(),
-                );
-                entry.load_error = None;
-                if entry.objects.as_ref().map(|o| o.is_empty()).unwrap_or(true) {
-                    entry.load_error = Some(format!(
-                        "No {} in schema '{}'.",
-                        explorer_group_label(&key).to_lowercase(),
-                        schema
-                    ));
-                }
-            }
-            Err(e) => {
-                entry.objects = Some(Vec::new());
-                entry.load_error = Some(explorer_error_hint(&e));
-            }
-        }
+        let exec_lock = self.sessions[self.active_idx].exec_lock.clone();
+        let sid = self.sessions[self.active_idx].id;
+        self.sessions[self.active_idx].explorer_struct_pending += 1;
+        let tx = self.cat_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = conn
+                .list_objects(&schema, &key)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(CatMsg::Objects {
+                sid,
+                schema,
+                group: key,
+                result,
+            });
+        });
     }
 
     fn load_table_columns(&mut self, sidx: usize, gidx: usize, tidx: usize) {
@@ -3454,31 +3841,212 @@ impl SessionManager {
             ),
             None => return,
         };
-        let res = self.with_active_conn_sync(|c| {
-            c.list_columns(&schema, &name, &kind)
-                .map_err(|e| e.to_string())
-        });
-        let sess = &mut self.sessions[self.active_idx];
-        let Some(entry) = sess
-            .explorer_schemas
-            .get_mut(sidx)
-            .and_then(|s| s.groups.as_mut())
-            .and_then(|g| g.get_mut(gidx))
-            .and_then(|g| g.objects.as_mut())
-            .and_then(|o| o.get_mut(tidx))
-        else {
+        let Some(conn) = self.active_connection() else {
             return;
         };
-        match res {
-            Ok(cols) => {
-                entry.columns = Some(cols);
-                entry.load_error = None;
-            }
-            Err(e) => {
-                entry.columns = Some(Vec::new());
-                entry.load_error = Some(explorer_error_hint(&e));
+        let exec_lock = self.sessions[self.active_idx].exec_lock.clone();
+        let sid = self.sessions[self.active_idx].id;
+        self.sessions[self.active_idx].explorer_struct_pending += 1;
+        let tx = self.cat_tx.clone();
+        thread::spawn(move || {
+            let _guard = exec_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let result = conn
+                .list_columns(&schema, &name, &kind)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(CatMsg::Columns {
+                sid,
+                schema,
+                name,
+                kind,
+                result,
+            });
+        });
+    }
+
+    /// Drain finished background explorer structure loads. Called every frame.
+    /// Results are applied by name so concurrent expansions stay correct.
+    pub fn poll_cat(&mut self) {
+        for _ in 0..16 {
+            let msg = match self.cat_rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            match msg {
+                CatMsg::Schemas { sid, result } => {
+                    let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) else {
+                        continue;
+                    };
+                    sess.explorer_struct_pending =
+                        sess.explorer_struct_pending.saturating_sub(1);
+                    match result {
+                        Ok(names) => {
+                            let prev = std::mem::take(&mut sess.explorer_schemas);
+                            sess.explorer_schemas = names
+                                .into_iter()
+                                .map(|n| {
+                                    let p = prev.iter().find(|p| p.name == n);
+                                    ExplorerSchema {
+                                        name: n,
+                                        expanded: p.map(|p| p.expanded).unwrap_or(false),
+                                        groups: p.and_then(|p| p.groups.clone()),
+                                        load_error: None,
+                                    }
+                                })
+                                .collect();
+                            sess.explorer_loaded = true;
+                            sess.explorer_error = None;
+                            if sess.explorer_schemas.is_empty() {
+                                sess.explorer_error = Some(
+                                    "No schemas found (or no dictionary access).".into(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            sess.explorer_loaded = true;
+                            sess.explorer_error = Some(explorer_error_hint(&e));
+                        }
+                    }
+                }
+                CatMsg::Groups { sid, schema, result } => {
+                    let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) else {
+                        continue;
+                    };
+                    sess.explorer_struct_pending =
+                        sess.explorer_struct_pending.saturating_sub(1);
+                    let Some(entry) = sess
+                        .explorer_schemas
+                        .iter_mut()
+                        .find(|s| s.name == schema)
+                    else {
+                        continue;
+                    };
+                    match result {
+                        Ok(mut groups) => {
+                            groups.sort_by(|a, b| {
+                                explorer_group_order(&a.0)
+                                    .cmp(&explorer_group_order(&b.0))
+                                    .then(a.0.cmp(&b.0))
+                            });
+                            let prev = entry.groups.take().unwrap_or_default();
+                            entry.groups = Some(
+                                groups
+                                    .into_iter()
+                                    .map(|(key, count)| {
+                                        let mut g = prev
+                                            .iter()
+                                            .find(|p| p.key == key)
+                                            .cloned()
+                                            .unwrap_or_else(|| ExplorerGroup::new(key, count));
+                                        g.count = count;
+                                        g.load_error = None;
+                                        g
+                                    })
+                                    .collect(),
+                            );
+                            entry.load_error = None;
+                            if entry.groups.as_ref().map(|g| g.is_empty()).unwrap_or(true) {
+                                entry.load_error =
+                                    Some(format!("Schema '{}' has no visible objects.", schema));
+                            }
+                        }
+                        Err(e) => {
+                            entry.groups = Some(Vec::new());
+                            entry.load_error = Some(explorer_error_hint(&e));
+                        }
+                    }
+                }
+                CatMsg::Objects {
+                    sid,
+                    schema,
+                    group,
+                    result,
+                } => {
+                    let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) else {
+                        continue;
+                    };
+                    sess.explorer_struct_pending =
+                        sess.explorer_struct_pending.saturating_sub(1);
+                    let entry = sess
+                        .explorer_schemas
+                        .iter_mut()
+                        .find(|s| s.name == schema)
+                        .and_then(|s| s.groups.as_mut())
+                        .and_then(|gs| gs.iter_mut().find(|g| g.key == group));
+                    let Some(entry) = entry else { continue };
+                    match result {
+                        Ok(items) => {
+                            let prev = entry.objects.take().unwrap_or_default();
+                            entry.objects = Some(
+                                items
+                                    .into_iter()
+                                    .take(2500)
+                                    .map(|(name, kind)| {
+                                        let mut t = prev
+                                            .iter()
+                                            .find(|p| p.name == name && p.kind == kind)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                ExplorerTable::new(name, kind)
+                                            });
+                                        t.load_error = None;
+                                        t
+                                    })
+                                    .collect(),
+                            );
+                            entry.load_error = None;
+                            if entry.objects.as_ref().map(|o| o.is_empty()).unwrap_or(true) {
+                                entry.load_error = Some(format!(
+                                    "No {} in schema '{}'.",
+                                    explorer_group_label(&group).to_lowercase(),
+                                    schema
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            entry.objects = Some(Vec::new());
+                            entry.load_error = Some(explorer_error_hint(&e));
+                        }
+                    }
+                }
+                CatMsg::Columns {
+                    sid,
+                    schema,
+                    name,
+                    kind: _,
+                    result,
+                } => {
+                    let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) else {
+                        continue;
+                    };
+                    sess.explorer_struct_pending =
+                        sess.explorer_struct_pending.saturating_sub(1);
+                    let entry = sess
+                        .explorer_schemas
+                        .iter_mut()
+                        .find(|s| s.name == schema)
+                        .and_then(|s| s.groups.as_mut())
+                        .and_then(|gs| {
+                            gs.iter_mut().find_map(|g| {
+                                g.objects.as_mut()?.iter_mut().find(|o| o.name == name)
+                            })
+                        });
+                    let Some(entry) = entry else { continue };
+                    match result {
+                        Ok(cols) => {
+                            entry.columns = Some(cols);
+                            entry.load_error = None;
+                        }
+                        Err(e) => {
+                            entry.columns = Some(Vec::new());
+                            entry.load_error = Some(explorer_error_hint(&e));
+                        }
+                    }
+                }
             }
         }
+        let idx = self.active_idx;
+        self.clamp_explorer_cursor();
+        let _ = idx;
     }
 
     /// Flat visible rows in tree order, honoring expansion + text filter.
@@ -5133,6 +5701,46 @@ mod tests {
             split("select 1 from dual; select 2 from dual;"),
             vec!["select 1 from dual", "select 2 from dual"]
         );
+    }
+
+    #[test]
+    fn editor_word_jumps_and_undo() {
+        let mut ed = SqlEditor::new();
+        ed.set_text("select empno, ename from emp");
+        ed.undo_stack.clear();
+        ed.redo_stack.clear();
+        ed.cursor_row = 0;
+        ed.cursor_col = ed.lines[0].len();
+        ed.move_word_left();
+        assert_eq!(&ed.lines[0][ed.cursor_col..], "emp");
+        ed.move_word_left();
+        assert_eq!(&ed.lines[0][ed.cursor_col..], "from emp");
+        ed.move_word_right();
+        assert_eq!(&ed.lines[0][ed.cursor_col..], "emp");
+        ed.move_word_right();
+        assert_eq!(&ed.lines[0][ed.cursor_col..], "");
+
+        // Undo / redo round-trips a word deletion.
+        ed.cursor_col = "select ".len();
+        ed.delete_range((0, "select ".len()), (0, "select empno".len()));
+        assert_eq!(ed.lines[0], "select , ename from emp");
+        assert!(ed.undo());
+        assert_eq!(ed.lines[0], "select empno, ename from emp");
+        assert!(ed.redo());
+        assert_eq!(ed.lines[0], "select , ename from emp");
+    }
+
+    #[test]
+    fn editor_hscroll_tracks_cursor() {
+        let mut ed = SqlEditor::new();
+        ed.set_text(&"x".repeat(100));
+        ed.cursor_row = 0;
+        ed.cursor_col = 100;
+        ed.ensure_cursor_visible_sized(10, 20);
+        assert_eq!(ed.col_offset, 81);
+        ed.cursor_col = 0;
+        ed.ensure_cursor_visible_sized(10, 20);
+        assert_eq!(ed.col_offset, 0);
     }
 
     #[test]

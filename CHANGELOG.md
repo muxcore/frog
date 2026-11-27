@@ -2,6 +2,34 @@
 
 All notable changes to frog are documented here.
 
+## [0.12.0] - 2026-11-27
+
+### Added
+- Saved-connection picker: `-c/--connection NAME` (`FROG_CONNECTION` env/`.env`)
+  selects a `config.yml` `connections[]` entry as a per-setting fallback tier;
+  `Alt+N`/`Alt+P` in `Ctrl+O` cycles the list. Startup warns on unknown names.
+- Postgres TLS via `PGSSLMODE` (`FROG_SSLMODE` alias):
+  `disable|prefer|allow|require|verify-ca|verify-full` (default `disable`;
+  `prefer`/`allow` fall back to plaintext). Cancel-query uses TLS when connected
+  over TLS; connect-error hints point at `PGSSLMODE`.
+- SQL editor undo/redo (`Alt+Z` / `Alt+Shift+Z`, 100-step history) and
+  Emacs-style word jumps (`Ctrl+Left/Right` in the editor, `Alt+B`/`Alt+F`
+  everywhere; `Alt+Left/Right` still switches tabs).
+- Editor horizontal scrolling: long lines scroll sideways with a scrollbar;
+  cursor, click/drag, completion popup and `Shift+wheel` follow the viewport.
+- Mouse: click the tab bar to switch tabs, wheel scrolls the editor, and the
+  editor/results splitter drags to resize. Help no longer advertises hover-focus.
+
+### Fixed
+- `F2` session browser and `F12` explorer structure loads (schemas, groups,
+  objects, columns) now run on background workers: arrow keys, expands and
+  auto-refresh never block the UI thread, with stale-response dropping and
+  `⟳` loading indicators.
+- First-keypress swallow removed: dismissing the startup splash now processes
+  the same key (e.g. `Ctrl+O`, `F2`) instead of eating it.
+- `Ctrl+W` on a tab with SQL/running query now asks for a second press within
+  5s instead of closing immediately.
+
 ## [0.11.0] - 2026-11-27
 
 ### Fixed

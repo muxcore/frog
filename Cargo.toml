@@ -1,6 +1,6 @@
 [package]
 name = "frog"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Terminal Oracle client - inspired by Toad, tmux, btop"
 
@@ -10,6 +10,8 @@ crossterm = "0.28"
 clap = { version = "4", features = ["derive", "env"] }
 oracle = { version = "0.6", features = ["chrono"] }
 postgres = "0.19"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

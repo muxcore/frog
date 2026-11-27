@@ -43,9 +43,12 @@ descriptor belongs to its backend (switching backend drops its host/port).\n\
 \n\
   Postgres (standard PG* names):\n\
     PGHOST=db1.local PGPORT=5432 PGDATABASE=myapp PGUSER=scott PGPASSWORD=tiger\n\
+    PGSSLMODE=require (disable|prefer|allow|require|verify-ca|verify-full;\n\
+        FROG_SSLMODE alias; default disable; require+ for managed/hostssl servers)\n\
 \n\
   Other:\n\
     FROG_CONFIG=~/.config/frog/prod.yml  FROG_MAX_ROWS=10000  FROG_NO_AUTOCOMMIT=true\n\
+    -c/--connection NAME (FROG_CONNECTION): saved entry from config.yml connections[]\n\
     FROG_SESSION_REFRESH_SECS=60 (F2 auto-refresh, seconds; 0 = manual only)\n\
     FROG_CLIPBOARD_CMD='clip.exe' (custom copy helper; auto-detected on WSL/Windows)\n\
 \n\
@@ -77,6 +80,10 @@ pub struct CliArgs {
 
     #[arg(short = 'f', long, env = "FROG_CONFIG")]
     pub config_file: Option<PathBuf>,
+
+    /// Saved connection to use from `config.yml` `connections[]` (by `name`).
+    #[arg(short = 'c', long, env = "FROG_CONNECTION")]
+    pub connection: Option<String>,
 
     #[arg(long, env = "FROG_MAX_ROWS", default_value = "10000")]
     pub max_rows: usize,
@@ -210,7 +217,6 @@ impl Config {
         };
 
         let args = CliArgs::parse();
-        let connection = Self::resolve_connection(&args, &dotenv_map);
         // Non-connection settings with no clap default conflict: dotenv fills
         // in only when neither CLI nor real env provided a value (the map
         // excludes keys already present in the real environment).
@@ -221,6 +227,35 @@ impl Config {
         let autocommit = !args.no_autocommit && !dotenv_flag(&dotenv_map, "FROG_NO_AUTOCOMMIT");
         let extra_config = dotenv_map.get("FROG_CONFIG").map(PathBuf::from);
         let effective_config = args.config_file.clone().or(extra_config);
+        let config_file = load_config_file(effective_config.as_deref());
+        let configured_conns = config_file
+            .as_ref()
+            .and_then(|c| c.connections.clone())
+            .unwrap_or_default();
+
+        // Named saved connection (`-c/--connection`, `FROG_CONNECTION` env or
+        // `.env`): used as a fallback tier below CLI/env/connect-string/`.env`
+        // and above built-in defaults, per setting.
+        let wanted = args
+            .connection
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| env_get("FROG_CONNECTION"))
+            .or_else(|| dotenv_map.get("FROG_CONNECTION").cloned());
+        let named = wanted.as_deref().and_then(|name| {
+            let found = configured_conns.iter().find(|c| c.name == name);
+            if found.is_none() {
+                eprintln!(
+                    "frog: warning: connection '{}' not found in config.yml connections[] — ignoring",
+                    name
+                );
+            }
+            found
+        });
+        if let Some(entry) = named {
+            eprintln!("frog: using saved connection '{}'", entry.name);
+        }
+        let connection = Self::resolve_connection(&args, &dotenv_map, named);
         // Tell the user when nothing configured the connection: this is the
         // "my env vars didn't reach the dialog" situation (e.g. `.env` in a
         // different directory, or unsupported variable names).
@@ -241,8 +276,6 @@ impl Config {
             );
         }
         let extra_saved = Self::saved_entry(&connection);
-
-        let config_file = load_config_file(effective_config.as_deref());
 
         let ui = config_file
             .as_ref()
@@ -324,9 +357,47 @@ impl Config {
         }]
     }
 
+    fn params_from_entry(entry: &ConnectionEntry) -> ConnectionParams {
+        let db_type = entry.db_type.unwrap_or(DbType::Oracle);
+        let (service, database) = match db_type {
+            DbType::Oracle => {
+                let mut service = entry.service.clone();
+                if service.is_empty() {
+                    service = entry.database.clone().unwrap_or_default();
+                }
+                if service.is_empty() {
+                    service = String::from("ORCL");
+                }
+                let database = service.clone();
+                (service, database)
+            }
+            DbType::Postgres => {
+                let mut database = entry.database.clone().unwrap_or_default();
+                if database.is_empty() {
+                    database = entry.service.clone();
+                }
+                if database.is_empty() {
+                    database = default_pg_database(&entry.user);
+                }
+                let service = database.clone();
+                (service, database)
+            }
+        };
+        ConnectionParams {
+            db_type,
+            host: entry.host.clone(),
+            port: entry.port,
+            service,
+            database,
+            user: entry.user.clone(),
+            password: entry.password.clone(),
+        }
+    }
+
     fn resolve_connection(
         args: &CliArgs,
         dotenv: &std::collections::HashMap<String, String>,
+        named: Option<&ConnectionEntry>,
     ) -> ConnectionParams {
         // Tiers per setting: CLI-or-real-env (tier 1) > `.env` map (tier 2) >
         // connect-string value > built-in default. A connect string never
@@ -386,8 +457,34 @@ impl Config {
         let t2_password = denv("ORACLE_PASSWORD").or_else(|| denv("PGPASSWORD"));
         let t2_db_type = denv("FROG_DB_TYPE").and_then(|t| t.parse::<DbType>().ok());
 
-        // Backend: tier 1 > connect string > tier 2 > auto-detect > oracle.
-        let db_type = t1_db_type.or(cs_db_type).or(t2_db_type).unwrap_or_else(|| {
+        // Tier 3: named saved connection (`-c/--connection` from config.yml).
+        let named_params = named.map(Self::params_from_entry);
+        let t3_db_type = named_params.as_ref().map(|p| p.db_type);
+        let t3_host = named_params
+            .as_ref()
+            .map(|p| p.host.clone())
+            .filter(|s| !s.is_empty());
+        let t3_port = named_params.as_ref().map(|p| p.port).filter(|p| *p != 0);
+        let t3_service = named_params
+            .as_ref()
+            .map(|p| p.service.clone())
+            .filter(|s| !s.is_empty());
+        let t3_database = named_params
+            .as_ref()
+            .map(|p| p.database.clone())
+            .filter(|s| !s.is_empty());
+        let t3_user = named_params
+            .as_ref()
+            .map(|p| p.user.clone())
+            .filter(|s| !s.is_empty());
+        let t3_password = named_params.as_ref().and_then(|p| p.password.clone());
+
+        // Backend: tier 1 > connect string > tier 2 > named > auto-detect > oracle.
+        let db_type = t1_db_type
+            .or(cs_db_type)
+            .or(t2_db_type)
+            .or(t3_db_type)
+            .unwrap_or_else(|| {
             if t1_database.is_some() {
                 return DbType::Postgres;
             }
@@ -426,26 +523,35 @@ impl Config {
         let host = t1_host
             .or(cs_host)
             .or(t2_host)
+            .or(t3_host)
             .unwrap_or_else(|| String::from("localhost"));
         let port = t1_port
             .or(cs_port)
             .or(t2_port)
+            .or(t3_port)
             .unwrap_or_else(|| db_type.default_port());
         let mut service = t1_service
             .or(cs_service)
             .or(t2_service)
+            .or(t3_service)
             .unwrap_or_default();
         let mut database = t1_database
             .or(cs_database)
             .or(t2_database)
+            .or(t3_database)
             .unwrap_or_default();
-        let user = t1_user.or(cs_user).or(t2_user).unwrap_or_default();
+        let user = t1_user
+            .or(cs_user)
+            .or(t2_user)
+            .or(t3_user)
+            .unwrap_or_default();
         // Password order: tier-1 connect string > tier-1 env > tier-2
-        // connect string > tier-2 env.
+        // connect string > tier-2 env > named entry.
         let password = (if cs_is_tier1 { cs_password.clone() } else { None })
             .or(t1_password)
             .or(if cs_is_tier1 { None } else { cs_password })
-            .or(t2_password);
+            .or(t2_password)
+            .or(t3_password);
 
         match db_type {
             DbType::Oracle => {
@@ -500,6 +606,7 @@ const CONN_ENV_KEYS: &[&str] = &[
     "ORACLE_USER",
     "ORACLE_PASSWORD",
     "FROG_DB_TYPE",
+    "FROG_CONNECTION",
     "PGHOST",
     "PGPORT",
     "PGDATABASE",
@@ -520,7 +627,7 @@ fn is_default_target(c: &ConnectionParams) -> bool {
 fn cli_gave_connection() -> bool {
     const FLAGS: &[&str] = &[
         "-H", "--host", "-P", "--port", "-S", "--service", "-D", "--database", "-U",
-        "--user", "-d", "--connect-string", "--db-type",
+        "--user", "-d", "--connect-string", "--db-type", "-c", "--connection",
     ];
     std::env::args().skip(1).any(|a| {
         FLAGS
@@ -532,6 +639,11 @@ fn cli_gave_connection() -> bool {
 /// Real (process) env var, ignoring empty values. (The `.env` map is never
 /// injected into the process env, so this is always the real environment.)
 fn env_get(key: &str) -> Option<String> {
+    env_get_public(key)
+}
+
+/// `pub(crate)` accessor for `env_get` (used by the postgres TLS plumbing).
+pub(crate) fn env_get_public(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
@@ -897,7 +1009,7 @@ mod tests {
         std::env::set_var("PGDATABASE", "mydb");
         std::env::set_var("PGUSER", "bob");
         let empty = std::collections::HashMap::new();
-        let c = Config::resolve_connection(&parse_args(), &empty);
+        let c = Config::resolve_connection(&parse_args(), &empty, None);
         assert_eq!(c.db_type, DbType::Postgres);
         assert_eq!(c.host, "pg.test");
         assert_eq!(c.port, 5432);
@@ -913,7 +1025,7 @@ mod tests {
         std::env::set_var("ORACLE_SERVICE", "XE");
         std::env::set_var("ORACLE_USER", "scott");
         let empty = std::collections::HashMap::new();
-        let c = Config::resolve_connection(&parse_args(), &empty);
+        let c = Config::resolve_connection(&parse_args(), &empty, None);
         assert_eq!(c.db_type, DbType::Oracle);
         assert_eq!(c.host, "ora.test");
         assert_eq!(c.port, 1521);
@@ -926,7 +1038,7 @@ mod tests {
         let _g = EnvGuard::clear(CONN_ENV_KEYS);
         std::env::set_var("DATABASE_URL", "postgres://bob@db:5433/app");
         let empty = std::collections::HashMap::new();
-        let c = Config::resolve_connection(&parse_args(), &empty);
+        let c = Config::resolve_connection(&parse_args(), &empty, None);
         assert_eq!(c.db_type, DbType::Postgres);
         assert_eq!(c.host, "db");
         assert_eq!(c.port, 5433);
@@ -950,7 +1062,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let c = Config::resolve_connection(&parse_args(), &dotenv);
+        let c = Config::resolve_connection(&parse_args(), &dotenv, None);
         assert_eq!(c.db_type, DbType::Postgres);
         assert_eq!(c.host, "pg.real");
         // Endpoint came from the Oracle descriptor for a Postgres target:
@@ -972,11 +1084,39 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let c = Config::resolve_connection(&parse_args(), &dotenv);
+        let c = Config::resolve_connection(&parse_args(), &dotenv, None);
         assert_eq!(c.db_type, DbType::Oracle);
         assert_eq!(c.host, "ora.env");
         assert_eq!(c.port, 1521);
         assert_eq!(c.service, "XE");
         assert_eq!(c.user, "envuser");
+    }
+
+    #[test]
+    fn resolve_named_connection_used_as_fallback_tier() {
+        let _g = EnvGuard::clear(CONN_ENV_KEYS);
+        let empty = std::collections::HashMap::new();
+        let entry = ConnectionEntry {
+            name: "pg-dev".into(),
+            host: "db1.local".into(),
+            port: 5433,
+            service: String::new(),
+            user: "bob".into(),
+            password: None,
+            db_type: Some(DbType::Postgres),
+            database: Some("myapp".into()),
+        };
+        let c = Config::resolve_connection(&parse_args(), &empty, Some(&entry));
+        assert_eq!(c.db_type, DbType::Postgres);
+        assert_eq!(c.host, "db1.local");
+        assert_eq!(c.port, 5433);
+        assert_eq!(c.database, "myapp");
+        assert_eq!(c.user, "bob");
+
+        // Real env beats the named entry per setting.
+        std::env::set_var("PGHOST", "pg.real");
+        let c2 = Config::resolve_connection(&parse_args(), &empty, Some(&entry));
+        assert_eq!(c2.host, "pg.real");
+        assert_eq!(c2.port, 5433);
     }
 }
