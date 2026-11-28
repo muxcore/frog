@@ -1950,6 +1950,25 @@ impl App {
         })
     }
 
+    fn ddl_search_highlight(&self) -> Option<crate::tui::widgets::LineSearchHighlight> {
+        let st = self.search.as_ref()?;
+        if st.target != SearchTarget::Ddl || st.query.is_empty() {
+            return None;
+        }
+        let (line, col, len) = match st.matches.get(st.current) {
+            Some(SearchMatch::Line { line, col, len }) => (*line, *col, *len),
+            _ => (0, 0, 0),
+        };
+        Some(crate::tui::widgets::LineSearchHighlight {
+            query: st.query.clone(),
+            case_sensitive: st.case_sensitive(),
+            current_line: line,
+            current_col: col,
+            current_len: len,
+            has_current: !st.matches.is_empty(),
+        })
+    }
+
     /// Short single-line context of the current match for the search bar,
     /// so the aim is readable even where the in-view highlight can't be
     /// (limited palettes, relayed sessions). Truncated to ~48 chars.
@@ -5019,7 +5038,8 @@ impl App {
             }
             SessionMode::ObjectDdl => {
                 let session = self.session_manager.active_session();
-                render_object_ddl(session, self.mouse_capture, f, chunks[1]);
+                let ddl_hl = self.ddl_search_highlight();
+                render_object_ddl(session, self.mouse_capture, ddl_hl.as_ref(), f, chunks[1]);
                 self.ddl_area = chunks[1];
             }
             SessionMode::Performance => {

@@ -7,8 +7,8 @@ use crate::db::perf::{
 use crate::db::session_manager::{Session, SessionManager};
 use crate::tui::app::ResultFormat;
 use crate::tui::widgets::{
-    clean_cell, format_bytes, render_result_scrollbars, render_table, result_title_counts,
-    visible_col_range_fit, wrap_sql_lines, TableViewState,
+    clean_cell, format_bytes, overlay_line_search, render_result_scrollbars, render_table,
+    result_title_counts, visible_col_range_fit, wrap_sql_lines, LineSearchHighlight, TableViewState,
 };
 use ratatui::{prelude::*, widgets::*};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -66,8 +66,15 @@ fn pane_border(focused: bool) -> Color {
 ///
 /// Honors `show_line_numbers` (`Mouse:OFF` native selection mode): when false,
 /// borders and gutter line numbers are hidden so terminal drag-selection copies
-/// clean executable DDL.
-pub fn render_object_ddl(session: &Session, show_line_numbers: bool, f: &mut Frame, area: Rect) {
+/// clean executable DDL. `search` tints all I-search hits (current match gets
+/// the cursor tint), mirroring the editor/results highlighting.
+pub fn render_object_ddl(
+    session: &Session,
+    show_line_numbers: bool,
+    search: Option<&LineSearchHighlight>,
+    f: &mut Frame,
+    area: Rect,
+) {
     let target_label = session
         .ddl_target
         .as_ref()
@@ -131,9 +138,14 @@ pub fn render_object_ddl(session: &Session, show_line_numbers: bool, f: &mut Fra
         let skip = session.ddl_scroll.min(raw_lines.len().saturating_sub(1));
         let lines: Vec<Line> = raw_lines
             .into_iter()
+            .enumerate()
             .skip(skip)
             .take(view_h.max(1))
-            .map(|l| highlight_ddl_line(hslice_display(l, session.ddl_hscroll)))
+            .map(|(idx, l)| {
+                let (visible, skipped) = hslice_with_offset(l, session.ddl_hscroll);
+                let line = highlight_ddl_line(visible.clone());
+                apply_ddl_search(line, &visible, idx, skipped, search)
+            })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
         return;
@@ -228,8 +240,14 @@ pub fn render_object_ddl(session: &Session, show_line_numbers: bool, f: &mut Fra
             format!("{:4} │ ", idx + 1),
             Style::default().fg(Color::DarkGray),
         );
-        let sliced = hslice_display(raw, session.ddl_hscroll);
-        let mut line = highlight_ddl_line(sliced);
+        let (visible, skipped) = hslice_with_offset(raw, session.ddl_hscroll);
+        let mut line = apply_ddl_search(
+            highlight_ddl_line(visible.clone()),
+            &visible,
+            idx,
+            skipped,
+            search,
+        );
         line.spans.insert(0, gutter);
         rendered.push(line);
     }
@@ -270,21 +288,50 @@ fn kind_badge_color(kind: &str) -> Color {
     }
 }
 
-fn hslice_display(s: &str, skip_cols: usize) -> String {
+/// Horizontal slice plus the byte offset skipped from the original line,
+/// so absolute search columns can be mapped into the visible slice.
+fn hslice_with_offset(s: &str, skip_cols: usize) -> (String, usize) {
     if skip_cols == 0 {
-        return s.to_string();
+        return (s.to_string(), 0);
     }
-    let mut skipped = 0usize;
+    let mut skipped_cols = 0usize;
+    let mut skipped_bytes = 0usize;
     let mut out = String::new();
     for ch in s.chars() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if skipped < skip_cols {
-            skipped += w;
+        if skipped_cols < skip_cols {
+            skipped_cols += w;
+            skipped_bytes += ch.len_utf8();
             continue;
         }
         out.push(ch);
     }
-    out
+    (out, skipped_bytes)
+}
+
+/// Tint I-search hits inside an already syntax-highlighted DDL line.
+/// Every occurrence of the query gets the match tint; the occurrence on
+/// the current match row at the (hscroll-adjusted) column gets the
+/// cursor tint.
+fn apply_ddl_search(
+    line: Line<'static>,
+    visible: &str,
+    abs_line: usize,
+    skipped_bytes: usize,
+    search: Option<&LineSearchHighlight>,
+) -> Line<'static> {
+    let Some(hl) = search else {
+        return line;
+    };
+    if hl.query.is_empty() {
+        return line;
+    }
+    let current_col = if hl.has_current && hl.current_line == abs_line {
+        hl.current_col.checked_sub(skipped_bytes)
+    } else {
+        None
+    };
+    overlay_line_search(line, visible, &hl.query, hl.case_sensitive, current_col)
 }
 
 /// Lightweight single-line SQL syntax highlighter for DDL scripts.
@@ -1488,7 +1535,7 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal
-            .draw(|f| render_object_ddl(&session, true, f, f.area()))
+            .draw(|f| render_object_ddl(&session, true, None, f, f.area()))
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut text = String::new();

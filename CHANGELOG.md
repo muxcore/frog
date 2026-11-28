@@ -2,6 +2,15 @@
 
 All notable changes to frog are documented here.
 
+## [0.12.1] - 2026-11-28
+
+### Fixed
+- `F4` Object DDL viewer now highlights I-search (`Ctrl+S`) hits: every
+  match gets the yellow tint and the current match gets the green cursor
+  tint, matching the editor/results highlighting (previously the view only
+  scrolled with no visible highlight). Works in both bordered and
+  `Mouse:OFF` native-copy modes and follows `ddl_hscroll`.
+
 ## [0.12.0] - 2026-11-27
 
 ### Added

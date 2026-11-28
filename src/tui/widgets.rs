@@ -193,12 +193,25 @@ fn cell_contains(haystack: &str, query: &str, case_sensitive: bool) -> bool {
     }
 }
 
+/// Highlight info for plain-text line panes (DDL, SQL, plan, help):
+/// all occurrences of `query` get a tint, the match on `current_line`
+/// at `current_col` gets the cursor tint.
+#[derive(Debug, Clone)]
+pub struct LineSearchHighlight {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub current_line: usize,
+    pub current_col: usize,
+    pub current_len: usize,
+    pub has_current: bool,
+}
+
 /// Search highlight styles, built only from 4-bit ANSI colors plus
 /// modifiers so they survive limited terminals (git-bash/mintty, jump-host
 /// proxies that strip 24-bit sequences): other matches black-on-yellow,
 /// the current match black-on-green + bold + underline — distinct from
 /// each other and from the cyan drag-selection.
-fn search_styles() -> (Style, Style) {
+pub(crate) fn search_styles() -> (Style, Style) {
     let match_style = Style::default().bg(Color::Yellow).fg(Color::Black);
     let current_style = Style::default()
         .bg(Color::Green)
@@ -267,6 +280,116 @@ fn highlight_spans(
         spans.push(Span::styled(line.to_string(), base));
     }
     spans
+}
+
+/// Overlay I-search highlighting onto an already syntax-highlighted `Line`
+/// (e.g. DDL): non-matching portions keep their original styles, every
+/// occurrence of `query` in `visible_text` gets `match_style`, the
+/// occurrence at `current_col` (byte offset into `visible_text`, when the
+/// row is the current match) gets `current_style` instead.
+/// Caller guarantees `query` is non-empty. Returns `line` unchanged when
+/// there are no matches.
+pub fn overlay_line_search(
+    line: Line<'static>,
+    visible_text: &str,
+    query: &str,
+    case_sensitive: bool,
+    current_col: Option<usize>,
+) -> Line<'static> {
+    let idxs: Vec<(usize, usize)> = if case_sensitive {
+        visible_text
+            .match_indices(query)
+            .map(|(o, m)| (o, m.len()))
+            .collect()
+    } else {
+        let lower = visible_text.to_lowercase();
+        let q = query.to_lowercase();
+        lower
+            .match_indices(q.as_str())
+            .map(|(o, m)| (o, m.len()))
+            .collect()
+    };
+    if idxs.is_empty() {
+        return line;
+    }
+    let (match_style, current_style) = search_styles();
+    // Flatten syntax spans so match ranges can split them.
+    let mut flat: Vec<(String, Style)> = Vec::new();
+    for span in line.spans {
+        flat.push((span.content.into_owned(), span.style));
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0usize;
+    // Ranges sorted by construction; skip overlaps/char-boundary hazards.
+    for (off, len) in idxs {
+        let off = off.min(visible_text.len());
+        let mut end = off.saturating_add(len).min(visible_text.len());
+        if !visible_text.is_char_boundary(off) {
+            continue;
+        }
+        while end < visible_text.len() && !visible_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= off || off < pos {
+            continue;
+        }
+        // Emit [pos..off) with original syntax styles.
+        let mut cursor = pos;
+        while cursor < off {
+            let (text, style, start) = match span_at(&flat, cursor) {
+                Some(v) => v,
+                None => break,
+            };
+            let chunk_end = (start + text.len()).min(off);
+            out.push(Span::styled(
+                text[cursor - start..chunk_end - start].to_string(),
+                style,
+            ));
+            cursor = chunk_end;
+        }
+        // Emit [off..end) with the search style.
+        let st = if Some(off) == current_col {
+            current_style
+        } else {
+            match_style
+        };
+        out.push(Span::styled(
+            visible_text[off..end].to_string(),
+            st,
+        ));
+        pos = end;
+    }
+    // Emit trailing [pos..end) with original syntax styles.
+    let mut cursor = pos;
+    while cursor < visible_text.len() {
+        let (text, style, start) = match span_at(&flat, cursor) {
+            Some(v) => v,
+            None => break,
+        };
+        let chunk_end = start + text.len();
+        out.push(Span::styled(
+            text[cursor - start..].to_string(),
+            style,
+        ));
+        cursor = chunk_end;
+    }
+    if out.is_empty() {
+        return Line::from(flat.into_iter().map(|(t, s)| Span::styled(t, s)).collect::<Vec<_>>());
+    }
+    Line::from(out)
+}
+
+/// Original `(text, style, byte start)` of the syntax span covering `pos`.
+fn span_at(flat: &[(String, Style)], pos: usize) -> Option<(&str, Style, usize)> {
+    let mut start = 0usize;
+    for (text, style) in flat {
+        let end = start + text.len();
+        if pos >= start && pos < end {
+            return Some((text.as_str(), *style, start));
+        }
+        start = end;
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
